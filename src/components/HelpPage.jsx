@@ -116,6 +116,12 @@ export default function HelpPage() {
             - 如何避免 DFS？将 `stepLimit` 设为较大或无穷，并启用 Beam 与增量剪枝。
           </div>
         </Section>
+
+        <Section title="联系作者">
+          <div>
+            联系作者：加QQ：3188789174 备注来意
+          </div>
+        </Section>
       </div>
     </div>
   )
