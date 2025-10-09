@@ -1,5 +1,59 @@
 import { nearestPaletteFromLab, rgb2lab, distLab } from './color-utils'
 
+// 轴对齐矩形裁剪（Sutherland–Hodgman）：将越界三角形裁剪为画布内的多边形
+function clipPolygonToRect(poly, width, height) {
+  const clipEdge = (points, edge) => {
+    const out = []
+    const inside = (p) => {
+      switch (edge.type) {
+        case 'left': return p.x >= 0
+        case 'right': return p.x <= width
+        case 'top': return p.y >= 0
+        case 'bottom': return p.y <= height
+        default: return true
+      }
+    }
+    const intersect = (p1, p2) => {
+      if (edge.type === 'left' || edge.type === 'right') {
+        const x = edge.type === 'left' ? 0 : width
+        const dx = p2.x - p1.x
+        if (Math.abs(dx) < 1e-6) return { x, y: p1.y }
+        const t = (x - p1.x) / dx
+        return { x, y: p1.y + t * (p2.y - p1.y) }
+      } else {
+        const y = edge.type === 'top' ? 0 : height
+        const dy = p2.y - p1.y
+        if (Math.abs(dy) < 1e-6) return { x: p1.x, y }
+        const t = (y - p1.y) / dy
+        return { x: p1.x + t * (p2.x - p1.x), y }
+      }
+    }
+    for (let i = 0; i < points.length; i++) {
+      const cur = points[i]
+      const prev = points[(i + points.length - 1) % points.length]
+      const curIn = inside(cur)
+      const prevIn = inside(prev)
+      if (prevIn && curIn) {
+        out.push(cur)
+      } else if (prevIn && !curIn) {
+        out.push(intersect(prev, cur))
+      } else if (!prevIn && curIn) {
+        out.push(intersect(prev, cur))
+        out.push(cur)
+      }
+    }
+    return out
+  }
+  let pts = poly
+  for (const edge of [ {type:'left'}, {type:'right'}, {type:'top'}, {type:'bottom'} ]) {
+    pts = clipEdge(pts, edge)
+    if (!pts || pts.length === 0) return []
+  }
+  const area = Math.abs(pts.reduce((s,p,i)=>{ const q=pts[(i+1)%pts.length]; return s + (p.x*q.y - q.x*p.y) },0))/2
+  if (area < 1e-3 || pts.length < 3) return []
+  return pts
+}
+
 function triVertices(x, y, side, up) {
   const H = side * Math.sqrt(3) / 2
   if (up) {
@@ -19,21 +73,26 @@ function triVertices(x, y, side, up) {
 
 export function buildTriangleGrid(width, height, side) {
   const H = side * Math.sqrt(3) / 2
-  const cols = Math.floor(width / (side / 2))
-  const rows = Math.floor(height / H)
+  // 为了让四边都成为直线，需要让网格在边界外延一圈，再裁剪回矩形
+  // 横向步长为 side/2，纵向步长为 H
+  const cols = Math.floor((width + side) / (side / 2)) + 2
+  const rows = Math.floor((height + H) / H) + 2
   const triangles = []
   let id = 0
-  for (let r = 0; r < rows; r++) {
-    for (let c = 0; c < cols; c++) {
+  for (let r = -1; r < rows; r++) {
+    for (let c = -2; c < cols; c++) {
       const x = c * (side / 2)
       const y = r * H
       const up = ((r + c) % 2 === 0)
       const v = triVertices(x, y, side, up)
-      // 边界过滤
-      if (v.every(p => p.x >= 0 && p.x <= width && p.y >= 0 && p.y <= height)) {
+      // 对越界三角形进行裁剪，生成用于绘制/采样的多边形
+      const clipped = clipPolygonToRect(v, width, height)
+      if (clipped.length >= 3) {
         const cx = (v[0].x + v[1].x + v[2].x) / 3
         const cy = (v[0].y + v[1].y + v[2].y) / 3
-        triangles.push({ id: id++, r, c, up, vertices: v, centroid: { x: cx, y: cy } })
+        const dcx = clipped.reduce((s,p)=>s+p.x,0)/clipped.length
+        const dcy = clipped.reduce((s,p)=>s+p.y,0)/clipped.length
+        triangles.push({ id: id++, r, c, up, vertices: v, centroid: { x: cx, y: cy }, drawVertices: clipped, drawCentroid: { x: dcx, y: dcy } })
       }
     }
   }
@@ -88,20 +147,24 @@ function triVerticesVertical(x, y, side, left) {
 // 构建“底边竖直”的网格（等价于原网格分布旋转90°）
 export function buildTriangleGridVertical(width, height, side) {
   const H = side * Math.sqrt(3) / 2
-  const cols = Math.floor(width / H)
-  const rows = Math.floor(height / (side / 2))
+  // 垂直底边模式同样在边界外延一圈再裁剪
+  const cols = Math.floor((width + H) / H) + 2
+  const rows = Math.floor((height + side / 2) / (side / 2)) + 2
   const triangles = []
   let id = 0
-  for (let r = 0; r < rows; r++) {
-    for (let c = 0; c < cols; c++) {
+  for (let r = -2; r < rows; r++) {
+    for (let c = -1; c < cols; c++) {
       const x = c * H
       const y = r * (side / 2)
       const left = ((r + c) % 2 === 0)
       const v = triVerticesVertical(x, y, side, left)
-      if (v.every(p => p.x >= 0 && p.x <= width && p.y >= 0 && p.y <= height)) {
+      const clipped = clipPolygonToRect(v, width, height)
+      if (clipped.length >= 3) {
         const cx = (v[0].x + v[1].x + v[2].x) / 3
         const cy = (v[0].y + v[1].y + v[2].y) / 3
-        triangles.push({ id: id++, r, c, left, vertices: v, centroid: { x: cx, y: cy } })
+        const dcx = clipped.reduce((s,p)=>s+p.x,0)/clipped.length
+        const dcy = clipped.reduce((s,p)=>s+p.y,0)/clipped.length
+        triangles.push({ id: id++, r, c, left, vertices: v, centroid: { x: cx, y: cy }, drawVertices: clipped, drawCentroid: { x: dcx, y: dcy } })
       }
     }
   }
@@ -161,8 +224,9 @@ export async function mapImageToGrid(bitmap, grid, palette) {
   const midPoint = (a, b) => ({ x: (a.x+b.x)/2, y: (a.y+b.y)/2 })
 
   return grid.triangles.map(t => {
-    const c = t.centroid
-    const v0=t.vertices[0], v1=t.vertices[1], v2=t.vertices[2]
+    const c = t.drawCentroid || t.centroid
+    const verts = t.drawVertices || t.vertices
+    const v0=verts[0], v1=verts[1], v2=verts[2]
     const pts = [
       c,
       insidePoint(v0, c, 0.20),

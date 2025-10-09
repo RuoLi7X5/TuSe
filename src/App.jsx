@@ -88,7 +88,8 @@ function App() {
   }, [imgBitmap, rotation])
 
   const handleImage = useCallback(async (blob) => {
-    const bitmap = await createImageBitmap(blob)
+    // 尊重 EXIF 方向，确保宽高与物理图像一致，避免比例失真
+    const bitmap = await createImageBitmap(blob, { imageOrientation: 'from-image' })
     setImgBitmap(bitmap)
     const { palette } = await quantizeImage(bitmap)
     setPalette(palette)
@@ -96,7 +97,20 @@ function App() {
 
     const w = bitmap.width
     const h = bitmap.height
-    const grid = rotation===90 ? buildTriangleGridVertical(w, h, triangleSize) : buildTriangleGrid(w, h, triangleSize)
+    // 自动微调三角形尺寸：当使用默认值时，根据图像短边计算，使列/行数更合理，比例更稳定
+    let side = triangleSize
+    const DEFAULT_SIDE = 18
+    if (triangleSize === DEFAULT_SIDE) {
+      const short = Math.min(w, h)
+      // 目标：短边约 60 个半边间距（列/行密度），确保采样密度随图像尺度自适应
+      const targetAcrossShort = 60
+      side = Math.max(10, Math.min(40, Math.round((2 * short) / targetAcrossShort)))
+    }
+    const grid = rotation===90 ? buildTriangleGridVertical(w, h, side) : buildTriangleGrid(w, h, side)
+    if (side !== triangleSize) {
+      // 同步 UI 滑块显示，但保留用户后续手动可再调整
+      setTriangleSize(side)
+    }
     setGrid(grid)
 
     const mapped = await mapImageToGrid(bitmap, grid, palette)

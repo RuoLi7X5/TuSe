@@ -1040,8 +1040,9 @@ export async function captureCanvasPNG(canvas, triangles, startId, path){
     for(const t of tris){
       if (t.deleted || t.color==='transparent') continue
       ctx.beginPath()
-      ctx.moveTo(t.vertices[0].x, t.vertices[0].y)
-      for(let i=1;i<3;i++) ctx.lineTo(t.vertices[i].x, t.vertices[i].y)
+      const verts = (t.drawVertices && t.drawVertices.length>=3) ? t.drawVertices : t.vertices
+      ctx.moveTo(verts[0].x, verts[0].y)
+      for(let i=1;i<verts.length;i++) ctx.lineTo(verts[i].x, verts[i].y)
       ctx.closePath(); ctx.fillStyle=t.color; ctx.fill(); ctx.stroke()
     }
   }
