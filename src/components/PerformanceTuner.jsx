@@ -20,7 +20,11 @@ export default function PerformanceTuner({ onClose }) {
     logPerf: false,
     // 进度与时间预算（新）
     workerTimeBudgetMs: 60000,
+    // 预处理（components）阶段时间预算，默认 5 分钟，可调
+    preprocessTimeBudgetMs: 300000,
     progressComponentsIntervalMs: 100,
+    // DFS 阶段进度节流（未在旧版面板暴露）
+    progressDFSIntervalMs: 50,
     // 权重参数
     adjAfterWeight: 0.6,
     bridgeWeight: 1.0,
@@ -68,12 +72,20 @@ export default function PerformanceTuner({ onClose }) {
   const setFlag = (key, value) => setFlags(prev => ({ ...prev, [key]: value }))
   const setNested = (key, sub, value) => setFlags(prev => ({ ...prev, [key]: { ...(prev[key] || {}), [sub]: value } }))
 
+  // 改进：参数变动即刻同步到 window 与当前 worker，并持久化到 localStorage
+  useEffect(() => {
+    try { window.SOLVER_FLAGS = { ...(window.SOLVER_FLAGS || {}), ...flags } } catch {}
+    try { window.__solverWorker?.postMessage({ type: 'set_flags', flags }) } catch {}
+    try { localStorage?.setItem('solverFlags', JSON.stringify(flags)) } catch {}
+  }, [flags])
+
   const onSave = () => {
     try {
       const next = { ...flags }
       window.SOLVER_FLAGS = next
       localStorage?.setItem('solverFlags', JSON.stringify(next))
-      alert('参数已保存。下一次计算将使用新设置。')
+      try { window.__solverWorker?.postMessage({ type: 'set_flags', flags: next }) } catch {}
+      alert('参数已保存并同步到工作线程。')
     } catch {}
     onClose?.()
   }
@@ -166,9 +178,17 @@ export default function PerformanceTuner({ onClose }) {
 提示：值越小越早看到阶段切换和搜索节点进度。">
             <NumInput value={flags.workerTimeBudgetMs} onChange={v=>setFlag('workerTimeBudgetMs', v)} step={1000} min={1000} />
           </Field>
+          <Field label="预处理阶段时间预算（ms）" tooltip="效果：控制连通分量识别（components 阶段）的最长耗时，超过该时间会提前结束预处理并进入搜索。
+默认：300,000（5 分钟）。可根据图大小与性能调节。">
+            <NumInput value={flags.preprocessTimeBudgetMs} onChange={v=>setFlag('preprocessTimeBudgetMs', v)} step={1000} min={0} />
+          </Field>
           <Field label="组件阶段进度节流（ms）" tooltip="效果：控制“components”阶段进度打点的最小间隔（毫秒）。
 建议：100~200。若希望几乎每个组件都打印，可设为 0。">
             <NumInput value={flags.progressComponentsIntervalMs} onChange={v=>setFlag('progressComponentsIntervalMs', v)} step={50} min={0} />
+          </Field>
+          <Field label="DFS 阶段进度节流（ms）" tooltip="效果：控制 DFS 阶段进度打点的最小间隔（毫秒）。
+建议：50~200。设为 0 可几乎每步上报（可能导致日志很多）。">
+            <NumInput value={flags.progressDFSIntervalMs} onChange={v=>setFlag('progressDFSIntervalMs', v)} step={50} min={0} />
           </Field>
         </Section>
 

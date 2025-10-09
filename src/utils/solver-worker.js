@@ -37,6 +37,8 @@ async function Solver_minSteps(triangles, startId, palette, maxBranches=3, onPro
   // 新增开关：零扩张候选过滤与性能日志
   const ENABLE_ZERO_FILTER = (FLAGS.enableZeroExpandFilter !== false)
   const LOG_PERF = !!FLAGS.logPerf
+  // 新增：DFS 进度上报时间间隔（毫秒），0 表示禁用
+  const PROGRESS_DFS_INTERVAL_MS = Number.isFinite(FLAGS?.progressDFSIntervalMs) ? Math.max(0, FLAGS.progressDFSIntervalMs) : 50
   // 稀有颜色与“准零扩张”/下界改进的过滤阈值（可调）
   const RARE_FREQ_RATIO = Number.isFinite(FLAGS?.rareFreqRatio) ? FLAGS.rareFreqRatio : 0.03
   const RARE_FREQ_ABS = Number.isFinite(FLAGS?.rareFreqAbs) ? FLAGS.rareFreqAbs : 3
@@ -364,16 +366,33 @@ async function Solver_minSteps(triangles, startId, palette, maxBranches=3, onPro
         return raw.sort((a,b)=>score(b)-score(a)).slice(0,8).filter(c=>c!==rc)
       }
       const startTs = Date.now()
+      let dfsNodes = 0
+      let lastDfsReportTs = startTime
       async function dfs(colors, regionSet, steps){
         if(isUniformSimple(colors.map((c,i)=>({color:c,id:i,neighbors:neighbors[i]})))) return steps
         if(steps.length>=stepLimit) return null
-        if(Date.now()-startTs > TIME_BUDGET_MS) return null
+        if(Date.now()-startTs > TIME_BUDGET_MS) { timedOut = true; return null }
+        if(onProgress && PROGRESS_DFS_INTERVAL_MS>0){
+          const now = Date.now()
+          if(now - lastDfsReportTs >= PROGRESS_DFS_INTERVAL_MS){
+            lastDfsReportTs = now
+            onProgress({ phase:'dfs', nodes: dfsNodes, depth: steps.length, elapsedMs: now - startTime, maxDepth: stepLimit })
+          }
+        }
         const tryColors = orderColors(colors, regionSet)
         for(const color of tryColors){
           const nextColors = colors.slice(); for(const id of regionSet) nextColors[idToIndex.get(id)] = color
           const key = keyFromColors(nextColors); if(seen.has(key)) continue; seen.add(key)
           const q=[...regionSet]; const visited2=new Set([...regionSet]); const newRegion=new Set([...regionSet])
           while(q.length){ const tid=q.shift(); const idx=idToIndex.get(tid); for(const nb of neighbors[idx]){ const nidx=idToIndex.get(nb); const tri=triangles[nidx]; if(!visited2.has(nb) && !tri.deleted && tri.color!=='transparent' && nextColors[nidx]===color){ visited2.add(nb); newRegion.add(nb); q.push(nb) } } }
+          dfsNodes++
+          if(onProgress && PROGRESS_DFS_INTERVAL_MS>0){
+            const now = Date.now()
+            if(now - lastDfsReportTs >= PROGRESS_DFS_INTERVAL_MS){
+              lastDfsReportTs = now
+              onProgress({ phase:'dfs', nodes: dfsNodes, depth: steps.length+1, elapsedMs: now - startTime, maxDepth: stepLimit })
+            }
+          }
           const res = await dfs(nextColors, newRegion, [...steps,color]); if(res) return res
           await new Promise(r=>setTimeout(r,0))
         }
@@ -381,27 +400,31 @@ async function Solver_minSteps(triangles, startId, palette, maxBranches=3, onPro
       }
       const dfsRegion = buildRegion(startColors)
       const dfsRes = await dfs(startColors, dfsRegion, [])
-      if(dfsRes) return { paths: [dfsRes], minSteps: dfsRes.length, timedOut }
+      if(dfsRes){ onProgress?.({ phase:'solution', minSteps: dfsRes.length, solutions: 1, elapsedMs: Date.now() - startTime }); return { paths: [dfsRes], minSteps: dfsRes.length, timedOut } }
     }
-    // 否则：保留贪心近似路径用于无限上限场景
-    const idToIndex = new Map(triangles.map((t,i)=>[t.id,i]))
-    const neighbors = triangles.map(t=>t.neighbors)
-    let colors = startColors.slice()
-    const steps=[]
-    let safeGuard=0
-    const limit = Number.isFinite(stepLimit) ? stepLimit : 80
-    while(!isUniformSimple(colors.map((c,i)=>({color:c,id:i,neighbors:neighbors[i]}))) && safeGuard<limit){
-      const regionSet = new Set(); const q=[startId]; const visited=new Set([startId])
-      const regionColor = colors[idToIndex.get(startId)]
-      while(q.length){ const id=q.shift(); const idx=idToIndex.get(id); if(colors[idx]!==regionColor) continue; regionSet.add(id); for(const nb of neighbors[idx]){ if(!visited.has(nb)){ visited.add(nb); q.push(nb) } } }
-      const gain=new Map(); for(const tid of regionSet){ const idx=idToIndex.get(tid); for(const nb of neighbors[idx]){ const nidx=idToIndex.get(nb); const tri = triangles[nidx]; const c = colors[nidx]; if(c!==regionColor && c && c!=='transparent' && !tri.deleted){ gain.set(c, (gain.get(c)||0)+1) } } }
-      const nextColor = [...gain.entries()].sort((a,b)=>b[1]-a[1])[0]?.[0] || (palette.find(c=>c!==regionColor) ?? palette[0])
-      if(!nextColor || nextColor===regionColor) break
-      for(const id of regionSet){ colors[idToIndex.get(id)] = nextColor }
-      steps.push(nextColor); safeGuard++
-      await new Promise(r=>setTimeout(r,0))
+    // 否则（仅当步数上限为无限时）：保留贪心近似路径用于参考
+    if (!Number.isFinite(stepLimit)) {
+      const idToIndex = new Map(triangles.map((t,i)=>[t.id,i]))
+      const neighbors = triangles.map(t=>t.neighbors)
+      let colors = startColors.slice()
+      const steps=[]
+      let safeGuard=0
+      const limit = 80
+      while(!isUniformSimple(colors.map((c,i)=>({color:c,id:i,neighbors:neighbors[i]}))) && safeGuard<limit){
+        const regionSet = new Set(); const q=[startId]; const visited=new Set([startId])
+        const regionColor = colors[idToIndex.get(startId)]
+        while(q.length){ const id=q.shift(); const idx=idToIndex.get(id); if(colors[idx]!==regionColor) continue; regionSet.add(id); for(const nb of neighbors[idx]){ if(!visited.has(nb)){ visited.add(nb); q.push(nb) } } }
+        const gain=new Map(); for(const tid of regionSet){ const idx=idToIndex.get(tid); for(const nb of neighbors[idx]){ const nidx=idToIndex.get(nb); const tri = triangles[nidx]; const c = colors[nidx]; if(c!==regionColor && c && c!=='transparent' && !tri.deleted){ gain.set(c, (gain.get(c)||0)+1) } } }
+        const nextColor = [...gain.entries()].sort((a,b)=>b[1]-a[1])[0]?.[0] || (palette.find(c=>c!==regionColor) ?? palette[0])
+        if(!nextColor || nextColor===regionColor) break
+        for(const id of regionSet){ colors[idToIndex.get(id)] = nextColor }
+        steps.push(nextColor); safeGuard++
+        await new Promise(r=>setTimeout(r,0))
+      }
+      return { paths: steps.length? [steps] : [], minSteps: steps.length, timedOut }
     }
-    return { paths: steps.length? [steps] : [], minSteps: steps.length, timedOut }
+    // 有步数上限但未找到统一解：不返回近似方案，交由上层处理
+    return { paths: [], minSteps: 0, timedOut }
   }
   const minSteps = solutions[0].length
   const paths = solutions.filter(s=>s.length===minSteps).slice(0, maxBranches)
@@ -419,7 +442,12 @@ async function Solver_minStepsAuto(triangles, palette, maxBranches=3, onProgress
     : 300000
   let timedOut = false
   const FLAGS = (typeof self !== 'undefined' && self.SOLVER_FLAGS) ? self.SOLVER_FLAGS : {}
+  // 预处理（components）阶段单独时间预算，默认 5 分钟，可调
+  const PREPROC_TIME_BUDGET_MS = Number.isFinite(FLAGS?.preprocessTimeBudgetMs)
+    ? Math.max(0, FLAGS.preprocessTimeBudgetMs)
+    : 300000
   const PROG_COMP_INTERVAL = Number.isFinite(FLAGS?.progressComponentsIntervalMs) ? Math.max(0, FLAGS.progressComponentsIntervalMs) : 100
+  const PROGRESS_DFS_INTERVAL_MS = Number.isFinite(FLAGS?.progressDFSIntervalMs) ? Math.max(0, FLAGS.progressDFSIntervalMs) : 50
   const USE_DFS_FIRST = !!FLAGS.useDFSFirst
   const idToIndex = new Map(triangles.map((t,i)=>[t.id,i]))
   const neighbors = triangles.map(t=>t.neighbors)
@@ -427,6 +455,10 @@ async function Solver_minStepsAuto(triangles, palette, maxBranches=3, onProgress
   const components = []
   let compLastTs = startTime
   for(const t of triangles){
+    // 超过预处理阶段时间预算则提前结束组件识别
+    if ((Date.now() - startTime) > PREPROC_TIME_BUDGET_MS) {
+      break
+    }
     const id = t.id
     if(visited.has(id)) continue
     if(t.deleted || t.color==='transparent') continue
@@ -435,12 +467,27 @@ async function Solver_minStepsAuto(triangles, palette, maxBranches=3, onProgress
     const q=[id]
     visited.add(id)
     while(q.length){
+      // 若预处理阶段超时，在构建当前分量时也立即退出
+      if ((Date.now() - startTime) > PREPROC_TIME_BUDGET_MS) {
+        break
+      }
       const cid=q.shift()
       const idx=idToIndex.get(cid)
       const tri=triangles[idx]
       if(tri.deleted || tri.color==='transparent' || tri.color!==color) continue
       comp.push(cid)
       for(const nb of neighbors[idx]){ if(!visited.has(nb)){ const nidx=idToIndex.get(nb); const tri2=triangles[nidx]; if(!tri2.deleted && tri2.color!=='transparent' && tri2.color===color){ visited.add(nb); q.push(nb) } } }
+
+      // 组件构建中的细粒度进度（时间节流），包含当前分量大小与颜色
+      if (onProgress) {
+        const nowTs = Date.now()
+        if (PROG_COMP_INTERVAL <= 0 || (nowTs - compLastTs) >= PROG_COMP_INTERVAL) {
+          compLastTs = nowTs
+          onProgress({ phase:'components_build', count: components.length, compSize: comp.length, color, elapsedMs: nowTs - startTime })
+          // 让出事件循环以便主线程 UI 刷新
+          await new Promise(r=>setTimeout(r,0))
+        }
+      }
     }
     if(comp.length>0){
       components.push({ color, ids: comp, startId: comp[0], size: comp.length })
@@ -450,11 +497,20 @@ async function Solver_minStepsAuto(triangles, palette, maxBranches=3, onProgress
         if (PROG_COMP_INTERVAL <= 0 || (nowTs - compLastTs) >= PROG_COMP_INTERVAL) {
           compLastTs = nowTs
           onProgress({ phase:'components', count: components.length, elapsedMs: nowTs - startTime })
+          // 让出事件循环，确保主线程能及时刷新显示
+          await new Promise(r=>setTimeout(r,0))
         } else {
           onProgress({ phase:'components', count: components.length, elapsedMs: nowTs - startTime })
         }
       }
     }
+  }
+  // 预处理阶段结束：无论耗时长短，输出一次总结打点，便于判定阶段完成
+  {
+    const nowTs = Date.now()
+    const largest = components.length>0 ? components.reduce((m,c)=> Math.max(m, c.size||0), 0) : 0
+    const summary = { phase:'components_done', count: components.length, largest, elapsedMs: nowTs - startTime }
+    try { onProgress?.(summary) } catch {}
   }
   if(components.length===0) return { bestStartId: null, paths: [], minSteps: 0 }
   components.sort((a,b)=>b.size-a.size)
@@ -484,16 +540,33 @@ async function Solver_minStepsAuto(triangles, palette, maxBranches=3, onProgress
           return raw.sort((a,b)=>score(b)-score(a)).slice(0,8).filter(c=>c!==rc)
         }
         const startTs = Date.now()
+        let dfsNodesFirst = 0
+        let lastDfsReportTsFirst = startTime
         async function dfs(colors, regionSet, steps){
           if(isUniformSimple(colors.map((c,i)=>({color:c,id:i,neighbors:neighbors[i]})))) return steps
           if(steps.length>=stepLimit) return null
-          if(Date.now()-startTs > TIME_BUDGET_MS) return null
+          if(Date.now()-startTs > TIME_BUDGET_MS) { timedOut = true; return null }
+          if(onProgress && PROGRESS_DFS_INTERVAL_MS>0){
+            const now = Date.now()
+            if(now - lastDfsReportTsFirst >= PROGRESS_DFS_INTERVAL_MS){
+              lastDfsReportTsFirst = now
+              onProgress({ phase:'dfs_first', nodes: dfsNodesFirst, depth: steps.length, elapsedMs: now - startTime, maxDepth: stepLimit })
+            }
+          }
           const tryColors = orderColors(colors, regionSet)
           for(const color of tryColors){
             const nextColors = colors.slice(); for(const id of regionSet) nextColors[idToIndex.get(id)] = color
             const key = keyFromColors(nextColors); if(seen.has(key)) continue; seen.add(key)
             const q=[...regionSet]; const visited2=new Set([...regionSet]); const newRegion=new Set([...regionSet])
             while(q.length){ const tid=q.shift(); const idx=idToIndex.get(tid); for(const nb of neighbors[idx]){ const nidx=idToIndex.get(nb); const tri=triangles[nidx]; if(!visited2.has(nb) && !tri.deleted && tri.color!=='transparent' && nextColors[nidx]===color){ visited2.add(nb); newRegion.add(nb); q.push(nb) } }
+            }
+            dfsNodesFirst++
+            if(onProgress && PROGRESS_DFS_INTERVAL_MS>0){
+              const now = Date.now()
+              if(now - lastDfsReportTsFirst >= PROGRESS_DFS_INTERVAL_MS){
+                lastDfsReportTsFirst = now
+                onProgress({ phase:'dfs_first', nodes: dfsNodesFirst, depth: steps.length+1, elapsedMs: now - startTime, maxDepth: stepLimit })
+              }
             }
             const res = await dfs(nextColors, newRegion, [...steps,color]); if(res) return res
             await new Promise(r=>setTimeout(r,0))

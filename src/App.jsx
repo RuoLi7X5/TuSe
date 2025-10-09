@@ -10,11 +10,12 @@ import { quantizeImage, setColorTuning } from './utils/color-utils'
 import { buildTriangleGrid, buildTriangleGridVertical, mapImageToGrid, isUniform } from './utils/grid-utils'
 import { floodFillRegion, attachSolverToWindow, captureCanvasPNG } from './utils/solver'
 
-// 设置默认的求解器开关与权重（可通过 window.SOLVER_FLAGS 覆写）
+// 设置默认的求解器开关与权重，并合并本地持久化配置（localStorage）
 if (typeof window !== 'undefined') {
+  let persisted = null
+  try { persisted = JSON.parse(localStorage.getItem('solverFlags') || 'null') } catch {}
   window.SOLVER_FLAGS = {
-    ...(window.SOLVER_FLAGS || {}),
-    // DFS 优先与可行解早停（满足题目限制立刻返回）
+    // 默认值（若面板未打开也能生效）
     useDFSFirst: true,
     returnFirstFeasible: true,
     enableBridgeFirst: true,
@@ -23,9 +24,11 @@ if (typeof window !== 'undefined') {
     bridgeWeight: 1.0,
     gateWeight: 0.4,
     richnessWeight: 0.5,
-    // 新增：零扩张候选过滤与性能日志默认值
     enableZeroExpandFilter: true,
     logPerf: true,
+    // 合并已有与持久化设置，持久化优先生效
+    ...(window.SOLVER_FLAGS || {}),
+    ...(persisted || {}),
   }
 }
 attachSolverToWindow()
@@ -47,8 +50,11 @@ function App() {
   const [editMode, setEditMode] = useState(true)
   const [rotation, setRotation] = useState(90)
   const [solving, setSolving] = useState(false)
-  // 自动求解步数上限（用于剪枝与性能控制）
-  const [maxStepsLimit, setMaxStepsLimit] = useState(60)
+  // 自动求解步数上限（用于剪枝与性能控制），持久化到 localStorage
+  const [maxStepsLimit, setMaxStepsLimit] = useState(() => {
+    try { const v = localStorage.getItem('maxStepsLimit'); return v!=null ? parseInt(v,10) : 60 } catch { return 60 }
+  })
+  useEffect(()=>{ try{ localStorage.setItem('maxStepsLimit', String(maxStepsLimit)) }catch{} }, [maxStepsLimit])
   // 框选状态
   const [isDragging, setIsDragging] = useState(false)
   const [dragStart, setDragStart] = useState(null)
@@ -351,30 +357,15 @@ function App() {
       // 让出一次事件循环，确保“计算中…”与状态文案先渲染
       await new Promise(r => setTimeout(r, 0))
       const maxBranches = 3
-      // 优先尝试 DeepSeek 远程求解；失败再使用本地 Web Worker；再失败回退主线程
+      // 仅使用本地计算：优先 Web Worker，失败则回退主线程
       let result = null
-      try {
-        const useRemote = (
-          import.meta?.env?.VITE_USE_DEEPSEEK === '1' ||
-          !!import.meta?.env?.VITE_DEEPSEEK_PROXY ||
-          !!import.meta?.env?.VITE_DEEPSEEK_API_KEY
-        )
-        if (useRemote) {
-          setStatus('已请求 DeepSeek 远程计算…（若失败将自动回退本地）')
-          setSolveProgress({ phase: 'remote' })
-          const { solveWithDeepSeek } = await import('./utils/remote-solver.js')
-          result = await solveWithDeepSeek(triangles, palette, { stepLimit: maxStepsLimit })
-        }
-      } catch (remoteErr) {
-        console.warn('DeepSeek 远程求解失败，回退本地：', remoteErr)
-        setStatus('远程计算失败，正在回退本地求解…')
-      }
       if (!result) {
         try {
           const worker = new Worker(new URL('./utils/solver-worker.js', import.meta.url), { type: 'module' })
+          try { window.__solverWorker = worker } catch {}
           const resPromise = new Promise((resolve, reject)=>{
             // 将 Worker 超时提升到 5 分钟以匹配计算预算
-            const timeout = setTimeout(()=>{ try{ worker.terminate() }catch{}; reject(new Error('worker-timeout')) }, 300000)
+            const timeout = setTimeout(()=>{ try{ worker.terminate() }catch{}; try{ window.__solverWorker = null }catch{}; reject(new Error('worker-timeout')) }, 300000)
             worker.onmessage = (ev)=>{
               const { type, payload } = ev.data || {}
               if(type==='progress'){
@@ -384,6 +375,7 @@ function App() {
                   const nodes = p?.nodes ?? 0
                   const sols = p?.solutions ?? 0
               const phase = p?.phase === 'components' ? `已识别连通分量：${p?.count}`
+                : p?.phase === 'components_build' ? `正在构建分量：${p?.count}（当前大小 ${p?.compSize??'-'}）`
                 : p?.phase === 'best_update' ? `已更新最优：起点 #${p?.bestStartId}，最少步骤 ${p?.minSteps}`
                 : `已探索节点：${nodes}，候选分支：${sols}`
               setStatus(`正在计算最少步骤… ${phase}`)
@@ -400,7 +392,11 @@ function App() {
               })
               // 记录日志（滚动窗口显示）
               const perf = p?.perf || {}
-              const line = `[${((now - solveStartRef.current)/1000).toFixed(1)}s] phase=${p?.phase||'search'} nodes=${p?.nodes??0} queue=${p?.queue??0} sols=${p?.solutions??0} enq=${perf?.enqueued??'-'} exp=${perf?.expanded??'-'} zf=${perf?.filteredZero??'-'}`
+              const phaseRaw = p?.phase || 'search'
+              const compInfo = (phaseRaw==='components' || phaseRaw==='components_build')
+                ? ` count=${p?.count??0}${p?.compSize!=null?` compSize=${p.compSize}`:''}`
+                : ''
+              const line = `[${((now - solveStartRef.current)/1000).toFixed(1)}s] phase=${phaseRaw}${compInfo} nodes=${p?.nodes??0} queue=${p?.queue??0} sols=${p?.solutions??0} enq=${perf?.enqueued??'-'} exp=${perf?.expanded??'-'} zf=${perf?.filteredZero??'-'}`
               setProgressLogs(prev=>{
                 const next = [...prev, line]
                 return next.length>200 ? next.slice(next.length-200) : next
@@ -410,6 +406,7 @@ function App() {
           } else if(type==='result'){
                 clearTimeout(timeout)
                 try{ worker.terminate() }catch{}
+                try{ window.__solverWorker = null }catch{}
                 resolve(payload)
               }
             }
@@ -419,6 +416,7 @@ function App() {
           worker.postMessage({ type:'auto', triangles, palette, maxBranches, stepLimit: maxStepsLimit })
           result = await resPromise
         } catch (wErr) {
+          try{ window.__solverWorker = null }catch{}
           // 回退：使用窗口内的自动求解器
           result = await window.Solver_minStepsAuto?.(triangles, palette, maxBranches, (p)=>{
             const now = Date.now()
@@ -426,6 +424,7 @@ function App() {
             const nodes = p?.nodes ?? 0
             const sols = p?.solutions ?? 0
             const phase = p?.phase === 'components' ? `已识别连通分量：${p?.count}`
+              : p?.phase === 'components_build' ? `正在构建分量：${p?.count}（当前大小 ${p?.compSize??'-'}）`
               : p?.phase === 'best_update' ? `已更新最优：起点 #${p?.bestStartId}，最少步骤 ${p?.minSteps}`
               : `已探索节点：${nodes}，候选分支：${sols}`
             setStatus(`正在计算最少步骤… ${phase}`)
@@ -441,7 +440,11 @@ function App() {
               perf: p?.perf,
             })
             const perf = p?.perf || {}
-            const line = `[${((now - solveStartRef.current)/1000).toFixed(1)}s] phase=${p?.phase||'search'} nodes=${p?.nodes??0} queue=${p?.queue??0} sols=${p?.solutions??0} enq=${perf?.enqueued??'-'} exp=${perf?.expanded??'-'} zf=${perf?.filteredZero??'-'}`
+            const phaseRaw2 = p?.phase || 'search'
+            const compInfo2 = (phaseRaw2==='components' || phaseRaw2==='components_build')
+              ? ` count=${p?.count??0}${p?.compSize!=null?` compSize=${p.compSize}`:''}`
+              : ''
+            const line = `[${((now - solveStartRef.current)/1000).toFixed(1)}s] phase=${phaseRaw2}${compInfo2} nodes=${p?.nodes??0} queue=${p?.queue??0} sols=${p?.solutions??0} enq=${perf?.enqueued??'-'} exp=${perf?.expanded??'-'} zf=${perf?.filteredZero??'-'}`
             setProgressLogs(prev=>{
               const next = [...prev, line]
               return next.length>200 ? next.slice(next.length-200) : next
@@ -532,8 +535,9 @@ function App() {
       let result = null
       try {
         const worker = new Worker(new URL('./utils/solver-worker.js', import.meta.url), { type: 'module' })
+        try { window.__solverWorker = worker } catch {}
         const resPromise = new Promise((resolve, reject)=>{
-          const timeout = setTimeout(()=>{ try{ worker.terminate() }catch{}; reject(new Error('worker-timeout')) }, 300000)
+          const timeout = setTimeout(()=>{ try{ worker.terminate() }catch{}; try{ window.__solverWorker = null }catch{}; reject(new Error('worker-timeout')) }, 300000)
           worker.onmessage = (ev)=>{
             const { type, payload } = ev.data || {}
             if(type==='progress'){
@@ -543,6 +547,7 @@ function App() {
                 const nodes = p?.nodes ?? 0
                 const sols = p?.solutions ?? 0
                 const phase = p?.phase === 'components' ? `已识别连通分量：${p?.count}`
+                  : p?.phase === 'components_build' ? `正在构建分量：${p?.count}（当前大小 ${p?.compSize??'-'}）`
                   : p?.phase === 'best_update' ? `已更新最优：起点 #${p?.bestStartId}，最少步骤 ${p?.minSteps}`
                   : `已探索节点：${nodes}，候选分支：${sols}`
                 setStatus(`正在继续计算最短步骤… ${phase}`)
@@ -558,7 +563,11 @@ function App() {
                   perf: p?.perf,
                 })
                 const perf = p?.perf || {}
-                const line = `[${((now - solveStartRef.current)/1000).toFixed(1)}s] phase=${p?.phase||'search'} nodes=${p?.nodes??0} queue=${p?.queue??0} sols=${p?.solutions??0} enq=${perf?.enqueued??'-'} exp=${perf?.expanded??'-'} zf=${perf?.filteredZero??'-'}`
+                const phaseRaw3 = p?.phase || 'search'
+                const compInfo3 = (phaseRaw3==='components' || phaseRaw3==='components_build')
+                  ? ` count=${p?.count??0}${p?.compSize!=null?` compSize=${p.compSize}`:''}`
+                  : ''
+                const line = `[${((now - solveStartRef.current)/1000).toFixed(1)}s] phase=${phaseRaw3}${compInfo3} nodes=${p?.nodes??0} queue=${p?.queue??0} sols=${p?.solutions??0} enq=${perf?.enqueued??'-'} exp=${perf?.expanded??'-'} zf=${perf?.filteredZero??'-'}`
                 setProgressLogs(prev=>{
                   const next = [...prev, line]
                   return next.length>200 ? next.slice(next.length-200) : next
@@ -568,6 +577,7 @@ function App() {
             } else if(type==='result'){
               clearTimeout(timeout)
               try{ worker.terminate() }catch{}
+              try{ window.__solverWorker = null }catch{}
               resolve(payload)
             }
           }
@@ -578,6 +588,7 @@ function App() {
         worker.postMessage({ type:'auto', triangles, palette, maxBranches, stepLimit: maxStepsLimit })
         result = await resPromise
       } catch (err) {
+        try{ window.__solverWorker = null }catch{}
         // 回退到主线程
         result = await window.Solver_minStepsAuto?.(triangles, palette, 3, (p)=>{
           const now = Date.now()
@@ -654,8 +665,9 @@ function App() {
       let result = null
       try {
         const worker = new Worker(new URL('./utils/solver-worker.js', import.meta.url), { type: 'module' })
+        try { window.__solverWorker = worker } catch {}
         const resPromise = new Promise((resolve, reject)=>{
-          const timeout = setTimeout(()=>{ try{ worker.terminate() }catch{}; reject(new Error('worker-timeout')) }, 180000)
+          const timeout = setTimeout(()=>{ try{ worker.terminate() }catch{}; try{ window.__solverWorker = null }catch{}; reject(new Error('worker-timeout')) }, 180000)
           worker.onmessage = (ev)=>{
             const { type, payload } = ev.data || {}
             if(type==='progress'){
@@ -673,6 +685,7 @@ function App() {
             } else if(type==='result'){
               clearTimeout(timeout)
               try{ worker.terminate() }catch{}
+              try{ window.__solverWorker = null }catch{}
               resolve(payload)
             }
           }
@@ -683,6 +696,7 @@ function App() {
         worker.postMessage({ type:'optimize', triangles, palette, startId: sid, path: originalPath })
         result = await resPromise
       } catch (err) {
+        try{ window.__solverWorker = null }catch{}
         // 回退：主线程路径优化
         result = await window.OptimizeSolution?.(triangles, palette, sid, originalPath, (p)=>{
           const now = Date.now()
@@ -736,10 +750,18 @@ function App() {
   // 进度窗口：自动滚动控制与复制/清空
   const [autoScroll, setAutoScroll] = useState(true)
   const onCopyLogs = useCallback(()=>{
-    const text = progressLogs.join('\n')
-    try { navigator.clipboard?.writeText(text); setStatus('已复制进度日志到剪贴板') }
+    const flags = { ...(window.SOLVER_FLAGS||{}) }
+    const meta = {
+      stepLimit: maxStepsLimit,
+      triangles: triangles?.length || 0,
+      palette: palette?.length || 0,
+      timestamp: new Date().toISOString(),
+    }
+    const header = `SOLVER_FLAGS=${JSON.stringify(flags)}\nMETA=${JSON.stringify(meta)}\n--- LOG ---\n`
+    const text = header + progressLogs.join('\n')
+    try { navigator.clipboard?.writeText(text); setStatus('已复制进度日志与参数到剪贴板') }
     catch { setStatus('复制失败，可手动选择文本复制') }
-  }, [progressLogs])
+  }, [progressLogs, maxStepsLimit, triangles, palette])
   const onClearLogs = useCallback(()=>{ setProgressLogs([]); setStatus('已清空进度日志') }, [])
   // 日志窗口自动滚动到最新（可关闭）
   useEffect(()=>{

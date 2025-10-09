@@ -96,7 +96,7 @@ export function attachSolverToWindow(){
       const newRegion = new Set([...regionSet])
       const q=[...regionSet]
       const visited2=new Set([...regionSet])
-      while(q.length){
+  while(q.length){
         const tid=q.shift(); const idx=idToIndex.get(tid)
         for(const nb of neighbors[idx]){
           const nidx=idToIndex.get(nb); if(nidx==null) continue
@@ -656,11 +656,30 @@ export function attachSolverToWindow(){
       }
       if(comp.length>0) {
         components.push({ color, ids: comp, startId: comp[0], size: comp.length })
-        if (onProgress && components.length % 10 === 0) {
-          try { onProgress({ phase: 'components', count: components.length }) } catch {}
-        }
+        // 组件阶段进度节流（与 worker 保持一致）
+        try {
+          const PROG_COMP_INTERVAL = Number.isFinite(window.SOLVER_FLAGS?.progressComponentsIntervalMs)
+            ? Math.max(0, window.SOLVER_FLAGS.progressComponentsIntervalMs)
+            : 100
+          window.__COMP_LAST_TS__ = window.__COMP_LAST_TS__ || Date.now()
+          const nowTs = Date.now()
+          if (!onProgress) {
+            // noop
+          } else if (PROG_COMP_INTERVAL <= 0 || (nowTs - window.__COMP_LAST_TS__) >= PROG_COMP_INTERVAL) {
+            window.__COMP_LAST_TS__ = nowTs
+            onProgress({ phase: 'components', count: components.length, elapsedMs: nowTs - startTime })
+          } else {
+            onProgress({ phase: 'components', count: components.length, elapsedMs: nowTs - startTime })
+          }
+        } catch {}
       }
-    }
+  }
+    // 预处理阶段结束：输出一次总结打点，便于判定阶段完成（主线程实现，与 worker 保持一致）
+    try {
+      const nowTs = Date.now()
+      const largest = components.length>0 ? components.reduce((m,c)=> Math.max(m, c.size||0), 0) : 0
+      onProgress?.({ phase:'components_done', count: components.length, largest, elapsedMs: nowTs - startTime })
+    } catch {}
     if(components.length===0) return { bestStartId: null, paths: [], minSteps: 0 }
     // 可选：按组件大小排序，优先尝试更大的区域
     components.sort((a,b)=>b.size-a.size)
