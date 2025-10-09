@@ -15,18 +15,47 @@ import { floodFillRegion, attachSolverToWindow, captureCanvasPNG } from './utils
 if (typeof window !== 'undefined') {
   let persisted = null
   try { persisted = JSON.parse(localStorage.getItem('solverFlags') || 'null') } catch {}
+  // 默认初始配置：与性能调节窗口一致，开箱即用
   window.SOLVER_FLAGS = {
-    // 默认值（若面板未打开也能生效）
-    useDFSFirst: true,
-    returnFirstFeasible: true,
+    // 基本搜索策略
+    enableLB: true,
+    enableLookahead: true,
+    enableLookaheadDepth2: false,
+    enableIncremental: true,
+    enableBeam: false,
+    beamWidth: 32,
+    enableBestFirst: true,
     enableBridgeFirst: true,
+    enableZeroExpandFilter: true,
+    useDFSFirst: false,
+    returnFirstFeasible: false,
+    logPerf: true,
+    // 进度与时间预算
+    workerTimeBudgetMs: 300000,
+    preprocessTimeBudgetMs: 20000,
+    progressComponentsIntervalMs: 0,
+    progressDFSIntervalMs: 100,
+    // 权重参数
     adjAfterWeight: 0.6,
-    boundaryWeight: 0.8,
-    bridgeWeight: 1.0,
+    bridgeWeight: 1,
     gateWeight: 0.4,
     richnessWeight: 0.5,
-    enableZeroExpandFilter: true,
-    logPerf: true,
+    boundaryWeight: 0.8,
+    regionClassWeights: { boundary: 0.8, bridge: 1, richness: 0.6 },
+    dimensionWeights: { expand: 1, connect: 0.8, barrier: 0.7 },
+    bifrontWeight: 2,
+    // 稀有颜色与扩张过滤
+    rareFreqRatio: 0.03,
+    rareFreqAbs: 3,
+    rareAllowBridgeMin: 2,
+    rareAllowGateMin: 1,
+    minDeltaRatio: 0.02,
+    lbImproveMin: 1,
+    // 路径优化
+    optimizeWindowSize: 5,
+    optimizeEnableWindow: true,
+    optimizeEnableRemoval: true,
+    optimizeSwapPasses: 1,
     // 合并已有与持久化设置，持久化优先生效
     ...(window.SOLVER_FLAGS || {}),
     ...(persisted || {}),

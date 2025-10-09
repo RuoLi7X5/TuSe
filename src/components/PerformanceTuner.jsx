@@ -1,30 +1,30 @@
-import { useEffect, useMemo, useState } from 'react'
+import { useEffect, useMemo, useRef, useState } from 'react'
 
 // 性能调节面板：集中管理求解器的所有可调参数
 export default function PerformanceTuner({ onClose }) {
   const existing = typeof window !== 'undefined' ? (window.SOLVER_FLAGS || {}) : {}
   // 默认值（与 solver.js / solver-worker.js 保持一致）
   const defaults = useMemo(() => ({
-    // 基本搜索策略
-    enableLB: false,
-    enableLookahead: false,
+    // 基本搜索策略（与默认初始设置一致）
+    enableLB: true,
+    enableLookahead: true,
     enableLookaheadDepth2: false,
-    enableIncremental: false,
+    enableIncremental: true,
     enableBeam: false,
-    beamWidth: 12,
-    enableBestFirst: false,
-    enableBridgeFirst: false,
+    beamWidth: 32,
+    enableBestFirst: true,
+    enableBridgeFirst: true,
     enableZeroExpandFilter: true,
     useDFSFirst: false,
     returnFirstFeasible: false,
-    logPerf: false,
-    // 进度与时间预算（新）
-    workerTimeBudgetMs: 60000,
-    // 预处理（components）阶段时间预算，默认 5 分钟，可调
-    preprocessTimeBudgetMs: 300000,
-    progressComponentsIntervalMs: 100,
-    // DFS 阶段进度节流（未在旧版面板暴露）
-    progressDFSIntervalMs: 50,
+    logPerf: true,
+    // 进度与时间预算
+    workerTimeBudgetMs: 300000,
+    // 预处理（components）阶段时间预算
+    preprocessTimeBudgetMs: 20000,
+    progressComponentsIntervalMs: 0,
+    // DFS 阶段进度节流
+    progressDFSIntervalMs: 100,
     // 权重参数
     adjAfterWeight: 0.6,
     bridgeWeight: 1.0,
@@ -100,8 +100,8 @@ export default function PerformanceTuner({ onClose }) {
   const Field = ({ label, tooltip, children }) => {
     const [hover, setHover] = useState(false)
     return (
-      <div style={{ position: 'relative' }} onMouseEnter={()=>setHover(true)} onMouseLeave={()=>setHover(false)}>
-        <div style={{ fontSize: '12px', color: '#a9b3c9', marginBottom: '4px' }}>{label}</div>
+      <div style={{ position: 'relative' }}>
+        <div style={{ fontSize: '12px', color: '#a9b3c9', marginBottom: '4px', display:'inline-block', cursor:'help' }} onMouseEnter={()=>setHover(true)} onMouseLeave={()=>setHover(false)}>{label}</div>
         {children}
         {hover && tooltip && (
           <div style={{ position:'absolute', zIndex:10, top:'100%', left:0, marginTop:'4px', background:'#0f1420', color:'#cbd3e1', border:'1px solid var(--border)', borderRadius:'6px', padding:'8px', fontSize:'12px', maxWidth:'420px', boxShadow:'0 4px 10px rgba(0,0,0,0.35)' }}>
@@ -118,13 +118,58 @@ export default function PerformanceTuner({ onClose }) {
       <span style={{ color:'#cbd3e1' }}>{value? '开启' : '关闭'}</span>
     </label>
   )
-  const NumInput = ({ value, onChange, step=1, min, max }) => (
-    <input type="number" value={value} step={step} min={min} max={max} onChange={e=>onChange(parseFloat(e.target.value))} style={{ width:'100%', padding:'6px', borderRadius:'6px', border:'1px solid var(--border)', background:'#1a1f2b', color:'var(--text)' }} />
-  )
+  const NumInput = ({ value, onChange, step=1, min, max }) => {
+    const [draft, setDraft] = useState(() => String(value ?? ''))
+    useEffect(() => { setDraft(String(value ?? '')) }, [value])
+    const commit = () => {
+      const n = parseFloat(draft)
+      if (Number.isFinite(n)) onChange(n)
+      else setDraft(String(value ?? ''))
+    }
+    const onKeyDown = (e) => {
+      if (e.key === 'Enter') { e.preventDefault(); commit() }
+    }
+    return (
+      <input type="number" value={draft} step={step} min={min} max={max}
+        onChange={e=>setDraft(e.target.value)} onBlur={commit} onKeyDown={onKeyDown}
+        style={{ width:'100%', padding:'6px', borderRadius:'6px', border:'1px solid var(--border)', background:'#1a1f2b', color:'var(--text)' }} />
+    )
+  }
+
+  // 恢复默认配置：将所有参数重置为默认值（即新用户初始配置）
+  const onResetDefaults = () => {
+    try {
+      const next = {
+        ...defaults,
+        // 深拷贝嵌套对象以确保状态变更
+        regionClassWeights: { ...defaults.regionClassWeights },
+        dimensionWeights: { ...defaults.dimensionWeights },
+      }
+      setFlags(next)
+      // 额外的即时同步（useEffect 也会同步），防止用户期望立即生效
+      if (typeof window !== 'undefined') {
+        window.SOLVER_FLAGS = next
+        try { localStorage.setItem('solverFlags', JSON.stringify(next)) } catch {}
+        try { window.__solverWorker?.postMessage({ type:'set_flags', flags: next }) } catch {}
+      }
+      try { alert('已恢复默认配置。') } catch {}
+    } catch (e) {
+      console.warn('恢复默认配置失败：', e)
+    }
+  }
+
+  const contentRef = useRef(null)
+  const scrollPosRef = useRef(0)
+  useEffect(() => {
+    // 在 flags 更新时恢复滚动位置，避免内容变化把容器滚动到顶部
+    if (contentRef.current) {
+      contentRef.current.scrollTop = scrollPosRef.current || contentRef.current.scrollTop
+    }
+  }, [flags])
 
   return (
     <div style={{ position:'fixed', inset:0, background:'rgba(0,0,0,0.55)', display:'flex', alignItems:'center', justifyContent:'center' }}>
-      <div style={{ width:'860px', maxWidth:'95vw', maxHeight:'85vh', overflow:'auto', background:'#0f1420', border:'1px solid var(--border)', borderRadius:'10px', padding:'16px' }}>
+      <div ref={contentRef} onScroll={() => { try { scrollPosRef.current = contentRef.current?.scrollTop || 0 } catch {} }} style={{ width:'860px', maxWidth:'95vw', maxHeight:'85vh', overflow:'auto', background:'#0f1420', border:'1px solid var(--border)', borderRadius:'10px', padding:'16px' }}>
         <div style={{ display:'flex', alignItems:'center', justifyContent:'space-between', marginBottom:'8px' }}>
           <div style={{ fontSize:'16px', fontWeight:700, color:'#cbd3e1' }}>性能调节</div>
           <div style={{ display:'flex', gap:'.5rem' }}>
@@ -266,6 +311,11 @@ export default function PerformanceTuner({ onClose }) {
             <NumInput value={flags.optimizeSwapPasses} onChange={v=>setFlag('optimizeSwapPasses', v)} step={1} min={0} />
           </Field>
         </Section>
+
+        {/* 底部操作区：恢复默认配置 */}
+        <div style={{ borderTop:'1px solid var(--border)', marginTop:'8px', paddingTop:'8px', display:'flex', justifyContent:'flex-end', gap:'.5rem' }}>
+          <button onClick={onResetDefaults} title="恢复为预设的默认参数（新用户初始配置）">恢复默认配置</button>
+        </div>
 
       </div>
     </div>
