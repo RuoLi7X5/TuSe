@@ -141,6 +141,20 @@ canvas {
   cursor: not-allowed;
 }
 
+/* 进度区的小按钮：与深色主题一致 */
+.small-btn {
+  padding: .35rem .6rem;
+  border-radius: 8px;
+  border: 1px solid var(--border);
+  background: #1a1f2b;
+  color: var(--text);
+  cursor: pointer;
+}
+.small-btn:disabled {
+  opacity: 0.6;
+  cursor: not-allowed;
+}
+
 .step-thumb {
   width: 100%;
   border-radius: 8px;

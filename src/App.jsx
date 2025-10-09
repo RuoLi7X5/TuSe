@@ -962,8 +962,8 @@ function App() {
           <div style={{ color: '#a9b3c9', marginBottom: '.25rem', display:'flex', alignItems:'center', justifyContent:'space-between' }}>
             <span>计算进度{!solving && '（空闲）'}</span>
             <span style={{ display:'inline-flex', gap:'6px', alignItems:'center' }}>
-              <button onClick={onCopyLogs} style={{ fontSize:'12px' }}>复制日志</button>
-              <button onClick={onClearLogs} style={{ fontSize:'12px' }}>清空</button>
+              <button onClick={onCopyLogs} className="small-btn" style={{ fontSize:'12px' }}>复制日志</button>
+              <button onClick={onClearLogs} className="small-btn" style={{ fontSize:'12px' }}>清空</button>
               <label style={{ fontSize:'12px', color:'#7f8aa8' }}>
                 <input type="checkbox" checked={autoScroll} onChange={e=>setAutoScroll(!!e.target.checked)} style={{ marginRight:'4px' }} />自动滚动
               </label>
