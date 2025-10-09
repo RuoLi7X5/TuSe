@@ -746,6 +746,7 @@ export function attachSolverToWindow(){
     const TIME_BUDGET_MS = Math.min(120000, 4000 + triangles.length * 10)
     const idToIndex = new Map(triangles.map((t,i)=>[t.id,i]))
     const neighbors = triangles.map(t=>t.neighbors)
+    const originalPath = Array.isArray(path) ? path.slice() : []
     // 早停：路径超过50，直接跳过优化，仅返回关键信息
     if (Array.isArray(path) && path.length > 50) {
       onProgress?.({ phase:'optimize_skipped', reason:'path_too_long', length: path.length })
@@ -773,9 +774,9 @@ export function attachSolverToWindow(){
     let colors = triangles.map(t=>t.color)
     let tmpColors = colors.slice()
     for(const stepColor of path){ const region = buildRegion(tmpColors, startId); for(const id of region){ tmpColors[idToIndex.get(id)] = stepColor } }
-    if(!isUniformFast(tmpColors)){
+    const initiallyUniform = isUniformFast(tmpColors)
+    if(!initiallyUniform){
       report?.({ phase:'analysis', ok:false, reason:'path_not_unified' })
-      return { bestStartId: startId, optimizedPath: path, originalLen: path.length, optimizedLen: path.length, shortened: false, analysis: { ok:false } }
     }
     const gains=[]
     let simColors = colors.slice()
@@ -850,7 +851,7 @@ export function attachSolverToWindow(){
     // 局部窗口重排（关注高权重与高连通潜力）
     const OPT_WINDOW_SIZE = Number.isFinite(window.SOLVER_FLAGS?.optimizeWindowSize) ? window.SOLVER_FLAGS.optimizeWindowSize : 5
     const OPT_ENABLE_WINDOW = window.SOLVER_FLAGS?.optimizeEnableWindow !== false
-      if (OPT_ENABLE_WINDOW && OPT_WINDOW_SIZE>1){
+      if (initiallyUniform && OPT_ENABLE_WINDOW && OPT_WINDOW_SIZE>1){
         const reorderWithinWindow = (p)=>{
           let curColors = triangles.map(t=>t.color)
           const idIdx = idToIndex
@@ -901,7 +902,7 @@ export function attachSolverToWindow(){
     }
     // 反思压缩：尝试移除低优先步骤（仍能统一颜色）
     const OPT_ENABLE_REMOVAL = window.SOLVER_FLAGS?.optimizeEnableRemoval !== false
-    if (OPT_ENABLE_REMOVAL){
+    if (initiallyUniform && OPT_ENABLE_REMOVAL){
       const SNAP_K = 3
       const buildSnapshots = (p)=>{ const snaps=[]; let cc=triangles.map(t=>t.color); for(let i=0;i<p.length;i++){ const reg=buildRegion(cc,startId); for(const id of reg){ cc[idToIndex.get(id)] = p[i] } if((i+1)%SNAP_K===0) snaps.push({ step:i+1, colors: cc.slice() }) } return { snaps } }
       let changed = true; let attempts=0
@@ -926,7 +927,7 @@ export function attachSolverToWindow(){
     }
     // 下界引导的修剪（优先移除不降低下界且增益偏低的步骤）
     const OPT_ENABLE_BOUND_TRIM = window.SOLVER_FLAGS?.optimizeEnableBoundTrim !== false
-    if (OPT_ENABLE_BOUND_TRIM){
+    if (initiallyUniform && OPT_ENABLE_BOUND_TRIM){
       const lowerBoundLocal = (colorsLocal)=>{
         const s = new Set();
         for(let i=0;i<triangles.length;i++){ const t=triangles[i]; const c=colorsLocal[i]; if(!t.deleted && c && c!=='transparent') s.add(c) }
@@ -955,7 +956,7 @@ export function attachSolverToWindow(){
     const OPT_ENABLE_SWAP = window.SOLVER_FLAGS?.optimizeEnableSwap !== false
     let OPT_SWAP_PASSES = Number.isFinite(window.SOLVER_FLAGS?.optimizeSwapPasses) ? window.SOLVER_FLAGS.optimizeSwapPasses : 1
     if (path.length>80) OPT_SWAP_PASSES = Math.max(1, Math.min(OPT_SWAP_PASSES, 1))
-    if (OPT_ENABLE_SWAP && path.length>1){
+    if (initiallyUniform && OPT_ENABLE_SWAP && path.length>1){
       const compressAdj = (arr)=>{ const out=[]; for(const c of arr){ if(out.length===0 || out[out.length-1]!==c) out.push(c) } return out }
       const lbLocal = (colorsLocal)=>{ const s=new Set(); for(let i=0;i<triangles.length;i++){ const t=triangles[i]; const c=colorsLocal[i]; if(!t.deleted && c && c!=='transparent') s.add(c) } return Math.max(0, s.size - 1) }
       const lbAfterFirst = (p)=>{ let cc = triangles.map(t=>t.color); const region = buildRegion(cc, startId); const next = cc.slice(); for(const id of region){ next[idToIndex.get(id)] = p[0] } return lbLocal(next) }
@@ -981,14 +982,47 @@ export function attachSolverToWindow(){
     const prevUseDFS = FLAGS.useDFSFirst
     const prevReturn = FLAGS.returnFirstFeasible
     try { window.SOLVER_FLAGS = { ...FLAGS, useDFSFirst: true, returnFirstFeasible: true } } catch {}
-    const res = await window.Solver_minStepsAuto?.(triangles, palette, 3, (p)=>{ report?.({ ...p, phase: p?.phase || 'optimize_search' }) }, Math.max(0, path.length-1))
+    const targetLimit = Math.max(0, path.length-1)
+    let res = await window.Solver_minStepsAuto?.(triangles, palette, 3, (p)=>{ report?.({ ...p, phase: p?.phase || 'optimize_search' }) }, targetLimit)
+    // 若首轮未改善，尝试第二轮：调整权重偏向桥接与扩张
+    if(!(res && res.paths && res.paths.length>0 && res.minSteps < path.length)){
+      const FLAGS2 = (typeof window !== 'undefined' && window.SOLVER_FLAGS) ? window.SOLVER_FLAGS : {}
+      const prevUseDFS2 = FLAGS2.useDFSFirst
+      const prevReturn2 = FLAGS2.returnFirstFeasible
+      const prevAdj = FLAGS2.adjAfterWeight
+      const prevBoundary = FLAGS2.boundaryWeight
+      const prevBridge = FLAGS2.bridgeWeight
+      try { window.SOLVER_FLAGS = { ...FLAGS2, useDFSFirst: true, returnFirstFeasible: true, adjAfterWeight: Math.max(0.4, (prevAdj??0.6)*1.2), boundaryWeight: Math.max(0.6, (prevBoundary??0.8)*1.1), bridgeWeight: Math.max(1.0, (prevBridge??1.0)*1.3) } } catch {}
+      report?.({ phase:'optimize_search_round2' })
+      res = await window.Solver_minStepsAuto?.(triangles, palette, 3, (p)=>{ report?.({ ...p, phase: p?.phase || 'optimize_search_round2' }) }, targetLimit)
+      try { window.SOLVER_FLAGS = { ...window.SOLVER_FLAGS, useDFSFirst: prevUseDFS2, returnFirstFeasible: prevReturn2, adjAfterWeight: prevAdj, boundaryWeight: prevBoundary, bridgeWeight: prevBridge } } catch {}
+    }
     try { window.SOLVER_FLAGS = { ...window.SOLVER_FLAGS, useDFSFirst: prevUseDFS, returnFirstFeasible: prevReturn } } catch {}
     if(res && res.paths && res.paths.length>0 && res.minSteps < path.length){
-      onProgress?.({ phase:'optimized', improved: true, minSteps: res.minSteps })
-      return { bestStartId: res.bestStartId ?? startId, optimizedPath: res.paths[0], originalLen: path.length, optimizedLen: res.minSteps, shortened: true, analysis: { ok:true, critical } }
+      // 双重一致性校验：确保返回路径统一颜色
+      let verifyColors = triangles.map(t=>t.color)
+      for(const c of res.paths[0]){ const reg = buildRegion(verifyColors, startId); for(const id of reg){ verifyColors[idToIndex.get(id)] = c } }
+      if(isUniformFast(verifyColors)){
+        onProgress?.({ phase:'optimized', improved: true, minSteps: res.minSteps })
+        return { bestStartId: res.bestStartId ?? startId, optimizedPath: res.paths[0], originalLen: path.length, optimizedLen: res.minSteps, shortened: true, analysis: { ok:true, critical } }
+      } else {
+        onProgress?.({ phase:'optimized_invalid', reason:'not_uniform_res', length: res.minSteps })
+      }
     } else {
+      // 最终一致性校验：若优化后的路径不能统一颜色，则回退到原始路径
+      let finalColors = triangles.map(t=>t.color)
+      for(const c of path){ const reg = buildRegion(finalColors, startId); for(const id of reg){ finalColors[idToIndex.get(id)] = c } }
+      const okUniform = (function(colorsArr){
+        let first=null
+        for(let i=0;i<triangles.length;i++){ const t=triangles[i]; const c=colorsArr[i]; if(t.deleted || !c || c==='transparent') continue; if(first===null){ first=c } else if(c!==first){ return false } }
+        return first!==null
+      })(finalColors)
+      if(!okUniform){
+        onProgress?.({ phase:'optimized_invalid', reason:'not_uniform', length: path.length })
+        return { bestStartId: startId, optimizedPath: originalPath, originalLen: originalPath.length, optimizedLen: originalPath.length, shortened: false, analysis: { ok:false, reason:'not_uniform_after_opt' } }
+      }
       onProgress?.({ phase:'optimized', improved: false })
-      return { bestStartId: startId, optimizedPath: path, originalLen: path.length, optimizedLen: path.length, shortened: false, analysis: { ok:true, critical } }
+      return { bestStartId: startId, optimizedPath: path, originalLen: originalPath.length, optimizedLen: path.length, shortened: path.length < originalPath.length, analysis: { ok:true, critical } }
     }
   }
 }

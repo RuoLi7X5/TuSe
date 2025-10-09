@@ -683,7 +683,24 @@ function App() {
         })
       }
       if (!result) { setStatus('路径优化失败'); setSolveProgress(null); return }
-      if (result.shortened && result.optimizedPath && result.optimizedLen < (originalPath?.length||Infinity)){
+      // 本地统一性校验：仅在“更短且统一”时替换展示
+      const checkUniformPath = (tris, startIdLocal, pathLocal)=>{
+        const idToIndex = new Map(tris.map((t,i)=>[t.id,i]))
+        const neighbors = tris.map(t=>t.neighbors)
+        const isUniformFast = (colorsArr)=>{
+          let first=null
+          for(let i=0;i<tris.length;i++){ const t=tris[i]; const c=colorsArr[i]; if(t.deleted || !c || c==='transparent') continue; if(first===null){ first=c } else if(c!==first){ return false } }
+          return first!==null
+        }
+        let colorsLocal = tris.map(t=>t.color)
+        const buildRegion = (colorsArr)=>{ const rc = colorsArr[idToIndex.get(startIdLocal)]; const rs=new Set(); const q=[startIdLocal]; const v=new Set([startIdLocal]); while(q.length){ const id=q.shift(); const idx=idToIndex.get(id); if(colorsArr[idx]!==rc) continue; rs.add(id); for(const nb of neighbors[idx]){ if(!v.has(nb)){ v.add(nb); q.push(nb) } } } return rs }
+        for(const stepColor of pathLocal){ const reg = buildRegion(colorsLocal); for(const id of reg){ colorsLocal[idToIndex.get(id)] = stepColor } }
+        return isUniformFast(colorsLocal)
+      }
+      const isUniformOut = Array.isArray(result.optimizedPath)
+        ? checkUniformPath(triangles, result.bestStartId ?? sid, result.optimizedPath)
+        : false
+      if (result.shortened && result.optimizedPath && result.optimizedLen < (originalPath?.length||Infinity) && isUniformOut){
         // 生成新的快照
         const SNAPSHOT_LIMIT = 40
         const snapshots = await captureCanvasPNG(canvasRef.current, triangles, result.bestStartId ?? sid, result.optimizedPath.slice(0, SNAPSHOT_LIMIT))
@@ -691,7 +708,7 @@ function App() {
         setBestStartId(result.bestStartId ?? sid)
         setStatus(`路径优化成功：由 ${originalPath.length} 步缩短为 ${result.optimizedLen} 步（起点 #${result.bestStartId ?? sid}）`)
       } else {
-        setStatus('未发现更短步骤，但已完成关键节点分析（可查看日志）')
+        setStatus('未发现更短且统一的路径（已完成关键节点分析，可查看日志）')
       }
       setSolveProgress(null)
     } catch (err) {
@@ -702,12 +719,21 @@ function App() {
     }
   }, [steps, bestStartId, triangles, palette])
 
-  // 日志窗口自动滚动到最新
+  // 进度窗口：自动滚动控制与复制/清空
+  const [autoScroll, setAutoScroll] = useState(true)
+  const onCopyLogs = useCallback(()=>{
+    const text = progressLogs.join('\n')
+    try { navigator.clipboard?.writeText(text); setStatus('已复制进度日志到剪贴板') }
+    catch { setStatus('复制失败，可手动选择文本复制') }
+  }, [progressLogs])
+  const onClearLogs = useCallback(()=>{ setProgressLogs([]); setStatus('已清空进度日志') }, [])
+  // 日志窗口自动滚动到最新（可关闭）
   useEffect(()=>{
+    if (!autoScroll) return
     const el = progressLogRef.current
     if (!el) return
     el.scrollTop = el.scrollHeight
-  }, [progressLogs])
+  }, [progressLogs, autoScroll])
 
   // 导出：保存后的网格图导出为 PNG
   const onExportGrid = useCallback(() => {
@@ -918,33 +944,38 @@ function App() {
             <button onClick={onEnterEdit}>进入编辑</button>
           )}
         </div>
-        {solving && (
-          <div style={{ marginTop: '.5rem', padding: '.5rem', border: '1px solid var(--border)', borderRadius: '8px', background: '#121826' }}>
-            <div style={{ color: '#a9b3c9', marginBottom: '.25rem', display:'flex', alignItems:'center', justifyContent:'space-between' }}>
-              <span>计算进度</span>
+        <div style={{ marginTop: '.5rem', padding: '.5rem', border: '1px solid var(--border)', borderRadius: '8px', background: '#121826' }}>
+          <div style={{ color: '#a9b3c9', marginBottom: '.25rem', display:'flex', alignItems:'center', justifyContent:'space-between' }}>
+            <span>计算进度{!solving && '（空闲）'}</span>
+            <span style={{ display:'inline-flex', gap:'6px', alignItems:'center' }}>
+              <button onClick={onCopyLogs} style={{ fontSize:'12px' }}>复制日志</button>
+              <button onClick={onClearLogs} style={{ fontSize:'12px' }}>清空</button>
+              <label style={{ fontSize:'12px', color:'#7f8aa8' }}>
+                <input type="checkbox" checked={autoScroll} onChange={e=>setAutoScroll(!!e.target.checked)} style={{ marginRight:'4px' }} />自动滚动
+              </label>
               {typeof solveProgress?.elapsedMs==='number' && <span style={{ fontSize:'12px', color:'#7f8aa8' }}>耗时 {Math.round(solveProgress.elapsedMs/1000)}s</span>}
-            </div>
-            {/* 顶部统计信息 */}
-            <div style={{ display:'flex', flexWrap:'wrap', gap:'8px', fontSize:'12px', marginBottom: '.5rem' }}>
-              {solveProgress?.phase && <span>阶段：{solveProgress.phase}</span>}
-              {typeof solveProgress?.nodes==='number' && <span>探索节点：{solveProgress.nodes}</span>}
-              {typeof solveProgress?.queue==='number' && <span>队列：{solveProgress.queue}</span>}
-              {typeof solveProgress?.solutions==='number' && <span>候选分支：{solveProgress.solutions}</span>}
-              {typeof solveProgress?.components==='number' && <span>分量数：{solveProgress.components}</span>}
-              {solveProgress?.bestStartId!=null && <span>当前最优起点：#{solveProgress.bestStartId}</span>}
-              {typeof solveProgress?.minSteps==='number' && <span>当前最少步骤：{solveProgress.minSteps}</span>}
-              {typeof solveProgress?.perf?.enqueued==='number' && <span>入队：{solveProgress.perf.enqueued}</span>}
-              {typeof solveProgress?.perf?.expanded==='number' && <span>扩张：{solveProgress.perf.expanded}</span>}
-              {typeof solveProgress?.perf?.filteredZero==='number' && <span>零扩张过滤：{solveProgress.perf.filteredZero}</span>}
-            </div>
-            {/* 滚动日志窗口 */}
-            <div ref={progressLogRef} style={{ height:'160px', overflowY:'auto', background:'#0f1420', border:'1px solid var(--border)', borderRadius:'6px', padding:'6px' }}>
-              <pre style={{ margin:0, whiteSpace:'pre-wrap', fontFamily:'Consolas, Menlo, monospace', fontSize:'12px', color:'#a9b3c9' }}>
-                {progressLogs.map((l, i)=> (<div key={i}>{l}</div>))}
-              </pre>
-            </div>
+            </span>
           </div>
-        )}
+          {/* 顶部统计信息 */}
+          <div style={{ display:'flex', flexWrap:'wrap', gap:'8px', fontSize:'12px', marginBottom: '.5rem' }}>
+            {solveProgress?.phase && <span>阶段：{solveProgress.phase}</span>}
+            {typeof solveProgress?.nodes==='number' && <span>探索节点：{solveProgress.nodes}</span>}
+            {typeof solveProgress?.queue==='number' && <span>队列：{solveProgress.queue}</span>}
+            {typeof solveProgress?.solutions==='number' && <span>候选分支：{solveProgress.solutions}</span>}
+            {typeof solveProgress?.components==='number' && <span>分量数：{solveProgress.components}</span>}
+            {solveProgress?.bestStartId!=null && <span>当前最优起点：#{solveProgress.bestStartId}</span>}
+            {typeof solveProgress?.minSteps==='number' && <span>当前最少步骤：{solveProgress.minSteps}</span>}
+            {typeof solveProgress?.perf?.enqueued==='number' && <span>入队：{solveProgress.perf.enqueued}</span>}
+            {typeof solveProgress?.perf?.expanded==='number' && <span>扩张：{solveProgress.perf.expanded}</span>}
+            {typeof solveProgress?.perf?.filteredZero==='number' && <span>零扩张过滤：{solveProgress.perf.filteredZero}</span>}
+          </div>
+          {/* 滚动日志窗口 */}
+          <div ref={progressLogRef} style={{ height:'160px', overflowY:'auto', background:'#0f1420', border:'1px solid var(--border)', borderRadius:'6px', padding:'6px' }}>
+            <pre style={{ margin:0, whiteSpace:'pre-wrap', fontFamily:'Consolas, Menlo, monospace', fontSize:'12px', color:'#a9b3c9' }}>
+              {progressLogs.map((l, i)=> (<div key={i}>{l}</div>))}
+            </pre>
+          </div>
+        </div>
         {isUniform(triangles) && triangles.length>0 && (
           <div className="success">成功！画布统一为一种颜色</div>
         )}

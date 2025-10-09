@@ -530,6 +530,7 @@ async function OptimizeSolution(triangles, palette, startId, path, onProgress){
   const TIME_BUDGET_MS = 120000
   const idToIndex = new Map(triangles.map((t,i)=>[t.id,i]))
   const neighbors = triangles.map(t=>t.neighbors)
+  const originalPath = Array.isArray(path) ? path.slice() : []
   // 早停：路径超过50，直接跳过优化，仅返回关键信息
   if (Array.isArray(path) && path.length > 50) {
     onProgress?.({ phase:'optimize_skipped', reason:'path_too_long', length: path.length })
@@ -553,15 +554,15 @@ async function OptimizeSolution(triangles, palette, startId, path, onProgress){
     return rs
   }
   const isUniformNow = ()=> isUniformSimple(colors.map((c,i)=>({color:c,id:i,neighbors:neighbors[i]})))
-  // 若当前路径不统一，则直接返回原路径
+  // 若当前路径不统一：不再早退，记录后跳过局部优化，直接进入全局重算阶段
   let tmpColors = colors.slice()
   for(const stepColor of path){
     const region = buildRegion(tmpColors, startId)
     for(const id of region){ tmpColors[idToIndex.get(id)] = stepColor }
   }
-  if(!isUniformFast(tmpColors)){
+  const initiallyUniform = isUniformFast(tmpColors)
+  if(!initiallyUniform){
     onProgress?.({ phase:'analysis', ok:false, reason:'path_not_unified' })
-    return { bestStartId: startId, optimizedPath: path, originalLen: path.length, optimizedLen: path.length, shortened: false, analysis: { ok:false } }
   }
   // 计算每一步的增益，识别关键节点
   const gains=[]
@@ -626,7 +627,7 @@ async function OptimizeSolution(triangles, palette, startId, path, onProgress){
   // 局部窗口重排（关注高权重与高连通潜力）
   const OPT_WINDOW_SIZE = Number.isFinite(self.SOLVER_FLAGS?.optimizeWindowSize) ? self.SOLVER_FLAGS.optimizeWindowSize : 5
   const OPT_ENABLE_WINDOW = self.SOLVER_FLAGS?.optimizeEnableWindow !== false
-  if (OPT_ENABLE_WINDOW && OPT_WINDOW_SIZE>1){
+  if (initiallyUniform && OPT_ENABLE_WINDOW && OPT_WINDOW_SIZE>1){
     const reorderWithinWindow = (p)=>{
       let curColors = triangles.map(t=>t.color)
       const metrics=[]
@@ -669,9 +670,76 @@ async function OptimizeSolution(triangles, palette, startId, path, onProgress){
     const newPath = reorderWithinWindow(path)
     if(newPath.length === path.length) path = newPath
   }
+  // 进一步：窗口束搜索（Beam），在局部窗口内尝试多候选排序以寻求更短压缩
+  const OPT_ENABLE_BEAM = self.SOLVER_FLAGS?.optimizeEnableBeamWindow !== false
+  let OPT_BEAM_WIDTH = Number.isFinite(self.SOLVER_FLAGS?.optimizeBeamWidth) ? self.SOLVER_FLAGS.optimizeBeamWidth : 4
+  let OPT_BEAM_WINDOWS = Number.isFinite(self.SOLVER_FLAGS?.optimizeBeamWindows) ? self.SOLVER_FLAGS.optimizeBeamWindows : 2
+  if (initiallyUniform && OPT_ENABLE_BEAM && OPT_WINDOW_SIZE>1 && OPT_BEAM_WIDTH>1){
+    const applyPath = (p)=>{ let cc=triangles.map(t=>t.color); for(const c of p){ const reg=buildRegion(cc,startId); for(const id of reg){ cc[idToIndex.get(id)]=c } } return cc }
+    const compressAdj = (arr)=>{ const out=[]; for(const c of arr){ if(out.length===0 || out[out.length-1]!==c) out.push(c) } return out }
+    const scoreSeg = (seg, cc)=>{
+      // 简化：使用窗口重排度量中的 priority 近似评分
+      const idIdx=idToIndex; const neigh=neighbors
+      let curColors = cc.slice(); let s=0
+      for(const color of seg){
+        const region = buildRegion(curColors, startId)
+        const rc = curColors[idIdx.get(startId)]
+        const adjSet=new Set(); for(const tid of region){ const idx=idIdx.get(tid); for(const nb of neigh[idx]){ const nidx=idIdx.get(nb); const cc2=curColors[nidx]; if(cc2!==rc && cc2 && cc2!=='transparent'){ adjSet.add(cc2) } } }
+        const beforeAdj=adjSet.size
+        const tmp=curColors.slice(); for(const id of region){ tmp[idIdx.get(id)]=color }
+        const reg2=new Set([...region]); const q=[...region]; const visited=new Set([...region])
+        while(q.length){ const tid=q.shift(); const idx=idIdx.get(tid); for(const nb of neigh[idx]){ const nidx=idIdx.get(nb); const tri=triangles[nidx]; if(!visited.has(nb) && !tri.deleted && tri.color!=='transparent' && tmp[nidx]===color){ visited.add(nb); reg2.add(nb); q.push(nb) } } }
+        const adjSet2=new Set(); for(const tid of reg2){ const idx=idIdx.get(tid); for(const nb of neigh[idx]){ const nidx=idIdx.get(nb); const cc3=tmp[nidx]; if(cc3!==color && cc3 && cc3!=='transparent'){ adjSet2.add(cc3) } } }
+        const afterAdj=adjSet2.size
+        const barrierDelta=Math.max(0,beforeAdj-afterAdj)
+        const expandAdj=afterAdj
+        const priority = (((self.SOLVER_FLAGS?.dimensionWeights?.expand)||1)*expandAdj + ((self.SOLVER_FLAGS?.dimensionWeights?.barrier)||0.7)*barrierDelta)
+        s+=priority
+        for(const id of region){ curColors[idIdx.get(id)]=color }
+      }
+      return s
+    }
+    const genCandidates = (seg)=>{
+      const uniq = Array.from(seg)
+      // 生成若干候选：降序、升序、相邻交换组合
+      const freq = new Map(); uniq.forEach(c=>freq.set(c,(freq.get(c)||0)+1))
+      const baseAsc = uniq.slice().sort()
+      const baseDesc = uniq.slice().sort().reverse()
+      const cand=[uniq, baseAsc, baseDesc]
+      if(uniq.length>=2) cand.push([uniq[1],uniq[0],...uniq.slice(2)])
+      if(uniq.length>=3) cand.push([uniq[2],uniq[0],uniq[1],...uniq.slice(3)])
+      // 去重
+      const seen=new Set(); const out=[]
+      for(const c of cand){ const k=c.join('|'); if(!seen.has(k)){ seen.add(k); out.push(c) } }
+      return out
+    }
+    let attempts=0
+    const maxPass = Math.max(1, OPT_BEAM_WINDOWS)
+    while(attempts<maxPass){
+      attempts++
+      let improved=false
+      for(let i=0;i+OPT_WINDOW_SIZE<=path.length;i+=OPT_WINDOW_SIZE){
+        const seg = path.slice(i, i+OPT_WINDOW_SIZE)
+        const ccBefore = applyPath(path.slice(0,i))
+        const cands = genCandidates(seg)
+        const scored = cands.map(s=>({ s, score: scoreSeg(s, ccBefore) }))
+        scored.sort((a,b)=> b.score - a.score)
+        const top = scored.slice(0, OPT_BEAM_WIDTH)
+        for(const cand of top){
+          const tryPath = path.slice(0,i).concat(cand.s, path.slice(i+OPT_WINDOW_SIZE))
+          const colorsTest = applyPath(tryPath)
+          if(!isUniformFast(colorsTest)) continue
+          const lenOrig = compressAdj(path).length
+          const lenNew = compressAdj(tryPath).length
+          if(lenNew < lenOrig){ path = tryPath; improved=true; onProgress?.({ phase:'optimize_beam', at:i, len:lenNew }) ; break }
+        }
+      }
+      if(!improved) break
+    }
+  }
   // 反思压缩：尝试移除低优先步骤（仍能统一颜色）
   const OPT_ENABLE_REMOVAL = self.SOLVER_FLAGS?.optimizeEnableRemoval !== false
-  if (OPT_ENABLE_REMOVAL){
+  if (initiallyUniform && OPT_ENABLE_REMOVAL){
     const SNAP_K = 3
     const buildSnapshots = (p)=>{ const snaps=[]; let cc=triangles.map(t=>t.color); for(let i=0;i<p.length;i++){ const reg=buildRegion(cc,startId); for(const id of reg){ cc[idToIndex.get(id)] = p[i] } if((i+1)%SNAP_K===0) snaps.push({ step:i+1, colors: cc.slice() }) } return { snaps } }
     let changed = true; let attempts=0
@@ -694,7 +762,7 @@ async function OptimizeSolution(triangles, palette, startId, path, onProgress){
   }
   // 下界引导的修剪（优先移除不降低下界且增益偏低的步骤）
   const OPT_ENABLE_BOUND_TRIM = self.SOLVER_FLAGS?.optimizeEnableBoundTrim !== false
-  if (OPT_ENABLE_BOUND_TRIM){
+  if (initiallyUniform && OPT_ENABLE_BOUND_TRIM){
     const lowerBoundLocal = (colorsLocal)=>{
       const s = new Set();
       for(let i=0;i<triangles.length;i++){ const t=triangles[i]; const c=colorsLocal[i]; if(!t.deleted && c && c!=='transparent') s.add(c) }
@@ -723,7 +791,7 @@ async function OptimizeSolution(triangles, palette, startId, path, onProgress){
   const OPT_ENABLE_SWAP = self.SOLVER_FLAGS?.optimizeEnableSwap !== false
   let OPT_SWAP_PASSES = Number.isFinite(self.SOLVER_FLAGS?.optimizeSwapPasses) ? self.SOLVER_FLAGS.optimizeSwapPasses : 1
   if (path.length>80) OPT_SWAP_PASSES = Math.max(1, Math.min(OPT_SWAP_PASSES, 1))
-  if (OPT_ENABLE_SWAP && path.length>1){
+  if (initiallyUniform && OPT_ENABLE_SWAP && path.length>1){
     const compressAdj = (arr)=>{ const out=[]; for(const c of arr){ if(out.length===0 || out[out.length-1]!==c) out.push(c) } return out }
     const lbLocal = (colorsLocal)=>{ const s=new Set(); for(let i=0;i<triangles.length;i++){ const t=triangles[i]; const c=colorsLocal[i]; if(!t.deleted && c && c!=='transparent') s.add(c) } return Math.max(0, s.size - 1) }
     const lbAfterFirst = (p)=>{ let cc = triangles.map(t=>t.color); const region = buildRegion(cc, startId); const next = cc.slice(); for(const id of region){ next[idToIndex.get(id)] = p[0] } return lbLocal(next) }
@@ -748,14 +816,47 @@ async function OptimizeSolution(triangles, palette, startId, path, onProgress){
   const prevUseDFS = FLAGS.useDFSFirst
   const prevReturn = FLAGS.returnFirstFeasible
   try { self.SOLVER_FLAGS = { ...FLAGS, useDFSFirst: true, returnFirstFeasible: true } } catch {}
-  const res = await Solver_minStepsAuto(triangles, palette, 3, (p)=>{ onProgress?.({ ...p, phase: p?.phase || 'optimize_search' }) }, Math.max(0, path.length-1))
+  const targetLimit = Math.max(0, path.length-1)
+  let res = await Solver_minStepsAuto(triangles, palette, 3, (p)=>{ onProgress?.({ ...p, phase: p?.phase || 'optimize_search' }) }, targetLimit)
+  // 若首轮未改善，尝试第二轮：调整权重偏向桥接与扩张
+  if(!(res && res.paths && res.paths.length>0 && res.minSteps < path.length)){
+    const FLAGS2 = (typeof self !== 'undefined' && self.SOLVER_FLAGS) ? self.SOLVER_FLAGS : {}
+    const prevUseDFS2 = FLAGS2.useDFSFirst
+    const prevReturn2 = FLAGS2.returnFirstFeasible
+    const prevAdj = FLAGS2.adjAfterWeight
+    const prevBoundary = FLAGS2.boundaryWeight
+    const prevBridge = FLAGS2.bridgeWeight
+    try { self.SOLVER_FLAGS = { ...FLAGS2, useDFSFirst: true, returnFirstFeasible: true, adjAfterWeight: Math.max(0.4, (prevAdj??0.6)*1.2), boundaryWeight: Math.max(0.6, (prevBoundary??0.8)*1.1), bridgeWeight: Math.max(1.0, (prevBridge??1.0)*1.3) } } catch {}
+    onProgress?.({ phase:'optimize_search_round2' })
+    res = await Solver_minStepsAuto(triangles, palette, 3, (p)=>{ onProgress?.({ ...p, phase: p?.phase || 'optimize_search_round2' }) }, targetLimit)
+    try { self.SOLVER_FLAGS = { ...self.SOLVER_FLAGS, useDFSFirst: prevUseDFS2, returnFirstFeasible: prevReturn2, adjAfterWeight: prevAdj, boundaryWeight: prevBoundary, bridgeWeight: prevBridge } } catch {}
+  }
   try { self.SOLVER_FLAGS = { ...self.SOLVER_FLAGS, useDFSFirst: prevUseDFS, returnFirstFeasible: prevReturn } } catch {}
   if(res && res.paths && res.paths.length>0 && res.minSteps < path.length){
-    onProgress?.({ phase:'optimized', improved: true, minSteps: res.minSteps })
-    return { bestStartId: res.bestStartId ?? startId, optimizedPath: res.paths[0], originalLen: path.length, optimizedLen: res.minSteps, shortened: true, analysis: { ok:true, critical } }
+    // 双重一致性校验：确保返回路径统一颜色
+    let verifyColors = triangles.map(t=>t.color)
+    for(const c of res.paths[0]){ const reg = buildRegion(verifyColors, startId); for(const id of reg){ verifyColors[idToIndex.get(id)] = c } }
+    if(isUniformFast(verifyColors)){
+      onProgress?.({ phase:'optimized', improved: true, minSteps: res.minSteps })
+      return { bestStartId: res.bestStartId ?? startId, optimizedPath: res.paths[0], originalLen: path.length, optimizedLen: res.minSteps, shortened: true, analysis: { ok:true, critical } }
+    } else {
+      onProgress?.({ phase:'optimized_invalid', reason:'not_uniform_res', length: res.minSteps })
+    }
   } else {
+    // 最终一致性校验：若优化后的路径不能统一颜色，则回退到原始路径
+    let finalColors = triangles.map(t=>t.color)
+    for(const c of path){ const reg = buildRegion(finalColors, startId); for(const id of reg){ finalColors[idToIndex.get(id)] = c } }
+    const okUniform = (function(colorsArr){
+      let first=null
+      for(let i=0;i<triangles.length;i++){ const t=triangles[i]; const c=colorsArr[i]; if(t.deleted || !c || c==='transparent') continue; if(first===null){ first=c } else if(c!==first){ return false } }
+      return first!==null
+    })(finalColors)
+    if(!okUniform){
+      onProgress?.({ phase:'optimized_invalid', reason:'not_uniform', length: path.length })
+      return { bestStartId: startId, optimizedPath: originalPath, originalLen: originalPath.length, optimizedLen: originalPath.length, shortened: false, analysis: { ok:false, reason:'not_uniform_after_opt' } }
+    }
     onProgress?.({ phase:'optimized', improved: false })
-    return { bestStartId: startId, optimizedPath: path, originalLen: path.length, optimizedLen: path.length, shortened: false, analysis: { ok:true, critical } }
+    return { bestStartId: startId, optimizedPath: path, originalLen: originalPath.length, optimizedLen: path.length, shortened: path.length < originalPath.length, analysis: { ok:true, critical } }
   }
 }
 
