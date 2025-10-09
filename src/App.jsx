@@ -5,6 +5,7 @@ import UploadPanel from './components/UploadPanel'
 import TriangleCanvas from './components/TriangleCanvas'
 import Controls from './components/Controls'
 import StepsPanel from './components/StepsPanel'
+import HelpPage from './components/HelpPage'
 
 import { quantizeImage, setColorTuning } from './utils/color-utils'
 import { buildTriangleGrid, buildTriangleGridVertical, mapImageToGrid, isUniform } from './utils/grid-utils'
@@ -34,6 +35,13 @@ if (typeof window !== 'undefined') {
 attachSolverToWindow()
 
 function App() {
+  // 简易哈希路由：用于“说明”子页
+  const [route, setRoute] = useState(() => (typeof window!=='undefined' ? window.location.hash : ''))
+  useEffect(() => {
+    const onHash = () => setRoute(window.location.hash || '')
+    window.addEventListener('hashchange', onHash)
+    return () => window.removeEventListener('hashchange', onHash)
+  }, [])
   const [imgBitmap, setImgBitmap] = useState(null)
   const [palette, setPalette] = useState([])
   const [grid, setGrid] = useState(null)
@@ -924,6 +932,16 @@ function App() {
     }
   }, [triangles, palette])
 
+  // 说明子页渲染（含返回按钮在组件内部）
+  if (route === '#/help') {
+    return (
+      <>
+        <a href="#" className="help-link" style={{ position:'fixed', top:'12px', right:'16px', color:'var(--muted)', textDecoration:'none' }}>返回主页</a>
+        <HelpPage />
+      </>
+    )
+  }
+
   return (
     <div className="app">
       <div className="panel upload">
@@ -931,6 +949,9 @@ function App() {
         <UploadPanel onImage={handleImage} />
         <div className="status">{status}</div>
       </div>
+
+      {/* 顶部右上角说明入口 */}
+      <a href="#/help" className="help-link" style={{ position:'fixed', top:'12px', right:'16px', color:'var(--muted)', textDecoration:'none' }}>说明</a>
 
       <div className="panel">
         <h2>画布</h2>
