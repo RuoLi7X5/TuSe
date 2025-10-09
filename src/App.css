@@ -1,0 +1,212 @@
+:root {
+  --bg: #0f1115;
+  --panel: #151822;
+  --border: #222636;
+  --text: #e8eef9;
+  --muted: #a9b3c9;
+  --accent: #4f8df7;
+  --success: #3fc77a;
+  --side-width: 240px; /* 两侧列宽（布局比例），可由滑块动态调整 */
+  --canvas-scale: 1; /* 画布显示缩放（网页页面视觉大小） */
+  --canvas-window-height: 480px; /* 横置长方形窗口高度（可按需调整） */
+}
+
+#root {
+  max-width: 100%;
+  margin: 0 auto;
+  padding: 1.5rem;
+  color: var(--text);
+}
+
+.app {
+  display: grid;
+  /* 让画布（左列）占据最大空间，控制与步骤固定宽度 */
+  grid-template-columns: 1fr var(--side-width) var(--side-width);
+  gap: 1rem;
+}
+
+.panel {
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  padding: 1rem;
+}
+
+.panel h2 {
+  font-size: 1rem;
+  margin: 0 0 .75rem 0;
+  color: var(--muted);
+}
+
+.upload {
+  display: flex;
+  flex-direction: row;
+  align-items: center;
+  gap: .75rem;
+  grid-column: 1 / -1; /* 顶部横跨所有列 */
+}
+.upload h2 { margin: 0; white-space: nowrap; }
+.upload .status { margin-top: 0; }
+.upload .dropzone { min-height: 48px; padding: .75rem 1rem; }
+
+.dropzone {
+  border: 2px dashed var(--border);
+  border-radius: 12px;
+  padding: 1rem;
+  text-align: center;
+  color: var(--muted);
+  background: #12151f;
+}
+
+.controls {
+  display: grid;
+  gap: .75rem;
+}
+
+/* 控制区域按钮统一深色样式，避免默认白底 */
+.controls button {
+  padding: .5rem .75rem;
+  border-radius: 8px;
+  border: 1px solid var(--border);
+  background: #1a1f2b;
+  color: var(--text);
+  cursor: pointer;
+}
+.controls button:disabled {
+  opacity: 0.6;
+  cursor: not-allowed;
+}
+
+.palette {
+  display: grid;
+  grid-template-columns: repeat(8, 1fr);
+  gap: .5rem;
+}
+
+.swatch {
+  height: 28px;
+  border-radius: 6px;
+  border: 1px solid var(--border);
+  cursor: pointer;
+}
+
+.swatch.selected {
+  outline: 2px solid var(--accent);
+}
+
+.grid-controls {
+  display: grid;
+  gap: .5rem;
+}
+
+.row {
+  display: flex;
+  align-items: center;
+  gap: .5rem;
+}
+
+.canvas-wrap {
+  position: relative;
+  background: #0b0d13;
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  height: var(--canvas-window-height); /* 固定为横置窗口高度，宽度随列变化 */
+  overflow: auto; /* 超出窗口时滚动查看 */
+}
+
+canvas {
+  display: block;
+  width: 100%;
+  height: auto;
+  transform: scale(var(--canvas-scale));
+  transform-origin: top left;
+}
+
+.steps {
+  display: grid;
+  gap: .75rem;
+}
+
+/* 方案步骤面板的按钮样式，统一深色并保持可读性 */
+.steps button {
+  padding: .5rem .75rem;
+  border-radius: 8px;
+  border: 1px solid var(--border);
+  background: #1a1f2b;
+  color: var(--text);
+  cursor: pointer;
+}
+.steps button:disabled {
+  opacity: 0.6;
+  cursor: not-allowed;
+}
+
+.step-thumb {
+  width: 100%;
+  border-radius: 8px;
+  border: 1px solid var(--border);
+}
+
+.toolbar {
+  display: flex;
+  gap: .5rem;
+}
+
+.toolbar button {
+  padding: .5rem .75rem;
+  border-radius: 8px;
+  border: 1px solid var(--border);
+  background: #1a1f2b;
+  color: var(--text);
+  cursor: pointer;
+}
+
+.toolbar button.primary {
+  border-color: var(--accent);
+}
+
+.status {
+  margin-top: .5rem;
+  font-size: .9rem;
+  color: var(--muted);
+}
+
+.success {
+  color: var(--success);
+}
+
+.logo {
+  height: 6em;
+  padding: 1.5em;
+  will-change: filter;
+  transition: filter 300ms;
+}
+.logo:hover {
+  filter: drop-shadow(0 0 2em #646cffaa);
+}
+.logo.react:hover {
+  filter: drop-shadow(0 0 2em #61dafbaa);
+}
+
+@keyframes logo-spin {
+  from {
+    transform: rotate(0deg);
+  }
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+@media (prefers-reduced-motion: no-preference) {
+  a:nth-of-type(2) .logo {
+    animation: logo-spin infinite 20s linear;
+  }
+}
+
+.card {
+  padding: 2em;
+}
+
+.read-the-docs {
+  color: #888;
+}
