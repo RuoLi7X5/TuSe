@@ -12,6 +12,12 @@ function draw(ctx, grid, triangles, selectedIds, rotation, selectionRect, lassoP
   if (!ctx) return
   ctx.clearRect(0, 0, ctx.canvas.width, ctx.canvas.height)
   const isSelected = (id)=> Array.isArray(selectedIds) && selectedIds.includes(id)
+  // 统一线条端点/拐角样式，避免不同边呈现不一致的粗细或尖角
+  ctx.lineJoin = 'round'
+  ctx.lineCap = 'round'
+  ctx.miterLimit = 2
+
+  // 第一轮：仅填充颜色，不描边
   for (const t of triangles) {
     if (t.deleted || t.color === 'transparent') continue
     ctx.beginPath()
@@ -25,13 +31,41 @@ function draw(ctx, grid, triangles, selectedIds, rotation, selectionRect, lassoP
     ctx.closePath()
     ctx.fillStyle = t.color
     ctx.fill()
-    if (isSelected(t.id)) {
-      ctx.lineWidth = 2
-      ctx.strokeStyle = '#4f8df7'
-    } else {
-      ctx.lineWidth = 1
-      ctx.strokeStyle = '#000000'
+  }
+
+  // 第二轮：非选中三角形基础轮廓（黑色，细线）
+  ctx.lineWidth = 1
+  ctx.strokeStyle = '#000000'
+  for (const t of triangles) {
+    if (t.deleted || t.color === 'transparent') continue
+    if (isSelected(t.id)) continue
+    ctx.beginPath()
+    const verts = (t.drawVertices && t.drawVertices.length>=3) ? t.drawVertices : t.vertices
+    const v0 = transformPoint(verts[0], grid, rotation)
+    ctx.moveTo(v0.x, v0.y)
+    for (let i=1;i<verts.length;i++){
+      const vi = transformPoint(verts[i], grid, rotation)
+      ctx.lineTo(vi.x, vi.y)
     }
+    ctx.closePath()
+    ctx.stroke()
+  }
+
+  // 第三轮：选中三角形高亮轮廓（统一宽度与颜色，置于最上层）
+  ctx.lineWidth = 2
+  ctx.strokeStyle = '#4f8df7'
+  for (const t of triangles) {
+    if (t.deleted || t.color === 'transparent') continue
+    if (!isSelected(t.id)) continue
+    ctx.beginPath()
+    const verts = (t.drawVertices && t.drawVertices.length>=3) ? t.drawVertices : t.vertices
+    const v0 = transformPoint(verts[0], grid, rotation)
+    ctx.moveTo(v0.x, v0.y)
+    for (let i=1;i<verts.length;i++){
+      const vi = transformPoint(verts[i], grid, rotation)
+      ctx.lineTo(vi.x, vi.y)
+    }
+    ctx.closePath()
     ctx.stroke()
   }
 

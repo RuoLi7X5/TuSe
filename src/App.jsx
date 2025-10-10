@@ -131,11 +131,11 @@ function App() {
   useEffect(() => {
     if (imgBitmap || grid) return
     const w = 1600, h = 1200
-    const g = rotation===90 ? buildTriangleGridVertical(w, h, triangleSize) : buildTriangleGrid(w, h, triangleSize)
+    const g = buildTriangleGrid(w, h, triangleSize)
     setGrid(g)
     const tris = g.triangles.map(t => ({ ...t, color: (t.up ?? t.left) ? '#1b2333' : '#121826' }))
     setTriangles(tris)
-  }, [imgBitmap, rotation])
+  }, [imgBitmap])
 
   const handleImage = useCallback(async (blob) => {
     // 尊重 EXIF 方向，确保宽高与物理图像一致，避免比例失真
@@ -156,7 +156,7 @@ function App() {
       const targetAcrossShort = 60
       side = Math.max(10, Math.min(40, Math.round((2 * short) / targetAcrossShort)))
     }
-    const grid = rotation===90 ? buildTriangleGridVertical(w, h, side) : buildTriangleGrid(w, h, side)
+    const grid = buildTriangleGrid(w, h, side)
     if (side !== triangleSize) {
       // 同步 UI 滑块显示，但保留用户后续手动可再调整
       setTriangleSize(side)
@@ -185,7 +185,7 @@ function App() {
     if (imgBitmap && palette.length) {
       const w = imgBitmap.width
       const h = imgBitmap.height
-      const grid = rotation===90 ? buildTriangleGridVertical(w, h, triangleSize) : buildTriangleGrid(w, h, triangleSize)
+      const grid = buildTriangleGrid(w, h, triangleSize)
       setGrid(grid)
       ;(async () => {
         const mapped = await mapImageToGrid(imgBitmap, grid, palette)
@@ -198,11 +198,11 @@ function App() {
     } else if (!imgBitmap) {
       const w = grid?.width || 800
       const h = grid?.height || 600
-      const g = rotation===90 ? buildTriangleGridVertical(w, h, triangleSize) : buildTriangleGrid(w, h, triangleSize)
+      const g = buildTriangleGrid(w, h, triangleSize)
       setGrid(g)
       setTriangles(g.triangles.map(t => ({ ...t, color: (t.up ?? t.left) ? '#1b2333' : '#121826' })))
     }
-  }, [triangleSize, rotation, loadedProject, colorSeparation, imgBitmap, palette])
+  }, [triangleSize, loadedProject, colorSeparation, imgBitmap, palette])
 
   const onClickTriangle = useCallback((id, e) => {
     // 取色已改为彩虹色带点击，不使用画布取色；保持原选择逻辑
@@ -1098,6 +1098,7 @@ function App() {
         <h2>画布</h2>
         <div className="canvas-wrap">
           <TriangleCanvas
+            key={rotation}
             ref={canvasRef}
             grid={grid}
             triangles={triangles}
