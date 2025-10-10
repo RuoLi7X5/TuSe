@@ -96,6 +96,13 @@ function App() {
   const [isDragging, setIsDragging] = useState(false)
   const [dragStart, setDragStart] = useState(null)
   const [dragRect, setDragRect] = useState(null)
+  // 套索选择状态
+  const [lassoPath, setLassoPath] = useState([])
+  const [lassoClosed, setLassoClosed] = useState(false)
+  const LASSO_MIN_DIST = 4
+  const LASSO_CLOSE_RADIUS = 12
+  const LASSO_SAMPLE_COUNT = 20
+  const LASSO_THRESHOLD = 0.5
   // 工程加载标记：用于避免导入后被副作用重建覆盖
   const [loadedProject, setLoadedProject] = useState(false)
   // 颜色分离强度（影响灰色惩罚与暖色回退边界）
@@ -899,33 +906,122 @@ function App() {
     if (e?.button !== 0) return
     setIsDragging(true)
     setDragStart(pt)
-    setDragRect({ x1: pt.x, y1: pt.y, x2: pt.x, y2: pt.y })
+    setLassoClosed(false)
+    setLassoPath([pt])
+    setDragRect(null)
+    setStatus('套索：拖拽以闭合选择')
   }, [])
 
   // 框选：移动
   const onDragMove = useCallback((pt, e) => {
     if (!isDragging || !dragStart) return
-    setDragRect({ x1: dragStart.x, y1: dragStart.y, x2: pt.x, y2: pt.y })
+    setLassoPath(prev => {
+      const last = prev[prev.length - 1]
+      const dx = pt.x - last.x
+      const dy = pt.y - last.y
+      const dist2 = dx*dx + dy*dy
+      if (dist2 >= LASSO_MIN_DIST * LASSO_MIN_DIST) return [...prev, pt]
+      return prev
+    })
   }, [isDragging, dragStart])
 
   // 框选：结束并选中矩形内三角形（按质心）
   const onDragEnd = useCallback((pt, e) => {
     if (!isDragging || !dragStart) return
     setIsDragging(false)
-    const x1 = Math.min(dragStart.x, pt.x)
-    const y1 = Math.min(dragStart.y, pt.y)
-    const x2 = Math.max(dragStart.x, pt.x)
-    const y2 = Math.max(dragStart.y, pt.y)
-    const ids = triangles
-      .filter(t => !t.deleted && t.color!=='transparent')
-      .filter(t => t.centroid && t.centroid.x>=x1 && t.centroid.x<=x2 && t.centroid.y>=y1 && t.centroid.y<=y2)
-      .map(t => t.id)
-    setSelectedIds(ids)
-    setStartId(ids[0] ?? null)
-    setStatus(`框选三角形：${ids.length} 个`)
-    setDragRect(null)
+    // 闭合判定：终点与起点距离
+    const start = dragStart
+    const dx = pt.x - start.x
+    const dy = pt.y - start.y
+    // 补上释放点，确保轨迹包含终点
+    let path = lassoPath
+    if (path && path.length) {
+      const last = path[path.length - 1]
+      const ddx = pt.x - last.x
+      const ddy = pt.y - last.y
+      if ((ddx*ddx + ddy*ddy) >= (LASSO_MIN_DIST * LASSO_MIN_DIST)) {
+        path = [...path, pt]
+      }
+    }
+    // 按你的习惯：右键点击作为“确认闭合”动作
+    const isRightClick = e?.button === 2
+    const closed = isRightClick && ((path?.length || 0) >= 3)
+    if (closed) {
+      path = [...path, start]
+      setLassoPath(path)
+      setLassoClosed(true)
+    }
+
+    // 仅对闭合路径执行选择
+    const pointInPolygon = (p, verts) => {
+      let inside = false
+      for (let i = 0, j = verts.length - 1; i < verts.length; j = i++) {
+        const xi = verts[i].x, yi = verts[i].y
+        const xj = verts[j].x, yj = verts[j].y
+        const intersect = ((yi > p.y) !== (yj > p.y)) && (p.x < (xj - xi) * (p.y - yi) / ((yj - yi) || 1e-9) + xi)
+        if (intersect) inside = !inside
+      }
+      return inside
+    }
+    const bbox = (verts) => {
+      let minX=Infinity, minY=Infinity, maxX=-Infinity, maxY=-Infinity
+      for (const v of verts) { if (v.x<minX)minX=v.x; if(v.y<minY)minY=v.y; if(v.x>maxX)maxX=v.x; if(v.y>maxY)maxY=v.y }
+      return { minX, minY, maxX, maxY }
+    }
+    const boxesOverlap = (b1, b2) => !(b1.maxX < b2.minX || b2.maxX < b1.minX || b1.maxY < b2.minY || b2.maxY < b1.minY)
+    const lbox = closed ? bbox(path) : { minX: -Infinity, minY: -Infinity, maxX: Infinity, maxY: Infinity }
+
+    const samplePointsInPolygon = (verts, count) => {
+      const b = bbox(verts)
+      const target = Math.max(3, count)
+      let stepX = Math.max(1, (b.maxX - b.minX) / Math.ceil(Math.sqrt(target)))
+      let stepY = Math.max(1, (b.maxY - b.minY) / Math.ceil(Math.sqrt(target)))
+      const pts = []
+      for (let y = b.minY; y <= b.maxY && pts.length < target; y += stepY) {
+        for (let x = b.minX; x <= b.maxX && pts.length < target; x += stepX) {
+          const p = { x, y }
+          if (pointInPolygon(p, verts)) pts.push(p)
+        }
+      }
+      // 若采样过少，使用质心与顶点补充
+      if (pts.length < 3) {
+        const cx = verts.reduce((s,v)=>s+v.x,0)/verts.length
+        const cy = verts.reduce((s,v)=>s+v.y,0)/verts.length
+        pts.push({x:cx,y:cy})
+        for (let i=0;i<verts.length && pts.length<target;i++) pts.push(verts[i])
+      }
+      return pts
+    }
+
+    let ids = []
+    if (closed) {
+      ids = triangles
+        .filter(t => !t.deleted && t.color!=='transparent')
+        .filter(t => {
+          const verts = (t.drawVertices && t.drawVertices.length>=3) ? t.drawVertices : t.vertices
+          const tb = bbox(verts)
+          if (!boxesOverlap(tb, lbox)) return false
+          const samples = samplePointsInPolygon(verts, LASSO_SAMPLE_COUNT)
+          let inside = 0
+          for (const p of samples) { if (pointInPolygon(p, path)) inside++ }
+          const cover = inside / (samples.length || 1)
+          return cover >= LASSO_THRESHOLD
+        })
+        .map(t => t.id)
+    }
+
+    if (closed) {
+      setSelectedIds(ids)
+      setStartId(ids[0] ?? null)
+      setStatus(`套索选择：${ids.length} 个（覆盖阈值≥${Math.round(LASSO_THRESHOLD*100)}%）`)
+    } else {
+      setStatus('套索未闭合（左键松开为取消；右键点击确认）')
+    }
     setDragStart(null)
-  }, [isDragging, dragStart, triangles])
+    setDragRect(null)
+    // 清理轨迹（保留一帧由渲染显示闭合），随后清空
+    setTimeout(() => { setLassoPath([]); setLassoClosed(false) }, 0)
+  }, [isDragging, dragStart, triangles, lassoPath])
 
   const onDeleteSelected = useCallback(() => {
     if (!editMode) { setStatus('当前为试玩模式，如需删除请进入编辑模式'); return }
@@ -947,6 +1043,22 @@ function App() {
   const onEnterEdit = useCallback(() => {
     setEditMode(true)
     setStatus('已进入编辑模式：可泼涂或删除三角形')
+  }, [])
+
+  // 支持 Esc 取消当前套索并清空轨迹
+  useEffect(() => {
+    const onKey = (e) => {
+      if (e.key === 'Escape') {
+        setIsDragging(false)
+        setDragStart(null)
+        setDragRect(null)
+        setLassoPath([])
+        setLassoClosed(false)
+        setStatus('已取消套索')
+      }
+    }
+    window.addEventListener('keydown', onKey)
+    return () => window.removeEventListener('keydown', onKey)
   }, [])
 
   // 当某种颜色在画布上不再出现时，从调色板隐藏，并修正当前选色
@@ -991,8 +1103,10 @@ function App() {
             triangles={triangles}
             onClickTriangle={onClickTriangle}
             selectedIds={selectedIds}
-            rotation={0}
+            rotation={rotation}
             selectionRect={dragRect}
+            lassoPath={lassoPath}
+            lassoClosed={lassoClosed}
             onDragStart={onDragStart}
             onDragMove={onDragMove}
             onDragEnd={onDragEnd}

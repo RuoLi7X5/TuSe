@@ -8,7 +8,7 @@ function transformPoint(pt, grid, rotation){
   return { x: pt.x, y: pt.y }
 }
 
-function draw(ctx, grid, triangles, selectedIds, rotation, selectionRect) {
+function draw(ctx, grid, triangles, selectedIds, rotation, selectionRect, lassoPath, lassoClosed) {
   if (!ctx) return
   ctx.clearRect(0, 0, ctx.canvas.width, ctx.canvas.height)
   const isSelected = (id)=> Array.isArray(selectedIds) && selectedIds.includes(id)
@@ -54,6 +54,34 @@ function draw(ctx, grid, triangles, selectedIds, rotation, selectionRect) {
     ctx.fillRect(rx, ry, rw, rh)
     ctx.restore()
   }
+
+  // 绘制自由套索轨迹（白色）
+  if (Array.isArray(lassoPath) && lassoPath.length >= 2) {
+    ctx.save()
+    ctx.lineWidth = 2
+    ctx.strokeStyle = '#ffffff'
+    const p0 = transformPoint(lassoPath[0], grid, rotation)
+    ctx.beginPath()
+    ctx.moveTo(p0.x, p0.y)
+    for (let i = 1; i < lassoPath.length; i++) {
+      const pi = transformPoint(lassoPath[i], grid, rotation)
+      ctx.lineTo(pi.x, pi.y)
+    }
+    if (lassoClosed) ctx.closePath()
+    ctx.stroke()
+    if (lassoClosed) {
+      ctx.fillStyle = 'rgba(255,255,255,0.08)'
+      ctx.fill()
+    }
+    // 起点吸附环，辅助闭合提示
+    const start = transformPoint(lassoPath[0], grid, rotation)
+    ctx.beginPath()
+    ctx.arc(start.x, start.y, 8, 0, Math.PI * 2)
+    ctx.strokeStyle = 'rgba(255,255,255,0.35)'
+    ctx.lineWidth = 1
+    ctx.stroke()
+    ctx.restore()
+  }
 }
 
 function pointInPolygon(p, verts) {
@@ -68,7 +96,7 @@ function pointInPolygon(p, verts) {
   return inside
 }
 
-export default forwardRef(function TriangleCanvas({ grid, triangles, onClickTriangle, selectedIds, rotation=0, selectionRect, onDragStart, onDragMove, onDragEnd }, ref) {
+export default forwardRef(function TriangleCanvas({ grid, triangles, onClickTriangle, selectedIds, rotation=0, selectionRect, lassoPath, lassoClosed, onDragStart, onDragMove, onDragEnd }, ref) {
   useEffect(() => {
     if (!ref?.current || !grid) return
     const canvas = ref.current
@@ -81,8 +109,8 @@ export default forwardRef(function TriangleCanvas({ grid, triangles, onClickTria
       canvas.height = grid.height
     }
     const ctx = canvas.getContext('2d')
-    draw(ctx, grid, triangles, selectedIds, rotation, selectionRect)
-  }, [grid, triangles, selectedIds, rotation, selectionRect])
+    draw(ctx, grid, triangles, selectedIds, rotation, selectionRect, lassoPath, lassoClosed)
+  }, [grid, triangles, selectedIds, rotation, selectionRect, lassoPath, lassoClosed])
 
   useEffect(() => {
     if (!ref?.current) return
@@ -139,14 +167,20 @@ export default forwardRef(function TriangleCanvas({ grid, triangles, onClickTria
       if (wasDragging) suppressNextClick = true
       wasDragging = false
     }
+    const onContextMenu = (e) => {
+      // 避免右键菜单干扰拖拽结束逻辑
+      e.preventDefault()
+    }
     canvas.addEventListener('click', onClick)
     canvas.addEventListener('mousedown', onMouseDown)
     canvas.addEventListener('mousemove', onMouseMove)
+    canvas.addEventListener('contextmenu', onContextMenu)
     window.addEventListener('mouseup', onMouseUp)
     return () => {
       canvas.removeEventListener('click', onClick)
       canvas.removeEventListener('mousedown', onMouseDown)
       canvas.removeEventListener('mousemove', onMouseMove)
+      canvas.removeEventListener('contextmenu', onContextMenu)
       window.removeEventListener('mouseup', onMouseUp)
     }
   }, [triangles, onClickTriangle, rotation, grid, onDragStart, onDragMove, onDragEnd])

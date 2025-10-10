@@ -50,6 +50,11 @@ export default function HelpPage() {
             5. 若参数设置有疑问，请查看下方详细说明与建议。
           </div>
         </Section>
+        <Section title="操作补充（Tips）">
+          <div>1. 按住 Shift 可多选三角形</div>
+          <div>2. 按住 Ctrl 并鼠标左键，可选中同色联通区域</div>
+          <div>3. 鼠标左键拖拽绘制，点击右键，可选中封闭图形内三角形</div>
+        </Section>
         <Section title="页面导航">
           <div>
             - 当前为帮助子页。点击右上角“返回”回到主页面。
