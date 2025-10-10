@@ -81,6 +81,13 @@ function App() {
   const [selectedIds, setSelectedIds] = useState([])
   const [undoStack, setUndoStack] = useState([])
   const [redoStack, setRedoStack] = useState([])
+  // 统一的操作历史（限制最近5步）
+  const [historyStack, setHistoryStack] = useState([])
+  const [historyRedoStack, setHistoryRedoStack] = useState([])
+  // 初始状态快照（用于“重做=重置到初始状态”）
+  const [initialPalette, setInitialPalette] = useState([])
+  const [initialSelectedColor, setInitialSelectedColor] = useState(null)
+  const [initialDeletedIds, setInitialDeletedIds] = useState([])
   const [steps, setSteps] = useState([])
   const [bestStartId, setBestStartId] = useState(null)
   const [status, setStatus] = useState('请上传图片')
@@ -109,13 +116,30 @@ function App() {
   const [colorSeparation, setColorSeparation] = useState(4)
   // 取色模式：点击画布拾取颜色并加入调色板
   const [pickMode, setPickMode] = useState(false)
-  const onAddColorFromPicker = useCallback((hex) => {
-    setPalette(p => (p.includes(hex) ? p : [...p, hex]))
-    setSelectedColor(hex)
-    setStatus(`已添加颜色：${hex}（拾色器）`)
-    setPickMode(false)
+  // 点击“添加颜色”始终进入色带选择；选择后由 onAddColorFromPicker 进行泼涂或加入集合
+  const onStartAddColorPick = useCallback(() => {
+    setPickMode(true)
+    setStatus('添加颜色模式：点击彩虹色带选择颜色')
   }, [])
-  const onCancelPick = useCallback(() => { setPickMode(false); setStatus('已取消取色') }, [])
+  const onAddColorFromPicker = useCallback((hex) => {
+    const prevSelected = selectedColor
+    // 仅添加到颜色集合，不进行泼涂
+    setPalette(p => {
+      const next = p.includes(hex) ? p : [...p, hex]
+      localStorage.setItem('palette', JSON.stringify(next))
+      return next
+    })
+    setSelectedColor(hex)
+    setStatus(`已添加颜色：${hex}`)
+    setPickMode(false)
+    // 记录历史，支持撤销/重做，限制最近5步
+    setHistoryStack(prev => {
+      const next = [...prev, { type: 'palette_add', color: hex, prevSelectedColor: prevSelected }]
+      return next.length > 5 ? next.slice(next.length - 5) : next
+    })
+    setHistoryRedoStack([])
+  }, [selectedColor])
+  const onCancelPick = useCallback(() => { setPickMode(false); setStatus('已取消添加颜色') }, [])
   // 自动求解进度（显示实时状态）
   const [solveProgress, setSolveProgress] = useState(null)
   // 实时滚动小窗口：进度日志
@@ -143,7 +167,9 @@ function App() {
     setImgBitmap(bitmap)
     const { palette } = await quantizeImage(bitmap)
     setPalette(palette)
+    setInitialPalette(palette)
     setSelectedColor(palette[0] ?? null)
+    setInitialSelectedColor(palette[0] ?? null)
 
     const w = bitmap.width
     const h = bitmap.height
@@ -182,7 +208,8 @@ function App() {
     setColorTuning({ GREY_PENALTY_BASE: penalty, WARM_MARGIN: margin, STRONG_B_TH: strongB })
     // 若处于导入工程状态，则不触发自动重建与重新识别
     if (loadedProject) return
-    if (imgBitmap && palette.length) {
+    // 关键保护：用户开始试玩（editMode=false）后，调色板变化不再自动重映射，避免覆盖已泼涂颜色
+    if (imgBitmap && palette.length && editMode) {
       const w = imgBitmap.width
       const h = imgBitmap.height
       const grid = buildTriangleGrid(w, h, triangleSize)
@@ -196,13 +223,24 @@ function App() {
         setSteps([])
       })()
     } else if (!imgBitmap) {
+      // 占位画布场景：避免因调色板变化而重置用户已泼涂的颜色
+      if (grid && Array.isArray(triangles) && triangles.length > 0) {
+        // 已有网格与颜色，说明用户可能在试玩；不进行重建
+        return
+      }
       const w = grid?.width || 800
       const h = grid?.height || 600
       const g = buildTriangleGrid(w, h, triangleSize)
       setGrid(g)
-      setTriangles(g.triangles.map(t => ({ ...t, color: (t.up ?? t.left) ? '#1b2333' : '#121826' })))
+      const base = g.triangles.map(t => ((t.up ?? t.left) ? '#1b2333' : '#121826'))
+      setTriangles(g.triangles.map((t, i) => ({ ...t, color: base[i] })))
+      // 记录初始快照，用于重置
+      setUndoStack([base])
+      setRedoStack([])
+      setInitialPalette(palette)
+      setInitialSelectedColor(palette[0] ?? null)
     }
-  }, [triangleSize, loadedProject, colorSeparation, imgBitmap, palette])
+  }, [triangleSize, loadedProject, colorSeparation, imgBitmap, editMode])
 
   const onClickTriangle = useCallback((id, e) => {
     // 取色已改为彩虹色带点击，不使用画布取色；保持原选择逻辑
@@ -255,36 +293,104 @@ function App() {
   }, [selectedIds, triangles])
 
   const onPaint = useCallback(() => {
-    if (startId == null || !selectedColor || triangles.length === 0) return
+    if (!selectedColor || triangles.length === 0) return
+    // 若存在多选，则对所有选中的三角形直接泼涂为当前选色
+    if (selectedIds.length > 0) {
+      const sel = new Set(selectedIds)
+      const next = triangles.map(t => sel.has(t.id) ? { ...t, color: selectedColor } : t)
+      const changedCount = triangles.reduce((acc, t) => acc + (sel.has(t.id) && t.color !== selectedColor ? 1 : 0), 0)
+      if (changedCount === 0) { setStatus('提示：选中的三角形颜色已是目标色'); return }
+      setTriangles(next)
+      setUndoStack(prev => {
+        const appended = [...prev, next.map(t => t.color)]
+        return appended.length > 5 ? appended.slice(appended.length - 5) : appended
+      })
+      setRedoStack([])
+      setHistoryStack(prev => {
+        const appended = [...prev, { type: 'paint' }]
+        return appended.length > 5 ? appended.slice(appended.length - 5) : appended
+      })
+      setHistoryRedoStack([])
+      setStatus(isUniform(next) ? '成功：画布颜色已统一' : `泼涂：已应用到选中 ${changedCount} 个`)
+      return
+    }
+    // 否则对起点的连通区域进行泼涂
+    if (startId == null) { setStatus('请先选择起点或框选三角形'); return }
     const { newColors, changedIds } = floodFillRegion(triangles, startId, selectedColor)
-    if (changedIds.length === 0) return
+    if (changedIds.length === 0) { setStatus('提示：起点区域颜色已是目标色'); return }
     const next = triangles.map((t, i) => ({ ...t, color: newColors[i] }))
     setTriangles(next)
-    setUndoStack(prev => [...prev, newColors])
+    setUndoStack(prev => {
+      const appended = [...prev, newColors]
+      return appended.length > 5 ? appended.slice(appended.length - 5) : appended
+    })
     setRedoStack([])
-    setStatus(isUniform(next) ? '成功：画布颜色已统一' : (editMode ? '编辑：已泼涂' : '已泼涂'))
-  }, [startId, selectedColor, triangles])
+    setHistoryStack(prev => {
+      const appended = [...prev, { type: 'paint' }]
+      return appended.length > 5 ? appended.slice(appended.length - 5) : appended
+    })
+    setHistoryRedoStack([])
+    setStatus(isUniform(next) ? '成功：画布颜色已统一' : `泼涂：连通区域 ${changedIds.length} 个`)
+  }, [startId, selectedIds, selectedColor, triangles])
 
   const onUndo = useCallback(() => {
-    if (undoStack.length <= 1) return
-    const prev = [...undoStack]
-    const last = prev.pop()
-    setRedoStack(r => [...r, last])
-    const colors = prev[prev.length - 1]
-    setUndoStack(prev)
-    setTriangles(triangles.map((t, i) => ({ ...t, color: colors[i] })))
-    setStatus('已撤销')
-  }, [undoStack, triangles])
+    if (historyStack.length === 0) return
+    const action = historyStack[historyStack.length - 1]
+    setHistoryStack(historyStack.slice(0, -1))
+    setHistoryRedoStack(prev => [...prev, action])
+    if (action.type === 'palette_add') {
+      setPalette(p => {
+        const idx = p.lastIndexOf(action.color)
+        if (idx === -1) return p
+        const next = [...p.slice(0, idx), ...p.slice(idx+1)]
+        localStorage.setItem('palette', JSON.stringify(next))
+        return next
+      })
+      setSelectedColor(action.prevSelectedColor || null)
+      setStatus(`已撤销添加颜色：${action.color}`)
+    } else if (action.type === 'paint') {
+      if (undoStack.length <= 1) return
+      const prev = [...undoStack]
+      const last = prev.pop()
+      setRedoStack(r => [...r, last])
+      const colors = prev[prev.length - 1]
+      setUndoStack(prev)
+      setTriangles(triangles.map((t, i) => ({ ...t, color: colors[i] })))
+      setStatus('已撤销')
+    } else if (action.type === 'delete') {
+      if (undoStack.length <= 1) return
+      const prev = [...undoStack]
+      const last = prev.pop()
+      setRedoStack(r => [...r, last])
+      const colors = prev[prev.length - 1]
+      setUndoStack(prev)
+      const toRestore = new Set(action.ids || [])
+      setTriangles(triangles.map((t, i) => (
+        toRestore.has(t.id)
+          ? { ...t, deleted: false, color: colors[i] }
+          : { ...t, color: colors[i], deleted: t.deleted }
+      )))
+      setStatus('已撤销删除')
+    }
+  }, [historyStack, undoStack, triangles])
 
+  // 重做：回到“存档点”（由保存编辑设置），包含删除标记与颜色快照
   const onRedo = useCallback(() => {
-    if (redoStack.length === 0) return
-    const r = [...redoStack]
-    const colors = r.pop()
-    setRedoStack(r)
-    setUndoStack(u => [...u, colors])
-    setTriangles(triangles.map((t, i) => ({ ...t, color: colors[i] })))
-    setStatus('已重做')
-  }, [redoStack, triangles])
+    if (undoStack.length === 0) return
+    const base = undoStack[0]
+    const delSet = new Set(initialDeletedIds || [])
+    setTriangles(triangles.map((t, i) => ({ ...t, color: base[i], deleted: delSet.has(t.id) })))
+    setUndoStack([base])
+    setRedoStack([])
+    setHistoryStack([])
+    setHistoryRedoStack([])
+    setPalette(initialPalette)
+    setSelectedColor(initialSelectedColor)
+    setSelectedIds([])
+    setStartId(null)
+    setSteps([])
+    setStatus('已重置到存档点')
+  }, [undoStack, triangles, initialPalette, initialSelectedColor, initialDeletedIds])
 
   // 批量：选择同色三角形
   const onSelectSameColor = useCallback(() => {
@@ -312,7 +418,10 @@ function App() {
     const sel = new Set(selectedIds)
     const next = triangles.map(t => sel.has(t.id) ? { ...t, color: selectedColor } : t)
     setTriangles(next)
-    setUndoStack(prev => [...prev, next.map(t => t.color)])
+    setUndoStack(prev => {
+      const appended = [...prev, next.map(t => t.color)]
+      return appended.length > 5 ? appended.slice(appended.length - 5) : appended
+    })
     setRedoStack([])
     setStatus(isUniform(next) ? '成功：画布颜色已统一' : `批量替换完成：${selectedIds.length} 个`)
   }, [selectedIds, selectedColor, triangles])
@@ -1031,14 +1140,34 @@ function App() {
     setTriangles(next)
     setSelectedIds([])
     setStartId(null)
+    // 记录颜色快照与删除步骤
+    setUndoStack(prev => {
+      const appended = [...prev, next.map(t => t.color)]
+      return appended.length > 5 ? appended.slice(appended.length - 5) : appended
+    })
+    setRedoStack([])
+    setHistoryStack(prev => {
+      const appended = [...prev, { type: 'delete', ids: [...toDelete] }]
+      return appended.length > 5 ? appended.slice(appended.length - 5) : appended
+    })
+    setHistoryRedoStack([])
     setStatus(`已删除 ${toDelete.size} 个三角形`)
   }, [editMode, selectedIds, triangles])
 
   const onSaveEdit = useCallback(() => {
     if (!grid || triangles.length === 0) { setStatus('当前无内容可保存'); return }
+    const snapshotColors = triangles.map(t => t.color)
+    const deletedIds = triangles.filter(t => t.deleted).map(t => t.id)
+    setUndoStack([snapshotColors])
+    setRedoStack([])
+    setHistoryStack([])
+    setHistoryRedoStack([])
+    setInitialPalette(palette)
+    setInitialSelectedColor(selectedColor || null)
+    setInitialDeletedIds(deletedIds)
     setEditMode(false)
-    setStatus('已保存编辑，可进行试玩泼涂与自动求解')
-  }, [grid, triangles])
+    setStatus('已保存编辑为存档点：撤销/重做将回到此状态')
+  }, [grid, triangles, palette, selectedColor])
 
   const onEnterEdit = useCallback(() => {
     setEditMode(true)
@@ -1061,16 +1190,11 @@ function App() {
     return () => window.removeEventListener('keydown', onKey)
   }, [])
 
-  // 当某种颜色在画布上不再出现时，从调色板隐藏，并修正当前选色
+  // 调色板允许包含“尚未出现在画布上的颜色”，避免添加后立刻被改回
+  // 因此不再强制将 selectedColor 改为画布中存在的颜色
   useEffect(() => {
     if (!palette || palette.length===0) return
-    const present = new Set(triangles.filter(t=>!t.deleted && t.color && t.color!=='transparent').map(t=>t.color))
-    // 如果当前选色已不存在，则切换到第一个仍存在的颜色或置空
-    if (selectedColor && !present.has(selectedColor)) {
-      const next = palette.find(p=>present.has(p)) || null
-      setSelectedColor(next)
-      if (!next) setStatus('提示：当前已无可用颜色')
-    }
+    // 保留占位以便未来扩展（例如统计使用情况），当前不改动 selectedColor
   }, [triangles, palette])
 
   // 说明子页渲染（含返回按钮在组件内部）
@@ -1185,10 +1309,10 @@ function App() {
       <div className="panel controls">
         <h2>控制</h2>
         <Controls
-          palette={palette.filter(p=>triangles.some(t=>!t.deleted && t.color===p))}
+          palette={palette}
           selectedColor={selectedColor}
           onSelectColor={setSelectedColor}
-          onStartAddColorPick={() => { setPickMode(true); setStatus('取色模式：点击彩虹色带选择颜色') }}
+          onStartAddColorPick={onStartAddColorPick}
           pickMode={pickMode}
           onAddColorFromPicker={onAddColorFromPicker}
           onCancelPick={onCancelPick}

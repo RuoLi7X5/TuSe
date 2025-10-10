@@ -22,10 +22,10 @@ export default function Controls({ palette, selectedColor, onSelectColor, onStar
   return (
     <div>
       <div style={{ marginBottom: '.5rem', color: '#a9b3c9', display:'flex', alignItems:'center', justifyContent:'space-between' }}>
-        <span>颜色（来自图片识别）</span>
+        <span>颜色</span>
         <div style={{ display:'flex', gap:'.5rem' }}>
           <button onClick={onStartAddColorPick} style={{ padding: '.25rem .5rem', borderRadius: '6px', border: '1px solid var(--border)', background: pickMode? '#26417a':'#1a1f2b', color: 'var(--text)' }}>
-            {pickMode? '取色中…（点击色带）' : '添加颜色（取色）'}
+            {pickMode? '添加颜色中…（点击色带）' : '添加颜色'}
           </button>
           <button onClick={()=>setShowTuner(true)} style={{ padding: '.25rem .5rem', borderRadius: '6px', border: '1px solid var(--border)', background: '#1a1f2b', color: 'var(--text)' }} title="调整自动求解的性能参数">
             性能调节
@@ -39,8 +39,7 @@ export default function Controls({ palette, selectedColor, onSelectColor, onStar
               const rect = e.currentTarget.getBoundingClientRect()
               const x = e.clientX - rect.left
               const ratio = Math.max(0, Math.min(1, x / rect.width))
-              const hue = Math.round(ratio * 360) % 360
-              const hex = hslToHex(hue, 95, 55)
+              const hex = sampleRainbow(ratio)
               onAddColorFromPicker?.(hex)
             }}
             style={{
@@ -80,20 +79,27 @@ export default function Controls({ palette, selectedColor, onSelectColor, onStar
     </div>
   )
 }
-function hslToHex(h, s, l){
-  s /= 100; l /= 100
-  const c = (1 - Math.abs(2*l - 1)) * s
-  const hh = h / 60
-  const x = c * (1 - Math.abs(hh % 2 - 1))
-  let r=0,g=0,b=0
-  if (hh >= 0 && hh < 1) { r=c; g=x; b=0 }
-  else if (hh < 2) { r=x; g=c; b=0 }
-  else if (hh < 3) { r=0; g=c; b=x }
-  else if (hh < 4) { r=0; g=x; b=c }
-  else if (hh < 5) { r=x; g=0; b=c }
-  else { r=c; g=0; b=x }
-  const m = l - c/2
-  const to255 = v => Math.max(0, Math.min(255, Math.round((v + m) * 255)))
-  const toHex = n => n.toString(16).padStart(2, '0')
-  return '#' + toHex(to255(r)) + toHex(to255(g)) + toHex(to255(b))
+// 依据显示的线性渐变色带（7个固定色停靠点）进行精确插值
+function sampleRainbow(ratio){
+  const stops = ['#ff0000','#ff7f00','#ffff00','#00ff00','#00ffff','#0000ff','#8b00ff']
+  const pos = [0, 1/6, 2/6, 3/6, 4/6, 5/6, 1]
+  const r = Math.max(0, Math.min(1, ratio))
+  let i = 0
+  for (let k=0;k<pos.length-1;k++){ if (r>=pos[k] && r<=pos[k+1]) { i=k; break } }
+  const t = (r - pos[i]) / (pos[i+1]-pos[i])
+  return mixHex(stops[i], stops[i+1], t)
+}
+function hexToRgb(hex){
+  const h = hex.replace('#','')
+  const r = parseInt(h.slice(0,2),16), g = parseInt(h.slice(2,4),16), b = parseInt(h.slice(4,6),16)
+  return { r, g, b }
+}
+function rgbToHex({r,g,b}){
+  const toHex = n => Math.max(0,Math.min(255,n)).toString(16).padStart(2,'0')
+  return '#' + toHex(r) + toHex(g) + toHex(b)
+}
+function mixHex(a,b,t){
+  const c1 = hexToRgb(a), c2 = hexToRgb(b)
+  const m = (x,y)=> Math.round(x*(1-t) + y*t)
+  return rgbToHex({ r:m(c1.r,c2.r), g:m(c1.g,c2.g), b:m(c1.b,c2.b) })
 }
