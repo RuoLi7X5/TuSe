@@ -1,7 +1,7 @@
 import { useState } from 'react'
 import PerformanceTuner from './PerformanceTuner.jsx'
 
-export default function Controls({ palette, selectedColor, onSelectColor, onStartAddColorPick, pickMode, onAddColorFromPicker, onCancelPick }) {
+export default function Controls({ palette, selectedColor, onSelectColor, onStartAddColorPick, pickMode, onAddColorFromPicker, onCancelPick, onCleanPalette }) {
   const [showTuner, setShowTuner] = useState(false)
   return (
     <div>
@@ -10,6 +10,9 @@ export default function Controls({ palette, selectedColor, onSelectColor, onStar
         <div style={{ display:'flex', gap:'.5rem' }}>
           <button onClick={onStartAddColorPick} style={{ padding: '.25rem .5rem', borderRadius: '6px', border: '1px solid var(--border)', background: pickMode? '#26417a':'#1a1f2b', color: 'var(--text)' }}>
             {pickMode? '添加颜色中…（点击色带）' : '添加颜色'}
+          </button>
+          <button onClick={onCleanPalette} style={{ padding: '.25rem .5rem', borderRadius: '6px', border: '1px solid var(--border)', background: '#1a1f2b', color: 'var(--text)' }} title="清理：仅保留当前画布出现的颜色">
+            清理调色板
           </button>
           <button onClick={()=>setShowTuner(true)} style={{ padding: '.25rem .5rem', borderRadius: '6px', border: '1px solid var(--border)', background: '#1a1f2b', color: 'var(--text)' }} title="调整自动求解的性能参数">
             性能调节

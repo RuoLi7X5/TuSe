@@ -8,7 +8,7 @@ import StepsPanel from './components/StepsPanel'
 import HelpPage from './components/HelpPage'
 
 import { quantizeImage, setColorTuning } from './utils/color-utils'
-import { buildTriangleGrid, buildTriangleGridVertical, mapImageToGrid, isUniform } from './utils/grid-utils'
+import { buildTriangleGrid, buildTriangleGridVertical, mapImageToGrid, isUniform, colorFrequency } from './utils/grid-utils'
 import { floodFillRegion, attachSolverToWindow, captureCanvasPNG } from './utils/solver'
 
 // 设置默认的求解器开关与权重，并合并本地持久化配置（localStorage）
@@ -93,6 +93,11 @@ function App() {
   const [status, setStatus] = useState('请上传图片')
   const [editMode, setEditMode] = useState(true)
   const [rotation, setRotation] = useState(90)
+  // 画布显示缩放（仅影响展示尺寸）
+  const [canvasScale, setCanvasScale] = useState(1)
+  // 画布位置偏移（仅影响展示位置）
+  const [canvasOffset, setCanvasOffset] = useState({ x: 0, y: 0 })
+  const canvasWrapRef = useRef(null)
   const [solving, setSolving] = useState(false)
   // 自动求解步数上限（用于剪枝与性能控制），持久化到 localStorage
   const [maxStepsLimit, setMaxStepsLimit] = useState(() => {
@@ -116,6 +121,8 @@ function App() {
   const [colorSeparation, setColorSeparation] = useState(4)
   // 取色模式：点击画布拾取颜色并加入调色板
   const [pickMode, setPickMode] = useState(false)
+  // 导入选项：仅加载画布用色（忽略快照中的 palette）
+  const [importPaletteOnlyFromTriangles, setImportPaletteOnlyFromTriangles] = useState(false)
   // 点击“添加颜色”始终进入色带选择；选择后由 onAddColorFromPicker 进行泼涂或加入集合
   const onStartAddColorPick = useCallback(() => {
     setPickMode(true)
@@ -140,6 +147,16 @@ function App() {
     setHistoryRedoStack([])
   }, [selectedColor])
   const onCancelPick = useCallback(() => { setPickMode(false); setStatus('已取消添加颜色') }, [])
+  // 清理调色板：仅保留当前画布出现的颜色（按出现频次降序）
+  const onCleanPaletteToCanvasColors = useCallback(() => {
+    if (!triangles || triangles.length===0) { setStatus('当前画布为空，无法清理调色板'); return }
+    const freq = colorFrequency(triangles)
+    const next = [...freq.keys()].sort((a,b)=> (freq.get(b)||0) - (freq.get(a)||0))
+    setPalette(next)
+    try { localStorage.setItem('palette', JSON.stringify(next)) } catch {}
+    setSelectedColor(prev => next.includes(prev) ? prev : (next[0] ?? null))
+    setStatus(`已清理调色板（保留画布用色，共 ${next.length} 色）`)
+  }, [triangles])
   // 自动求解进度（显示实时状态）
   const [solveProgress, setSolveProgress] = useState(null)
   // 实时滚动小窗口：进度日志
@@ -237,6 +254,42 @@ function App() {
       setInitialSelectedColor(palette[0] ?? null)
     }
   }, [triangleSize, loadedProject, colorSeparation, imgBitmap, editMode])
+
+  // 将缩放系数写入 CSS 变量，供画布样式使用
+  useEffect(() => {
+    try { document.documentElement.style.setProperty('--canvas-scale', String(canvasScale)) } catch {}
+  }, [canvasScale])
+
+  // 将画布偏移写入 CSS 变量（支持键盘平移）
+  useEffect(() => {
+    try {
+      document.documentElement.style.setProperty('--canvas-offset-x', `${canvasOffset.x}px`)
+      document.documentElement.style.setProperty('--canvas-offset-y', `${canvasOffset.y}px`)
+    } catch {}
+  }, [canvasOffset])
+
+  // 键盘平移：WASD 与方向键（按缩放系数调整步长）
+  useEffect(() => {
+    const onKeyPan = (e) => {
+      const target = e.target
+      const tag = target?.tagName
+      const isTyping = tag === 'INPUT' || tag === 'TEXTAREA' || target?.isContentEditable
+      if (isTyping) return
+      const key = e.key
+      const step = 40 / (canvasScale || 1)
+      let dx = 0, dy = 0
+      if (key === 'ArrowLeft' || key === 'a' || key === 'A') dx = -step
+      else if (key === 'ArrowRight' || key === 'd' || key === 'D') dx = step
+      else if (key === 'ArrowUp' || key === 'w' || key === 'W') dy = -step
+      else if (key === 'ArrowDown' || key === 's' || key === 'S') dy = step
+      if (dx !== 0 || dy !== 0) {
+        e.preventDefault()
+        setCanvasOffset(prev => ({ x: prev.x + dx, y: prev.y + dy }))
+      }
+    }
+    window.addEventListener('keydown', onKeyPan)
+    return () => window.removeEventListener('keydown', onKeyPan)
+  }, [canvasScale])
 
   const onClickTriangle = useCallback((id, e) => {
     // 取色已改为彩虹色带点击，不使用画布取色；保持原选择逻辑
@@ -990,8 +1043,15 @@ function App() {
       setTriangleSize(obj.triangleSize ?? triangleSize)
       setRotation(obj.rotation ?? rotation)
       setEditMode(!!obj.editMode)
-      setPalette(Array.isArray(obj.palette)? obj.palette : [])
-      setSelectedColor(obj.selectedColor ?? null)
+      // palette 处理：可选择仅从导入的 triangles 反推画布用色
+      let importedPalette = Array.isArray(obj.palette)? obj.palette : []
+      if (importPaletteOnlyFromTriangles) {
+        const freq = colorFrequency(obj.triangles || [])
+        importedPalette = [...freq.keys()].sort((a,b)=> (freq.get(b)||0) - (freq.get(a)||0))
+      }
+      setPalette(importedPalette)
+      try { localStorage.setItem('palette', JSON.stringify(importedPalette)) } catch {}
+      setSelectedColor(importedPalette.includes(obj.selectedColor) ? obj.selectedColor : (importedPalette[0] ?? null))
       setStartId(obj.startId ?? null)
       setSelectedIds(Array.isArray(obj.selectedIds)? obj.selectedIds : [])
       setGrid(obj.grid)
@@ -1004,7 +1064,7 @@ function App() {
       console.error('Import project error:', err)
       setStatus('导入工程失败，请检查文件或重试')
     }
-  }, [triangleSize, rotation])
+  }, [triangleSize, rotation, importPaletteOnlyFromTriangles])
 
   // 框选：开始
   const onDragStart = useCallback((pt, e) => {
@@ -1216,7 +1276,7 @@ function App() {
 
       <div className="panel">
         <h2>画布</h2>
-        <div className="canvas-wrap">
+        <div className="canvas-wrap" ref={canvasWrapRef}>
           <TriangleCanvas
             key={rotation}
             ref={canvasRef}
@@ -1312,12 +1372,33 @@ function App() {
           pickMode={pickMode}
           onAddColorFromPicker={onAddColorFromPicker}
           onCancelPick={onCancelPick}
+          onCleanPalette={onCleanPaletteToCanvasColors}
         />
         <div className="grid-controls">
           <div className="row">
             <label>三角形尺寸</label>
-            <input type="range" min="10" max="40" value={triangleSize} onChange={e=>setTriangleSize(+e.target.value)} />
+            <input
+              type="range"
+              min="10"
+              max="40"
+              value={triangleSize}
+              onChange={e=>setTriangleSize(+e.target.value)}
+              disabled={!editMode || loadedProject}
+              title={!editMode ? '当前为试玩模式：尺寸调整被暂停以保护已涂色内容'
+                : loadedProject ? '当前为导入工程：为保持一致性暂不支持调整尺寸'
+                : '调整三角形尺寸'}
+            />
             <span>{triangleSize}px</span>
+            {(!editMode || loadedProject) && (
+              <span style={{ marginLeft: '.4rem', color: 'var(--muted)' }}>
+                {loadedProject ? '导入工程状态下尺寸不可改' : '试玩模式下尺寸不可改'}
+              </span>
+            )}
+          </div>
+          <div className="row">
+            <label>画布缩放</label>
+            <input type="range" min="0.4" max="2" step="0.05" value={canvasScale} onChange={e=>setCanvasScale(+e.target.value)} />
+            <span>{Math.round(canvasScale*100)}%</span>
           </div>
           <div className="row">
             <label>网格旋转</label>
@@ -1340,6 +1421,13 @@ function App() {
               const f=e.target.files?.[0]; if(f) onImportProjectFile(f)
               e.target.value=''
             }} />
+          </div>
+          <div className="row" style={{ marginTop: '.25rem' }}>
+            <label>导入选项</label>
+            <label style={{ display:'inline-flex', alignItems:'center', gap:'.35rem' }} title="开启后：导入时忽略快照中的调色板，只保留导入画布中出现的颜色">
+              <input type="checkbox" checked={importPaletteOnlyFromTriangles} onChange={e=>setImportPaletteOnlyFromTriangles(e.target.checked)} />
+              仅加载画布用色
+            </label>
           </div>
         </div>
 

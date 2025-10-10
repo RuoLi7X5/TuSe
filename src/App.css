@@ -9,6 +9,8 @@
   --side-width: 240px; /* 保留但不再使用（移除滑块），布局改为自适应 */
   --canvas-scale: 1; /* 画布显示缩放（网页页面视觉大小） */
   --canvas-window-height: 72vh; /* 画布窗口高度改为随视口自适应 */
+  --canvas-offset-x: 0px; /* 画布平移（X） */
+  --canvas-offset-y: 0px; /* 画布平移（Y） */
 }
 
 #root {
@@ -116,15 +118,18 @@
   background: #0b0d13;
   border: 1px solid var(--border);
   border-radius: 12px;
-  height: var(--canvas-window-height); /* 固定为横置窗口高度，宽度随列变化 */
-  overflow: auto; /* 超出窗口时滚动查看 */
+  /* 解除与视口高度的绑定，使画布按自身尺寸呈现 */
+  height: auto;
+  max-height: none;
+  overflow: auto; /* 内容超出容器时可滚动查看 */
 }
 
 canvas {
   display: block;
-  width: 100%;
+  /* 使用画布的固有像素尺寸展示，避免受容器宽度拉伸/压缩 */
+  width: auto;
   height: auto;
-  transform: scale(var(--canvas-scale));
+  transform: translate(var(--canvas-offset-x), var(--canvas-offset-y)) scale(var(--canvas-scale));
   transform-origin: top left;
 }
 
