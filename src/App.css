@@ -6,9 +6,9 @@
   --muted: #a9b3c9;
   --accent: #4f8df7;
   --success: #3fc77a;
-  --side-width: 240px; /* 两侧列宽（布局比例），可由滑块动态调整 */
+  --side-width: 240px; /* 保留但不再使用（移除滑块），布局改为自适应 */
   --canvas-scale: 1; /* 画布显示缩放（网页页面视觉大小） */
-  --canvas-window-height: 480px; /* 横置长方形窗口高度（可按需调整） */
+  --canvas-window-height: 72vh; /* 画布窗口高度改为随视口自适应 */
 }
 
 #root {
@@ -20,8 +20,8 @@
 
 .app {
   display: grid;
-  /* 让画布（左列）占据最大空间，控制与步骤固定宽度 */
-  grid-template-columns: 1fr var(--side-width) var(--side-width);
+  /* 两列自适应：将控制区宽度改为当前的 3/5（约 21vw） */
+  grid-template-columns: minmax(0, 1fr) minmax(300px, 21vw);
   gap: 1rem;
 }
 
@@ -59,9 +59,15 @@
 }
 
 .controls {
-  display: grid;
-  gap: .75rem;
+  display: flex;
+  flex-direction: column;
+  align-items: stretch;
+  justify-content: flex-start;
+  gap: .5rem;
 }
+/* 控制区域整体靠上、收紧上边距 */
+.panel.controls { padding-top: .5rem; }
+.panel.controls h2 { margin-bottom: .5rem; }
 
 /* 控制区域按钮统一深色样式，避免默认白底 */
 .controls button {
@@ -96,13 +102,13 @@
 
 .grid-controls {
   display: grid;
-  gap: .5rem;
+  gap: .35rem;
 }
 
 .row {
   display: flex;
   align-items: center;
-  gap: .5rem;
+  gap: .4rem;
 }
 
 .canvas-wrap {
@@ -223,4 +229,7 @@ canvas {
 
 .read-the-docs {
   color: #888;
+}
+.panel.steps {
+  grid-column: 1 / -1; /* 底部跨所有列，横向放在画布与控制区域下方 */
 }

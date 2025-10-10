@@ -1332,11 +1332,11 @@ function App() {
             <input type="range" min="0" max="10" value={colorSeparation} onChange={e=>setColorSeparation(+e.target.value)} />
             <span>{colorSeparation}</span>
           </div>
-          <div className="row" style={{ marginTop: '.5rem' }}>
+          <div className="row" style={{ marginTop: '.25rem' }}>
             <label>导出</label>
             <button onClick={onExportGrid} disabled={editMode || triangles.length===0}>导出网格图（PNG）</button>
           </div>
-          <div className="row" style={{ marginTop: '.5rem' }}>
+          <div className="row" style={{ marginTop: '.25rem' }}>
             <label>工程</label>
             <button onClick={onExportProject} disabled={!grid || triangles.length===0}>导出工程（JSON）</button>
             <button onClick={()=>importRef.current?.click()} style={{ marginLeft: '.5rem' }}>导入工程（JSON）</button>
@@ -1347,7 +1347,6 @@ function App() {
           </div>
         </div>
 
-        <StepsPanel steps={steps} />
       </div>
 
       <div className="panel steps">

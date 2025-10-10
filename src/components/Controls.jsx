@@ -1,24 +1,8 @@
-import { useMemo, useState } from 'react'
+import { useState } from 'react'
 import PerformanceTuner from './PerformanceTuner.jsx'
 
 export default function Controls({ palette, selectedColor, onSelectColor, onStartAddColorPick, pickMode, onAddColorFromPicker, onCancelPick }) {
-  const initialSide = useMemo(() => {
-    if (typeof window !== 'undefined') {
-      const v = getComputedStyle(document.documentElement)?.getPropertyValue('--side-width')
-      const n = parseInt(v?.trim()?.replace('px','') || '240', 10)
-      if (Number.isFinite(n)) return Math.max(120, Math.min(360, n))
-    }
-    return 240
-  }, [])
-  const [sideWidth, setSideWidth] = useState(initialSide)
   const [showTuner, setShowTuner] = useState(false)
-  const onChangeSide = (e) => {
-    const n = parseInt(e.target.value, 10)
-    setSideWidth(n)
-    if (typeof window !== 'undefined') {
-      document.documentElement?.style.setProperty('--side-width', `${n}px`)
-    }
-  }
   return (
     <div>
       <div style={{ marginBottom: '.5rem', color: '#a9b3c9', display:'flex', alignItems:'center', justifyContent:'space-between' }}>
@@ -57,18 +41,12 @@ export default function Controls({ palette, selectedColor, onSelectColor, onStar
           </div>
         </div>
       )}
-      <div className="grid-controls">
-        <div className="row">
-          <label htmlFor="layout-side-width">布局比例（两侧列宽，值越小画布越大）</label>
-          <input id="layout-side-width" type="range" min="120" max="360" value={sideWidth} onChange={onChangeSide} />
-          <span style={{ color:'#a9b3c9' }}>{sideWidth}px</span>
-        </div>
-      </div>
-      <div className="palette">
-        {palette.map((hex, i) => (
-          <div
-            key={i}
-            className={`swatch ${selectedColor===hex?'selected':''}`}
+
+  <div className="palette">
+      {palette.map((hex, i) => (
+        <div
+          key={i}
+          className={`swatch ${selectedColor===hex?'selected':''}`}
             style={{ background: hex }}
             onClick={() => onSelectColor(hex)}
             title={hex}
