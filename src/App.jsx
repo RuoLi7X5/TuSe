@@ -223,11 +223,7 @@ function App() {
         setSteps([])
       })()
     } else if (!imgBitmap) {
-      // 占位画布场景：避免因调色板变化而重置用户已泼涂的颜色
-      if (grid && Array.isArray(triangles) && triangles.length > 0) {
-        // 已有网格与颜色，说明用户可能在试玩；不进行重建
-        return
-      }
+      // 占位画布场景：允许三角形尺寸变化时重建网格，以便看到尺寸变化效果
       const w = grid?.width || 800
       const h = grid?.height || 600
       const g = buildTriangleGrid(w, h, triangleSize)
