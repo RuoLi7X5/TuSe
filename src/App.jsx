@@ -10,6 +10,7 @@ import HelpPage from './components/HelpPage'
 import { quantizeImage, setColorTuning } from './utils/color-utils'
 import { buildTriangleGrid, buildTriangleGridVertical, mapImageToGrid, isUniform, colorFrequency } from './utils/grid-utils'
 import { floodFillRegion, attachSolverToWindow, captureCanvasPNG } from './utils/solver'
+import { startRun as telemetryStartRun, logEvent as telemetryLogEvent, finishRun as telemetryFinishRun, makeGraphSignature, getRecommendation, getCachePath, putCachePath } from './utils/telemetry'
 
 // 设置默认的求解器开关与权重，并合并本地持久化配置（localStorage）
 if (typeof window !== 'undefined') {
@@ -30,19 +31,22 @@ if (typeof window !== 'undefined') {
     useDFSFirst: false,
     returnFirstFeasible: false,
     logPerf: true,
+    // 后端遥测开关与服务地址
+    enableTelemetry: true,
+    serverBaseUrl: 'http://localhost:3001',
     // 进度与时间预算
     workerTimeBudgetMs: 300000,
     preprocessTimeBudgetMs: 20000,
     progressComponentsIntervalMs: 0,
     progressDFSIntervalMs: 100,
-    // 权重参数
+    // 权重参数（强调连通与桥接，避免面积偏好）
     adjAfterWeight: 0.6,
-    bridgeWeight: 1,
-    gateWeight: 0.4,
+    bridgeWeight: 1.3,
+    gateWeight: 0.6,
     richnessWeight: 0.5,
     boundaryWeight: 0.8,
-    regionClassWeights: { boundary: 0.8, bridge: 1, richness: 0.6 },
-    dimensionWeights: { expand: 1, connect: 0.8, barrier: 0.7 },
+    regionClassWeights: { boundary: 0.9, bridge: 1.4, richness: 0.6, saddle: 1.0 },
+    dimensionWeights: { expand: 1.2, connect: 1.5, barrier: 0.8, multiFront: 1.2 },
     bifrontWeight: 2,
     // 稀有颜色与扩张过滤
     rareFreqRatio: 0.03,
@@ -76,7 +80,7 @@ function App() {
   const [grid, setGrid] = useState(null)
   const [triangles, setTriangles] = useState([])
   const [selectedColor, setSelectedColor] = useState(null)
-  const [triangleSize, setTriangleSize] = useState(18)
+const [triangleSize, setTriangleSize] = useState(30)
   const [startId, setStartId] = useState(null)
   const [selectedIds, setSelectedIds] = useState([])
   const [undoStack, setUndoStack] = useState([])
@@ -92,7 +96,11 @@ function App() {
   const [bestStartId, setBestStartId] = useState(null)
   const [status, setStatus] = useState('请上传图片')
   const [editMode, setEditMode] = useState(true)
-  const [rotation, setRotation] = useState(90)
+  const [rotation, setRotation] = useState(0)
+  // 网格排列方向：horizontal（底边水平）/ vertical（底边竖直）
+  const [gridArrangement, setGridArrangement] = useState('horizontal')
+  // 网格分辨率因子：实际用于构建网格的边长 = 基础尺寸 / 分辨率因子
+  const [resolutionScale, setResolutionScale] = useState(1)
   // 画布显示缩放（仅影响展示尺寸）
   const [canvasScale, setCanvasScale] = useState(1)
   // 画布位置偏移（仅影响展示位置）
@@ -167,16 +175,40 @@ function App() {
   const solveStartRef = useRef(0)
   const progressLogRef = useRef(null)
   const importRef = useRef(null)
+  const rebuildTimerRef = useRef(null)
+
+  // 居中视图（不改变缩放，仅设置偏移）
+  const centerView = useCallback(() => {
+    try {
+      const wrap = canvasWrapRef.current
+      if (!wrap || !grid) return
+      const swap = rotation === 90 || rotation === 270
+      const cw = swap ? grid.height : grid.width
+      const ch = swap ? grid.width : grid.height
+      const ww = wrap.clientWidth
+      const wh = wrap.clientHeight
+      if (ww <= 0 || wh <= 0 || cw <= 0 || ch <= 0) return
+      const s = canvasScale || 1
+      const ox = (ww - cw * s) / 2
+      const oy = (wh - ch * s) / 2
+      setCanvasOffset({ x: ox, y: oy })
+    } catch {}
+  }, [grid, rotation, canvasScale])
 
   // 初次加载时展示占位网格，避免空白画布
   useEffect(() => {
     if (imgBitmap || grid) return
-    const w = 1600, h = 1200
-    const g = buildTriangleGrid(w, h, triangleSize)
+    const wrap = canvasWrapRef.current
+    const w = wrap?.clientWidth || 1600
+    const h = wrap?.clientHeight || 1200
+    const sideInit = triangleSize / (resolutionScale || 1)
+    const g = (gridArrangement === 'horizontal')
+      ? buildTriangleGrid(w, h, sideInit)
+      : buildTriangleGridVertical(w, h, sideInit)
     setGrid(g)
     const tris = g.triangles.map(t => ({ ...t, color: (t.up ?? t.left) ? '#1b2333' : '#121826' }))
     setTriangles(tris)
-  }, [imgBitmap])
+  }, [imgBitmap, gridArrangement, triangleSize, resolutionScale])
 
   const handleImage = useCallback(async (blob) => {
     // 尊重 EXIF 方向，确保宽高与物理图像一致，避免比例失真
@@ -191,18 +223,22 @@ function App() {
     const w = bitmap.width
     const h = bitmap.height
     // 自动微调三角形尺寸：当使用默认值时，根据图像短边计算，使列/行数更合理，比例更稳定
-    let side = triangleSize
+    let sideBase = triangleSize
     const DEFAULT_SIDE = 18
     if (triangleSize === DEFAULT_SIDE) {
       const short = Math.min(w, h)
-      // 目标：短边约 60 个半边间距（列/行密度），确保采样密度随图像尺度自适应
-      const targetAcrossShort = 60
-      side = Math.max(10, Math.min(40, Math.round((2 * short) / targetAcrossShort)))
+      // 目标：短边约 90 个半边间距（更细密，减少形状“变形”感）
+      const targetAcrossShort = 90
+      // 放宽自适应范围：6~60
+      sideBase = Math.max(6, Math.min(60, Math.round((2 * short) / targetAcrossShort)))
     }
-    const grid = buildTriangleGrid(w, h, side)
-    if (side !== triangleSize) {
+    const side = sideBase / (resolutionScale || 1)
+    const grid = (gridArrangement === 'horizontal')
+      ? buildTriangleGrid(w, h, side)
+      : buildTriangleGridVertical(w, h, side)
+    if (sideBase !== triangleSize) {
       // 同步 UI 滑块显示，但保留用户后续手动可再调整
-      setTriangleSize(side)
+      setTriangleSize(sideBase)
     }
     setGrid(grid)
 
@@ -215,7 +251,7 @@ function App() {
     setSelectedIds([])
     setSteps([])
     setEditMode(true)
-  }, [triangleSize])
+  }, [triangleSize, gridArrangement, resolutionScale])
 
   useEffect(() => {
     // 根据分离强度调节颜色匹配参数
@@ -225,35 +261,44 @@ function App() {
     setColorTuning({ GREY_PENALTY_BASE: penalty, WARM_MARGIN: margin, STRONG_B_TH: strongB })
     // 若处于导入工程状态，则不触发自动重建与重新识别
     if (loadedProject) return
-    // 关键保护：用户开始试玩（editMode=false）后，调色板变化不再自动重映射，避免覆盖已泼涂颜色
-    if (imgBitmap && palette.length && editMode) {
-      const w = imgBitmap.width
-      const h = imgBitmap.height
-      const grid = buildTriangleGrid(w, h, triangleSize)
-      setGrid(grid)
-      ;(async () => {
-        const mapped = await mapImageToGrid(imgBitmap, grid, palette)
-        setTriangles(mapped)
-        setUndoStack([mapped.map(t => t.color)])
-        setRedoStack([])
-        setStartId(null)
-        setSteps([])
-      })()
-    } else if (!imgBitmap) {
-      // 占位画布场景：允许三角形尺寸变化时重建网格，以便看到尺寸变化效果
-      const w = grid?.width || 800
-      const h = grid?.height || 600
-      const g = buildTriangleGrid(w, h, triangleSize)
-      setGrid(g)
-      const base = g.triangles.map(t => ((t.up ?? t.left) ? '#1b2333' : '#121826'))
-      setTriangles(g.triangles.map((t, i) => ({ ...t, color: base[i] })))
-      // 记录初始快照，用于重置
-      setUndoStack([base])
-      setRedoStack([])
-      setInitialPalette(palette)
-      setInitialSelectedColor(palette[0] ?? null)
-    }
-  }, [triangleSize, loadedProject, colorSeparation, imgBitmap, editMode])
+    // 防抖：频繁拖动滑块时合并重建与映射，避免阻塞 UI
+    if (rebuildTimerRef.current) { clearTimeout(rebuildTimerRef.current) }
+    rebuildTimerRef.current = setTimeout(async () => {
+      try {
+        if (imgBitmap && palette.length && editMode) {
+          const w = imgBitmap.width
+          const h = imgBitmap.height
+          const gridNew = (gridArrangement === 'horizontal')
+            ? buildTriangleGrid(w, h, triangleSize / (resolutionScale || 1))
+            : buildTriangleGridVertical(w, h, triangleSize / (resolutionScale || 1))
+          setGrid(gridNew)
+          const mapped = await mapImageToGrid(imgBitmap, gridNew, palette)
+          setTriangles(mapped)
+          setUndoStack([mapped.map(t => t.color)])
+          setRedoStack([])
+          setStartId(null)
+          setSteps([])
+        } else if (!imgBitmap) {
+          // 占位画布场景：允许三角形尺寸变化时重建网格，以便看到尺寸变化效果
+          const w = grid?.width || 800
+          const h = grid?.height || 600
+          const g = (gridArrangement === 'horizontal')
+            ? buildTriangleGrid(w, h, triangleSize / (resolutionScale || 1))
+            : buildTriangleGridVertical(w, h, triangleSize / (resolutionScale || 1))
+          setGrid(g)
+          const base = g.triangles.map(t => ((t.up ?? t.left) ? '#1b2333' : '#121826'))
+          setTriangles(g.triangles.map((t, i) => ({ ...t, color: base[i] })))
+          // 记录初始快照，用于重置
+          setUndoStack([base])
+          setRedoStack([])
+          setInitialPalette(palette)
+          setInitialSelectedColor(palette[0] ?? null)
+        }
+      } finally {
+        rebuildTimerRef.current = null
+      }
+    }, 150)
+  }, [triangleSize, gridArrangement, resolutionScale, loadedProject, colorSeparation, imgBitmap, editMode])
 
   // 将缩放系数写入 CSS 变量，供画布样式使用
   useEffect(() => {
@@ -268,6 +313,72 @@ function App() {
     } catch {}
   }, [canvasOffset])
 
+  // Ctrl+滚轮缩放：向下滚轮放大，向上缩小（锚定指针位置）
+  const getMinScale = useCallback(() => {
+    try {
+      const wrap = canvasWrapRef.current
+      if (!wrap || !grid) return 0.2
+      const ww = wrap.clientWidth
+      const wh = wrap.clientHeight
+      const swap = rotation === 90 || rotation === 270
+      const cw = swap ? grid.height : grid.width
+      const ch = swap ? grid.width : grid.height
+      if (ww<=0 || wh<=0 || cw<=0 || ch<=0) return 0.2
+      return Math.max(ww / cw, wh / ch)
+    } catch { return 0.2 }
+  }, [grid, rotation])
+
+  useEffect(() => {
+    const wrap = canvasWrapRef.current
+    if (!wrap) return
+    const onWheel = (e) => {
+      if (!e.ctrlKey) return
+      e.preventDefault()
+      const rect = wrap.getBoundingClientRect()
+      const cx = e.clientX - rect.left
+      const cy = e.clientY - rect.top
+      setCanvasScale(prev => {
+        const rawNext = prev * (e.deltaY < 0 ? 1.12 : 0.88)
+        const next = Math.max(0.1, Math.min(6, rawNext))
+        setCanvasOffset(offPrev => {
+          const Px = (cx - offPrev.x) / prev
+          const Py = (cy - offPrev.y) / prev
+          return { x: cx - Px * next, y: cy - Py * next }
+        })
+        return next
+      })
+    }
+    wrap.addEventListener('wheel', onWheel, { passive: false })
+    return () => wrap.removeEventListener('wheel', onWheel)
+  }, [getMinScale])
+
+  // 保证视图始终铺满窗口：网格变化或旋转时，限制到最小填充缩放并居中
+  useEffect(() => {
+    if (!grid) return
+    const minS = getMinScale()
+    setCanvasScale(s => (s < minS ? minS : s))
+    centerView()
+  }, [grid, rotation])
+
+  // 窗口尺寸变化时也维持铺满并居中
+  useEffect(() => {
+    const onResize = () => {
+      const minS = getMinScale()
+      setCanvasScale(s => (s < minS ? minS : s))
+      centerView()
+    }
+    window.addEventListener('resize', onResize)
+    return () => window.removeEventListener('resize', onResize)
+  }, [getMinScale])
+
+  // 图形颜色旋转（仅重映射颜色，不改变网格排列方向）
+  // 顺时针旋转视图 90°（网格与识别图形一起，仅改变方向，不改变大小）
+  const onRotate90 = useCallback(() => {
+    setRotation(r => (r + 90) % 360)
+    setStatus('已旋转视图 90°（网格与图形一起）')
+    setTimeout(() => centerView(), 0)
+  }, [centerView])
+
   // 键盘平移：WASD 与方向键（按缩放系数调整步长）
   useEffect(() => {
     const onKeyPan = (e) => {
@@ -278,10 +389,14 @@ function App() {
       const key = e.key
       const step = 40 / (canvasScale || 1)
       let dx = 0, dy = 0
-      if (key === 'ArrowLeft' || key === 'a' || key === 'A') dx = -step
-      else if (key === 'ArrowRight' || key === 'd' || key === 'D') dx = step
-      else if (key === 'ArrowUp' || key === 'w' || key === 'W') dy = -step
-      else if (key === 'ArrowDown' || key === 's' || key === 'S') dy = step
+      if (key === 'ArrowLeft') dx = -step
+      else if (key === 'ArrowRight') dx = step
+      else if (key === 'a' || key === 'A') dx = step
+      else if (key === 'd' || key === 'D') dx = -step
+      else if (key === 'ArrowUp') dy = -step
+      else if (key === 'ArrowDown') dy = step
+      else if (key === 'w' || key === 'W') dy = step
+      else if (key === 's' || key === 'S') dy = -step
       if (dx !== 0 || dy !== 0) {
         e.preventDefault()
         setCanvasOffset(prev => ({ x: prev.x + dx, y: prev.y + dy }))
@@ -556,8 +671,37 @@ function App() {
       setSolveProgress({ phase: 'init' })
       setProgressLogs([])
       solveStartRef.current = Date.now()
+      // 启动遥测 Run（不阻塞求解）
+      const graphSignature = makeGraphSignature(triangles, palette)
+      let __runId = null
+      try { const __r = await telemetryStartRun(triangles, palette, window.SOLVER_FLAGS); __runId = __r?.runId || null } catch {}
+      const telemetrySafeLog = async (payload)=>{ try{ if(__runId) await telemetryLogEvent(__runId, payload) }catch{} }
       // 让出一次事件循环，确保“计算中…”与状态文案先渲染
       await new Promise(r => setTimeout(r, 0))
+      // 优先尝试缓存命中
+      try {
+        const cache = await getCachePath(graphSignature)
+        const cachedPath = cache?.path
+        const cachedStart = cache?.start_id
+        const cachedMin = cache?.min_steps
+        if (cachedPath && cachedPath.length>0 && cachedStart!=null) {
+          const snapshots = await captureCanvasPNG(canvasRef.current, triangles, cachedStart, cachedPath.slice(0, Math.max(1, Math.min(40, cachedPath.length))))
+          setSteps([{ path: cachedPath, images: snapshots }])
+          setBestStartId(cachedStart)
+          setStatus(`缓存命中：起点 #${cachedStart}，步骤 ${cachedMin??cachedPath.length}`)
+          setSolveProgress(null)
+          try { if(__runId) await telemetryFinishRun(__runId, { status:'cache_hit', min_steps: cachedMin??cachedPath.length, best_start_id: cachedStart, time_ms: Date.now() - solveStartRef.current, graph_signature: graphSignature }) } catch {}
+          return
+        }
+      } catch {}
+      // 获取推荐参数与优先起点
+      let preferredStartId = null
+      try {
+        const rec = await getRecommendation(graphSignature)
+        if (rec?.flags_overrides) { window.SOLVER_FLAGS = { ...(window.SOLVER_FLAGS||{}), ...(rec.flags_overrides||{}) } }
+        if (rec?.start_id!=null) { window.SOLVER_FLAGS.preferredStartId = rec.start_id; preferredStartId = rec.start_id }
+        if (typeof rec?.lb_estimate==='number') { telemetrySafeLog({ phase:'recommend', extra: { lb_estimate: rec.lb_estimate } }) }
+      } catch {}
       const maxBranches = 3
       // 仅使用本地计算：优先 Web Worker，失败则回退主线程
       let result = null
@@ -573,7 +717,10 @@ function App() {
               if(type==='progress'){
                 const p = payload
                 const now = Date.now()
-                if (now - progressLastRef.current > 200) {
+                const flags = (window.SOLVER_FLAGS||{})
+                const compPhases = ['components','components_build','components_analysis']
+                const intervalCfg = compPhases.includes(p?.phase) ? (flags.progressComponentsIntervalMs ?? 0) : (flags.progressDFSIntervalMs ?? 100)
+                if (intervalCfg===0 || (now - progressLastRef.current) >= intervalCfg) {
                   const nodes = p?.nodes ?? 0
                   const sols = p?.solutions ?? 0
               const phase = p?.phase === 'components' ? `已识别连通分量：${p?.count}`
@@ -592,13 +739,33 @@ function App() {
                 elapsedMs: now - solveStartRef.current,
                 perf: p?.perf,
               })
+              // 发送进度遥测（后端 events）
+              telemetrySafeLog({
+                phase: p?.phase,
+                nodes: p?.nodes,
+                solutions: p?.solutions,
+                queue: p?.queue,
+                perf: p?.perf,
+                extra: { bestStartId: p?.bestStartId, minSteps: p?.minSteps, count: p?.count }
+              })
               // 记录日志（滚动窗口显示）
               const perf = p?.perf || {}
               const phaseRaw = p?.phase || 'search'
               const compInfo = (phaseRaw==='components' || phaseRaw==='components_build')
                 ? ` count=${p?.count??0}${p?.compSize!=null?` compSize=${p.compSize}`:''}`
                 : ''
-              const line = `[${((now - solveStartRef.current)/1000).toFixed(1)}s] phase=${phaseRaw}${compInfo} nodes=${p?.nodes??0} queue=${p?.queue??0} sols=${p?.solutions??0} enq=${perf?.enqueued??'-'} exp=${perf?.expanded??'-'} zf=${perf?.filteredZero??'-'}`
+              const extra = (function(){
+                if (phaseRaw==='branch_pruned') {
+                  return ` reason=${p?.reason??'-'} step=${p?.step??'-'} color=${p?.color??'-'}`
+                } else if (phaseRaw==='branch_quality') {
+                  const dr = (typeof p?.deltaRatio==='number') ? (p.deltaRatio.toFixed(3)) : (p?.deltaRatio??'-')
+                  return ` step=${p?.step??'-'} color=${p?.color??'-'} delta=${p?.delta??'-'} dr=${dr} lb=${p?.lb??'-'} prio=${p?.priority??'-'}`
+                } else if (phaseRaw==='components_analysis') {
+                  return ` count=${p?.count??0}`
+                }
+                return ''
+              })()
+              const line = `[${((now - solveStartRef.current)/1000).toFixed(1)}s] phase=${phaseRaw}${compInfo}${extra} nodes=${p?.nodes??0} queue=${p?.queue??0} sols=${p?.solutions??0} enq=${perf?.enqueued??'-'} exp=${perf?.expanded??'-'} zf=${perf?.filteredZero??'-'}`
               setProgressLogs(prev=>{
                 const next = [...prev, line]
                 return next.length>200 ? next.slice(next.length-200) : next
@@ -615,14 +782,19 @@ function App() {
           })
           // 先同步求解器参数（flags），再启动自动求解
           try { worker.postMessage({ type:'set_flags', flags: window.SOLVER_FLAGS }) } catch {}
-          worker.postMessage({ type:'auto', triangles, palette, maxBranches, stepLimit: maxStepsLimit })
+          const lightTris = triangles.map(t=>({ id: t.id, neighbors: t.neighbors, color: t.color, deleted: !!t.deleted }))
+          worker.postMessage({ type:'auto', triangles: lightTris, palette, maxBranches, stepLimit: maxStepsLimit, preferredStartId })
           result = await resPromise
         } catch (wErr) {
           try{ window.__solverWorker = null }catch{}
           // 回退：使用窗口内的自动求解器
-          result = await window.Solver_minStepsAuto?.(triangles, palette, maxBranches, (p)=>{
+          const lightTris2 = triangles.map(t=>({ id: t.id, neighbors: t.neighbors, color: t.color, deleted: !!t.deleted }))
+          result = await window.Solver_minStepsAuto?.(lightTris2, palette, maxBranches, (p)=>{
             const now = Date.now()
-            if (now - progressLastRef.current > 200) {
+            const flags = (window.SOLVER_FLAGS||{})
+            const compPhases = ['components','components_build','components_analysis']
+            const intervalCfg = compPhases.includes(p?.phase) ? (flags.progressComponentsIntervalMs ?? 0) : (flags.progressDFSIntervalMs ?? 100)
+            if (intervalCfg===0 || (now - progressLastRef.current) >= intervalCfg) {
             const nodes = p?.nodes ?? 0
             const sols = p?.solutions ?? 0
             const phase = p?.phase === 'components' ? `已识别连通分量：${p?.count}`
@@ -646,7 +818,18 @@ function App() {
             const compInfo2 = (phaseRaw2==='components' || phaseRaw2==='components_build')
               ? ` count=${p?.count??0}${p?.compSize!=null?` compSize=${p.compSize}`:''}`
               : ''
-            const line = `[${((now - solveStartRef.current)/1000).toFixed(1)}s] phase=${phaseRaw2}${compInfo2} nodes=${p?.nodes??0} queue=${p?.queue??0} sols=${p?.solutions??0} enq=${perf?.enqueued??'-'} exp=${perf?.expanded??'-'} zf=${perf?.filteredZero??'-'}`
+                const extra2 = (function(){
+                  if (phaseRaw2==='branch_pruned') {
+                    return ` reason=${p?.reason??'-'} step=${p?.step??'-'} color=${p?.color??'-'}`
+                  } else if (phaseRaw2==='branch_quality') {
+                    const dr = (typeof p?.deltaRatio==='number') ? (p.deltaRatio.toFixed(3)) : (p?.deltaRatio??'-')
+                    return ` step=${p?.step??'-'} color=${p?.color??'-'} delta=${p?.delta??'-'} dr=${dr} lb=${p?.lb??'-'} prio=${p?.priority??'-'}`
+                  } else if (phaseRaw2==='components_analysis') {
+                    return ` count=${p?.count??0}`
+                  }
+                  return ''
+                })()
+                const line = `[${((now - solveStartRef.current)/1000).toFixed(1)}s] phase=${phaseRaw2}${compInfo2}${extra2} nodes=${p?.nodes??0} queue=${p?.queue??0} sols=${p?.solutions??0} enq=${perf?.enqueued??'-'} exp=${perf?.expanded??'-'} zf=${perf?.filteredZero??'-'}`
             setProgressLogs(prev=>{
               const next = [...prev, line]
               return next.length>200 ? next.slice(next.length-200) : next
@@ -677,21 +860,111 @@ function App() {
         const finalTris = triangles.map((t,i)=>({ ...t, color: colors[i] }))
         return isUniform(finalTris)
       }
-      const unifiedPaths = (result?.paths||[]).filter(p=>checkUnified(p))
+      let unifiedPaths = (result?.paths||[]).filter(p=>checkUnified(p))
       if (!result || unifiedPaths.length === 0 || !result.bestStartId) {
-        const startIdLocal = (result?.bestStartId!=null) ? result.bestStartId : (startId!=null ? startId : pickHeuristicStartId(triangles))
-        const heurLimit = Math.max(1, Math.min(40, maxStepsLimit))
-        const heurPath = computeGreedyPath(triangles, palette, startIdLocal, heurLimit)
-        if (heurPath && heurPath.length) {
-          const snapshots = await captureCanvasPNG(canvasRef.current, triangles, startIdLocal, heurPath)
-          setSteps([{ path: heurPath, images: snapshots }])
-          setStatus(`超时或未统一，已给出接近方案：起点 #${startIdLocal}，步骤 ${heurPath.length}`)
+        const elapsed = Date.now() - solveStartRef.current
+        const budget = (window.SOLVER_FLAGS?.workerTimeBudgetMs ?? 300000)
+        if (elapsed < budget - 10000) {
+          setStatus('未统一，继续搜索合格方案（桥接优先）…')
+          try {
+            const worker2 = new Worker(new URL('./utils/solver-worker.js', import.meta.url), { type: 'module' })
+            try { window.__solverWorker = worker2 } catch {}
+            const resPromise2 = new Promise((resolve, reject)=>{
+              const timeout2 = setTimeout(()=>{ try{ worker2.terminate() }catch{}; try{ window.__solverWorker = null }catch{}; reject(new Error('worker-timeout')) }, Math.max(10000, budget - elapsed))
+              worker2.onmessage = (ev)=>{
+                const { type, payload } = ev.data || {}
+                if(type==='progress'){
+                  const p2 = payload
+                  const now2 = Date.now()
+                  const flags2 = (window.SOLVER_FLAGS||{})
+                  const compPhases2 = ['components','components_build','components_analysis']
+                  const intervalCfg2 = compPhases2.includes(p2?.phase) ? (flags2.progressComponentsIntervalMs ?? 0) : (flags2.progressDFSIntervalMs ?? 100)
+                  if (intervalCfg2===0 || (now2 - progressLastRef.current) >= intervalCfg2) {
+                    const nodes2 = p2?.nodes ?? 0
+                    const sols2 = p2?.solutions ?? 0
+                    const phase2 = p2?.phase === 'components' ? `已识别连通分量：${p2?.count}`
+                      : p2?.phase === 'components_build' ? `正在构建分量：${p2?.count}（当前大小 ${p2?.compSize??'-'}）`
+                      : p2?.phase === 'best_update' ? `已更新最优：起点 #${p2?.bestStartId}，最少步骤 ${p2?.minSteps}`
+                      : `已探索节点：${nodes2}，候选分支：${sols2}`
+                    setStatus(`正在继续搜索合格方案… ${phase2}`)
+                    setSolveProgress({
+                      phase: p2?.phase,
+                      nodes: p2?.nodes,
+                      solutions: p2?.solutions,
+                      queue: p2?.queue,
+                      components: p2?.count,
+                      bestStartId: p2?.bestStartId,
+                      minSteps: p2?.minSteps,
+                      elapsedMs: now2 - solveStartRef.current,
+                      perf: p2?.perf,
+                    })
+                    const perf2 = p2?.perf || {}
+                    const phaseRaw2 = p2?.phase || 'search'
+                    const compInfo2 = (phaseRaw2==='components' || phaseRaw2==='components_build')
+                      ? ` count=${p2?.count??0}${p2?.compSize!=null?` compSize=${p2.compSize}`:''}`
+                      : ''
+                    const extra2 = (function(){
+                      if (phaseRaw2==='branch_pruned') {
+                        return ` reason=${p2?.reason??'-'} step=${p2?.step??'-'} color=${p2?.color??'-'}`
+                      } else if (phaseRaw2==='branch_quality') {
+                        const dr2 = (typeof p2?.deltaRatio==='number') ? (p2.deltaRatio.toFixed(3)) : (p2?.deltaRatio??'-')
+                        return ` step=${p2?.step??'-'} color=${p2?.color??'-'} delta=${p2?.delta??'-'} dr=${dr2} lb=${p2?.lb??'-'} prio=${p2?.priority??'-'}`
+                      } else if (phaseRaw2==='components_analysis') {
+                        return ` count=${p2?.count??0}`
+                      }
+                      return ''
+                    })()
+                    const line2 = `[${((now2 - solveStartRef.current)/1000).toFixed(1)}s] phase=${phaseRaw2}${compInfo2}${extra2} nodes=${p2?.nodes??0} queue=${p2?.queue??0} sols=${p2?.solutions??0} enq=${perf2?.enqueued??'-'} exp=${perf2?.expanded??'-'} zf=${perf2?.filteredZero??'-'}`
+                    setProgressLogs(prev=>{ const next=[...prev,line2]; return next.length>200 ? next.slice(next.length-200) : next })
+                    progressLastRef.current = now2
+                  }
+                } else if(type==='result'){
+                  clearTimeout(timeout2)
+                  try{ worker2.terminate() }catch{}
+                  try{ window.__solverWorker = null }catch{}
+                  resolve(payload)
+                }
+              }
+            })
+            const flagsStrong = { ...(window.SOLVER_FLAGS||{}), useDFSFirst: false, returnFirstFeasible: false, enableBridgeFirst: true, bifrontWeight: Math.max(2, (window.SOLVER_FLAGS?.bifrontWeight ?? 2)) }
+            try { worker2.postMessage({ type:'set_flags', flags: flagsStrong }) } catch {}
+            const lightTrisX = triangles.map(t=>({ id: t.id, neighbors: t.neighbors, color: t.color, deleted: !!t.deleted }))
+            worker2.postMessage({ type:'auto', triangles: lightTrisX, palette, maxBranches, stepLimit: maxStepsLimit })
+            const result2 = await resPromise2
+            const unifiedPaths2 = (result2?.paths||[]).filter(p=>{
+              let colors = triangles.map(t=>t.color)
+              const startIdLocal2 = result2.bestStartId
+              for(const color of p){
+                const startColorCur2 = colors[idToIndex.get(startIdLocal2)]
+                if(color===startColorCur2) continue
+                const regionSet2 = new Set(); const q2=[startIdLocal2]; const visited2=new Set([startIdLocal2])
+                while(q2.length){ const id=q2.shift(); const idx=idToIndex.get(id); if(colors[idx]!==startColorCur2) continue; regionSet2.add(id); for(const nb of neighbors[idx]){ if(!visited2.has(nb)){ visited2.add(nb); q2.push(nb) } } }
+                for(const id of regionSet2){ colors[idToIndex.get(id)] = color }
+              }
+              const finalTris2 = triangles.map((t,i)=>({ ...t, color: colors[i] }))
+              return isUniform(finalTris2)
+            })
+            if (result2 && unifiedPaths2.length>0 && result2.bestStartId!=null) {
+              result = result2
+              unifiedPaths = unifiedPaths2
+            }
+          } catch {}
+        }
+        if (!result || unifiedPaths.length === 0 || !result.bestStartId) {
+          const startIdLocal = (result?.bestStartId!=null) ? result.bestStartId : (startId!=null ? startId : pickHeuristicStartId(triangles))
+          const heurLimit = Math.max(1, Math.min(40, maxStepsLimit))
+          const heurPath = computeGreedyPath(triangles, palette, startIdLocal, heurLimit)
+          if (heurPath && heurPath.length) {
+            const snapshots = await captureCanvasPNG(canvasRef.current, triangles, startIdLocal, heurPath)
+            setSteps([{ path: heurPath, images: snapshots }])
+            setStatus(`超时或未统一，已给出接近方案：起点 #${startIdLocal}，步骤 ${heurPath.length}`)
+            setSolveProgress(null)
+            return
+          }
+          setStatus('未能在上限内统一，也无法生成接近方案。请提高步数上限或重试。')
           setSolveProgress(null)
           return
         }
-        setStatus('未能在上限内统一，也无法生成接近方案。请提高步数上限或重试。')
-        setSolveProgress(null)
-        return
       }
       if (!result || result.paths.length === 0 || !result.bestStartId) {
         if (result?.timedOut) {
@@ -714,9 +987,13 @@ function App() {
       setBestStartId(result.bestStartId ?? null)
       setStatus(`计算完成（自动起点 #${result.bestStartId}），最少步骤：${result.minSteps}，合格分支：${unifiedPaths.length}`)
       setSolveProgress(null)
+      try { await putCachePath(graphSignature, { path: unifiedPaths[0]||[], min_steps: result.minSteps, start_id: result.bestStartId, flags: window.SOLVER_FLAGS }) } catch {}
+      // 结束遥测 Run
+      try { if(__runId) await telemetryFinishRun(__runId, { status:'finished', min_steps: result.minSteps, best_start_id: result.bestStartId, time_ms: Date.now() - solveStartRef.current, graph_signature: graphSignature }) } catch {}
     } catch (err) {
       console.error('Auto-solve error:', err)
       setStatus('求解过程中发生错误')
+      try { if(__runId) await telemetryFinishRun(__runId, { status:'error', error: String(err?.message||err), time_ms: Date.now() - solveStartRef.current, graph_signature: graphSignature }) } catch {}
     } finally {
       setSolving(false)
     }
@@ -769,7 +1046,18 @@ function App() {
                 const compInfo3 = (phaseRaw3==='components' || phaseRaw3==='components_build')
                   ? ` count=${p?.count??0}${p?.compSize!=null?` compSize=${p.compSize}`:''}`
                   : ''
-                const line = `[${((now - solveStartRef.current)/1000).toFixed(1)}s] phase=${phaseRaw3}${compInfo3} nodes=${p?.nodes??0} queue=${p?.queue??0} sols=${p?.solutions??0} enq=${perf?.enqueued??'-'} exp=${perf?.expanded??'-'} zf=${perf?.filteredZero??'-'}`
+                const extra3 = (function(){
+                  if (phaseRaw3==='branch_pruned') {
+                    return ` reason=${p?.reason??'-'} step=${p?.step??'-'} color=${p?.color??'-'}`
+                  } else if (phaseRaw3==='branch_quality') {
+                    const dr = (typeof p?.deltaRatio==='number') ? (p.deltaRatio.toFixed(3)) : (p?.deltaRatio??'-')
+                    return ` step=${p?.step??'-'} color=${p?.color??'-'} delta=${p?.delta??'-'} dr=${dr} lb=${p?.lb??'-'} prio=${p?.priority??'-'}`
+                  } else if (phaseRaw3==='components_analysis') {
+                    return ` count=${p?.count??0}`
+                  }
+                  return ''
+                })()
+                const line = `[${((now - solveStartRef.current)/1000).toFixed(1)}s] phase=${phaseRaw3}${compInfo3}${extra3} nodes=${p?.nodes??0} queue=${p?.queue??0} sols=${p?.solutions??0} enq=${perf?.enqueued??'-'} exp=${perf?.expanded??'-'} zf=${perf?.filteredZero??'-'}`
                 setProgressLogs(prev=>{
                   const next = [...prev, line]
                   return next.length>200 ? next.slice(next.length-200) : next
@@ -787,12 +1075,14 @@ function App() {
         // 覆写 flags：关闭 DFS 与早停，采用标准 BFS/Best-First 求最短
         const flags = { ...(window.SOLVER_FLAGS||{}), useDFSFirst: false, returnFirstFeasible: false }
         try { worker.postMessage({ type:'set_flags', flags }) } catch {}
-        worker.postMessage({ type:'auto', triangles, palette, maxBranches, stepLimit: maxStepsLimit })
+        const lightTris3 = triangles.map(t=>({ id: t.id, neighbors: t.neighbors, color: t.color, deleted: !!t.deleted }))
+        worker.postMessage({ type:'auto', triangles: lightTris3, palette, maxBranches, stepLimit: maxStepsLimit })
         result = await resPromise
       } catch (err) {
         try{ window.__solverWorker = null }catch{}
         // 回退到主线程
-        result = await window.Solver_minStepsAuto?.(triangles, palette, 3, (p)=>{
+        const lightTris4 = triangles.map(t=>({ id: t.id, neighbors: t.neighbors, color: t.color, deleted: !!t.deleted }))
+        result = await window.Solver_minStepsAuto?.(lightTris4, palette, 3, (p)=>{
           const now = Date.now()
           if (now - progressLastRef.current > 200) {
             const nodes = p?.nodes ?? 0
@@ -895,12 +1185,14 @@ function App() {
         // 确保使用 DFS-first 与早停寻找更短路径
         const flags = { ...(window.SOLVER_FLAGS||{}), useDFSFirst: true, returnFirstFeasible: true }
         try { worker.postMessage({ type:'set_flags', flags }) } catch {}
-        worker.postMessage({ type:'optimize', triangles, palette, startId: sid, path: originalPath })
+        const lightTris5 = triangles.map(t=>({ id: t.id, neighbors: t.neighbors, color: t.color, deleted: !!t.deleted }))
+        worker.postMessage({ type:'optimize', triangles: lightTris5, palette, startId: sid, path: originalPath })
         result = await resPromise
       } catch (err) {
         try{ window.__solverWorker = null }catch{}
         // 回退：主线程路径优化
-        result = await window.OptimizeSolution?.(triangles, palette, sid, originalPath, (p)=>{
+        const lightTris6 = triangles.map(t=>({ id: t.id, neighbors: t.neighbors, color: t.color, deleted: !!t.deleted }))
+        result = await window.OptimizeSolution?.(lightTris6, palette, sid, originalPath, (p)=>{
           const now = Date.now()
           const phase = p?.phase || 'optimize'
           if (now - progressLastRef.current > 200) {
@@ -1379,8 +1671,8 @@ function App() {
             <label>三角形尺寸</label>
             <input
               type="range"
-              min="10"
-              max="40"
+              min="6"
+              max="60"
               value={triangleSize}
               onChange={e=>setTriangleSize(+e.target.value)}
               disabled={!editMode || loadedProject}
@@ -1397,12 +1689,37 @@ function App() {
           </div>
           <div className="row">
             <label>画布缩放</label>
-            <input type="range" min="0.4" max="2" step="0.05" value={canvasScale} onChange={e=>setCanvasScale(+e.target.value)} />
+            <input
+              type="range"
+              min="0.1"
+              max="4"
+              step="0.05"
+              value={canvasScale}
+              onChange={e=>{ const v=+e.target.value; setCanvasScale(Number.isFinite(v)? v : 1) }}
+            />
             <span>{Math.round(canvasScale*100)}%</span>
           </div>
           <div className="row">
-            <label>网格旋转</label>
-            <button onClick={()=>setRotation(r=> (r===0?90:0))}>{rotation===0? '旋转90°':'还原0°'}</button>
+            <label>分辨率</label>
+            <span style={{ display:'inline-flex', gap:'.35rem' }}>
+              <button onClick={()=>setResolutionScale(1)} disabled={loadedProject || resolutionScale===1} title={loadedProject ? '导入工程状态下分辨率不可改' : '将网格分辨率设为 1x'}>1x</button>
+              <button onClick={()=>setResolutionScale(2)} disabled={loadedProject || resolutionScale===2} title={loadedProject ? '导入工程状态下分辨率不可改' : '将网格分辨率设为 2x（约四倍三角数量）'}>2x</button>
+              <button onClick={()=>setResolutionScale(4)} disabled={loadedProject || resolutionScale===4} title={loadedProject ? '导入工程状态下分辨率不可改' : '将网格分辨率设为 4x（更细）'}>4x</button>
+            </span>
+          </div>
+          <div className="row">
+            <label>视图</label>
+            <button onClick={centerView} title="按当前缩放居中画布">居中视图</button>
+          </div>
+          <div className="row">
+            <label>网格排列</label>
+            <button onClick={()=>setGridArrangement(a=> (a==='horizontal'?'vertical':'horizontal'))} title="只改变网格排列方向，不改变识别图形方向">
+              {gridArrangement==='horizontal' ? '切到竖直排列' : '切到水平排列'}
+            </button>
+          </div>
+          <div className="row">
+            <label>图形旋转</label>
+            <button onClick={onRotate90} title="顺时针旋转视图 90°（网格与图形一起）">旋转90°</button>
           </div>
           <div className="row">
             <label>颜色分离强度</label>

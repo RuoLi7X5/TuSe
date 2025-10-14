@@ -1,9 +1,16 @@
 import { forwardRef, useEffect } from 'react'
 
 function transformPoint(pt, grid, rotation){
-  if (rotation === 90) {
-    // 旋转90°（顺时针），将坐标映射到宽=grid.height，高=grid.width 的画布
+  const r = ((rotation % 360) + 360) % 360
+  if (r === 90) {
+    // 旋转90°（顺时针）：画布宽=grid.height，高=grid.width
     return { x: grid.height - pt.y, y: pt.x }
+  } else if (r === 180) {
+    // 旋转180°：画布宽高不变
+    return { x: grid.width - pt.x, y: grid.height - pt.y }
+  } else if (r === 270) {
+    // 旋转270°（=逆时针90°）：画布宽=grid.height，高=grid.width
+    return { x: pt.y, y: grid.width - pt.x }
   }
   return { x: pt.x, y: pt.y }
 }
@@ -134,8 +141,8 @@ export default forwardRef(function TriangleCanvas({ grid, triangles, onClickTria
   useEffect(() => {
     if (!ref?.current || !grid) return
     const canvas = ref.current
-    // 旋转90°时交换画布宽高
-    if (rotation === 90) {
+    // 90°/270° 时交换画布宽高
+    if (rotation === 90 || rotation === 270) {
       canvas.width = grid.height
       canvas.height = grid.width
     } else {
@@ -159,8 +166,13 @@ export default forwardRef(function TriangleCanvas({ grid, triangles, onClickTria
       return { x, y }
     }
     const inv = (pt)=> {
-      if (rotation === 90) {
+      const r = ((rotation % 360) + 360) % 360
+      if (r === 90) {
         return { x: pt.y, y: grid.height - pt.x }
+      } else if (r === 180) {
+        return { x: grid.width - pt.x, y: grid.height - pt.y }
+      } else if (r === 270) {
+        return { x: grid.width - pt.y, y: pt.x }
       }
       return pt
     }

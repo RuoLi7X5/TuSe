@@ -118,9 +118,9 @@
   background: #0b0d13;
   border: 1px solid var(--border);
   border-radius: 12px;
-  /* 解除与视口高度的绑定，使画布按自身尺寸呈现 */
-  height: auto;
-  max-height: none;
+  /* 按视口高度作为画布窗口，便于铺满与居中 */
+  height: var(--canvas-window-height);
+  max-height: var(--canvas-window-height);
   overflow: auto; /* 内容超出容器时可滚动查看 */
 }
 

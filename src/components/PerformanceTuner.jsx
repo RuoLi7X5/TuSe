@@ -41,6 +41,13 @@ export default function PerformanceTuner({ onClose }) {
     rareAllowGateMin: 1.0,
     minDeltaRatio: 0.02,
     lbImproveMin: 1,
+    // 预处理分析与顺序
+    preprocessEnableAnalysisOrder: false,
+    dispersionThreshold: 0.2,
+    bridgeEdgeDensityThreshold: 0.4,
+    // 质量上报采样
+    qualitySampleRate: 0.15,
+    gainDropWarnRatio: 0.01,
     // 路径优化
     optimizeWindowSize: 5,
     optimizeEnableWindow: true,
@@ -214,6 +221,27 @@ export default function PerformanceTuner({ onClose }) {
           </Field>
           <Field label="性能日志" tooltip="效果：输出入队/扩张/过滤等统计，便于观察瓶颈与调参效果。\n适用：调参与问题定位阶段。\n不适用：正式演示或追求清爽界面时关闭。">
             <BoolInput value={flags.logPerf} onChange={v=>setFlag('logPerf', v)} />
+          </Field>
+        </Section>
+
+        <Section title="预处理分析与顺序">
+          <Field label="启用分析驱动的分量顺序" tooltip="效果：根据颜色离散度与桥接潜力，重排分量处理顺序（优先高离散度且有桥接潜力的分量）。\n适用：希望更快进入对全局最有价值分量的搜索。">
+            <BoolInput value={flags.preprocessEnableAnalysisOrder} onChange={v=>setFlag('preprocessEnableAnalysisOrder', v)} />
+          </Field>
+          <Field label="离散度阈值" tooltip="效果：当颜色的离散度高于该值时，判作高离散度（优先处理）。\n建议：0.15~0.30，图案越碎越可适当调高。">
+            <NumInput value={flags.dispersionThreshold} onChange={v=>setFlag('dispersionThreshold', v)} step={0.01} />
+          </Field>
+          <Field label="桥接边密度阈值" tooltip="效果：当分量的跨边界边比例高于该值时，判作桥接分量（优先处理）。\n建议：0.3~0.6，图案分裂较多时适当提高。">
+            <NumInput value={flags.bridgeEdgeDensityThreshold} onChange={v=>setFlag('bridgeEdgeDensityThreshold', v)} step={0.01} />
+          </Field>
+        </Section>
+
+        <Section title="质量上报采样">
+          <Field label="质量采样比例" tooltip="效果：在入队新分支时采样上报质量（delta、下界、优先级等），便于观察选择倾向与瓶颈。\n建议：0.05~0.20，过高会导致日志很多。">
+            <NumInput value={flags.qualitySampleRate} onChange={v=>setFlag('qualitySampleRate', v)} step={0.01} />
+          </Field>
+          <Field label="增益下降告警阈值" tooltip="效果：当扩张增益比率低于该值时标注为“增益下降”，便于识别低收益步骤。\n建议：0.005~0.02。">
+            <NumInput value={flags.gainDropWarnRatio} onChange={v=>setFlag('gainDropWarnRatio', v)} step={0.001} />
           </Field>
         </Section>
 

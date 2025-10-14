@@ -88,6 +88,10 @@ export function attachSolverToWindow(){
     // 构建一次 RAG 与全局颜色频次，供桥接启发式使用
     const RAG = buildRAG(triangles)
     const FREQ = colorFrequency(triangles)
+    // 颜色集中度偏置（不依赖面积）：按 RAG 组件计数构建简单偏置
+    const COLOR_COMP_COUNT = new Map()
+    for(const comp of RAG.components){ const c = comp.color; if(c){ COLOR_COMP_COUNT.set(c,(COLOR_COMP_COUNT.get(c)||0)+1) } }
+    const getColorBias = (c)=> 1 / Math.max(1, (COLOR_COMP_COUNT.get(c)||1))
 
     function computeAdjAfterSize(color, curColors, regionSet){
       // 预演一步应用 color 后的新区域相邻颜色种类数
@@ -151,14 +155,14 @@ export function attachSolverToWindow(){
         for(const compId of seenComps){
           const comp = RAG.components[compId]
           if(!comp) continue
-          const size = comp.members.length || 0
           const bd = RAG.boundaryDegree[compId] || 0
           // 邻近颜色多样性估计：组件邻接的不同颜色计数
           const adjComps = RAG.compAdj[compId] || []
           const adjColorSet = new Set()
           for(const aj of adjComps){ const co = RAG.components[aj]; if(co && co.color){ adjColorSet.add(co.color) } }
           const neighborVariety = adjColorSet.size
-          const richness = size * 0.5 + bd * 0.5 + neighborVariety * 1.0
+          // 去面积化：不再使用 size，强调边界与邻色多样性
+          const richness = bd * 0.7 + neighborVariety * 1.3
           bridgePotential += richness
           const contacts = gateContacts.get(compId) || 0
           // 窄缝奖励：接触点少但组件边界度高，视为“打通价值高”
@@ -286,8 +290,7 @@ export function attachSolverToWindow(){
       const preK = ENABLE_BEAM ? Math.min(BEAM_WIDTH, basePreK) : basePreK
       const prelim = tryColorsRaw.map(c=>{
         const g = (gain.get(c)||0)
-        const freq = (colorCount.get(c)||0)
-        const score0 = g*3 + freq*0.5
+        const score0 = g*3 + getColorBias(c)
         return { c, score0, gain:g }
       }).sort((a,b)=> b.score0 - a.score0).slice(0, preK)
 
@@ -310,19 +313,26 @@ export function attachSolverToWindow(){
           const nbIdx = idToIndex.get(nb)
           if (nbIdx!=null && curColors[nbIdx]===c){ seeds.push(nb) }
         }
-        // 估计扩张潜力（并集）
-        const seenUnion = new Set(seeds)
-        const qUnion = [...seeds]
-        while(qUnion.length){
-          const u = qUnion.shift()
-          const uIdx = idToIndex.get(u)
-          for(const v of neighbors[uIdx]){
-            const vIdx = idToIndex.get(v)
-            if (vIdx==null) continue
-            if (curColors[vIdx]===c && !seenUnion.has(v)) { seenUnion.add(v); qUnion.push(v) }
+        // 非面积扩张潜力：边界同色种子数量 + 种子连通性（分量越少越好）
+        const seedSet = new Set(seeds)
+        const visitedB = new Set()
+        let compCountB = 0
+        for(const s of seeds){
+          if(visitedB.has(s)) continue
+          compCountB += 1
+          const qB=[s]; visitedB.add(s)
+          while(qB.length){
+            const u=qB.shift()
+            const uIdx=idToIndex.get(u)
+            for(const v of neighbors[uIdx]){
+              const vIdx=idToIndex.get(v)
+              if(vIdx==null) continue
+              if(seedSet.has(v) && !visitedB.has(v) && curColors[vIdx]===c){ visitedB.add(v); qB.push(v) }
+            }
           }
         }
-        enlargePotential.set(c, seenUnion.size + regionSet.size)
+        const boundarySeedCount = seeds.length
+        enlargePotential.set(c, boundarySeedCount * 1.0 + Math.max(0, boundarySeedCount - compCountB) * 0.5)
       }
       // 双前沿“saddle”潜力：统计边界上颜色 c 的连通分量数量与最大的两个分量规模之和
       const saddlePotential = new Map()
@@ -350,8 +360,8 @@ export function attachSolverToWindow(){
           compSizes.push(size)
         }
         compSizes.sort((a,b)=>b-a)
-        const top2 = (compSizes[0]||0) + (compSizes[1]||0)
-        saddlePotential.set(c, compSizes.length>=2 ? top2 : 0)
+        // 非面积“saddle”：以分量数量衡量多前沿潜力
+        saddlePotential.set(c, compSizes.length)
       }
       const baseLimitTry = Math.max(6, Math.min(10, 6 + Math.floor((adjColors.size||0)/3) + (boundaryBefore>6?2:0)))
       const limitTry = ENABLE_BEAM ? Math.min(BEAM_WIDTH, baseLimitTry) : baseLimitTry
@@ -359,10 +369,9 @@ export function attachSolverToWindow(){
       const BF_W = Number.isFinite(window?.SOLVER_FLAGS?.bifrontWeight) ? window.SOLVER_FLAGS.bifrontWeight : 2.0
       const tryColors = prelim
         .map(({c, gain})=>{
-          const freq = (colorCount.get(c)||0)
           const pot = (enlargePotential.get(c)||0)
           const saddle = (saddlePotential.get(c)||0)
-          let score = gain*3 + freq*0.5 + pot*2 + saddle*BF_W
+          let score = gain*3 + pot*2 + saddle*BF_W + getColorBias(c)
           if (ENABLE_LOOKAHEAD){
             // 一步预演：应用颜色后计算下界变化，倾向于降低下界的颜色
             const tmp = curColors.slice()
@@ -390,7 +399,7 @@ export function attachSolverToWindow(){
             const raw2 = adj2.size>0 ? [...adj2] : palette
             const preK2 = 4
             const prelim2 = raw2.map(c2=>({ c2, g:(gain2.get(c2)||0), f:(colorCount.get(c2)||0) }))
-              .map(({c2,g,f})=>({ c2, score0: g*3 + f*0.5 }))
+              .map(({c2,g})=>({ c2, score0: g*3 + getColorBias(c2) }))
               .sort((a,b)=>b.score0-a.score0)
               .slice(0, preK2)
             let bestLb2 = lb1
@@ -530,11 +539,9 @@ export function attachSolverToWindow(){
               if(c!==regionColor2 && c && c!=='transparent' && !tri.deleted){ adjColors.add(c); gain.set(c,(gain.get(c)||0)+1) }
             }
           }
-          const colorCount=new Map()
-          for(const t of triangles){ if(!t.deleted && t.color && t.color!=='transparent'){ colorCount.set(t.color,(colorCount.get(t.color)||0)+1) } }
           const raw = adjColors.size>0 ? [...adjColors] : palette
           const score=(c)=>{
-            let s = (gain.get(c)||0)*3 + (colorCount.get(c)||0)*0.5
+            let s = (gain.get(c)||0)*3 + getColorBias(c)
             if (ENABLE_BRIDGE_FIRST){
               const adjAfter = computeAdjAfterSize(c, colors, regionSet)
               const { bridgePotential, gateScore } = computeBridgePotential(c, colors, regionSet)
@@ -681,7 +688,14 @@ export function attachSolverToWindow(){
       onProgress?.({ phase:'components_done', count: components.length, largest, elapsedMs: nowTs - startTime })
     } catch {}
     if(components.length===0) return { bestStartId: null, paths: [], minSteps: 0 }
-    // 可选：按组件大小排序，优先尝试更大的区域
+    // 若指定了优先起点，则将该分量置顶；否则按大小排序
+    try {
+      const preferred = (typeof window !== 'undefined' && window.SOLVER_FLAGS) ? window.SOLVER_FLAGS.preferredStartId : null
+      if (preferred!=null) {
+        const idxPref = components.findIndex(c=>c.startId===preferred)
+        if (idxPref>0) { const [c] = components.splice(idxPref,1); components.unshift(c) }
+      }
+    } catch {}
     components.sort((a,b)=>b.size-a.size)
     let best={ startId:null, minSteps: Infinity, paths: [] }
     for(const comp of components){

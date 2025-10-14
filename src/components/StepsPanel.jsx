@@ -16,9 +16,24 @@ export default function StepsPanel({ steps }) {
               </span>
             ))}
           </div>
-          <div style={{ display:'grid', gap:'.5rem' }}>
+          <div style={{ display:'grid', gap:'.5rem', gridTemplateColumns:'repeat(4, minmax(0, 1fr))' }}>
             {branch.images.map((src, j) => (
-              <img key={j} className="step-thumb" src={src} alt={`step ${j+1}`} />
+              <img
+                key={j}
+                className="step-thumb"
+                src={src}
+                alt={`step ${j+1}`}
+                loading="lazy"
+                style={{
+                  width: '100%',
+                  height: 'auto',
+                  maxHeight: '140px',
+                  objectFit: 'contain',
+                  border: '1px solid var(--border)',
+                  borderRadius: '6px',
+                  background: '#0b0f1a'
+                }}
+              />
             ))}
           </div>
         </div>
