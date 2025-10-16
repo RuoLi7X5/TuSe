@@ -2,10 +2,16 @@ require('dotenv').config()
 const express = require('express')
 const mongoose = require('mongoose')
 const cors = require('cors')
+const path = require('path')
 
 const app = express()
 app.use(cors({ origin: [/^http:\/\/localhost:\d+$/], credentials: false }))
 app.use(express.json({ limit: '2mb' }))
+// Serve static assets from dist (if present)
+try {
+  const distDirEarly = path.join(__dirname, '../dist')
+  app.use(express.static(distDirEarly))
+} catch {}
 
 const MONGODB_URI = process.env.MONGODB_URI || 'mongodb://127.0.0.1:27017/zhezhituse'
 const PORT = process.env.PORT || 3001
@@ -16,6 +22,8 @@ const Run = require('./models/Run')
 const Event = require('./models/Event')
 const Recommendation = require('./models/Recommendation')
 const Cache = require('./models/Cache')
+const UCB = require('./models/UCB')
+const Strategy = require('./models/Strategy')
 
 // Health
 app.get('/api/health', (req, res)=>{ res.json({ ok: true }) })
@@ -141,9 +149,112 @@ app.post('/api/cache/path', async (req, res)=>{
   } catch (e) { res.status(500).json({ error: e.message }) }
 })
 
+// UCB stats: aggregate per graph signature
+app.get('/api/learn/ucb', async (req, res)=>{
+  try {
+    const { signature } = req.query || {}
+    if (!signature) return res.status(400).json({ error: 'signature required' })
+    const doc = await UCB.findOne({ graph_signature: signature })
+    if (!doc) return res.json(null)
+    res.json({ counts: doc.counts_json || {}, rewards: doc.rewards_json || {}, totalPulls: doc.total_pulls || 0 })
+  } catch (e) { res.status(500).json({ error: e.message }) }
+})
+
+app.post('/api/learn/ucb', async (req, res)=>{
+  try {
+    const { graph_signature, counts, rewards, totalPulls } = req.body || {}
+    if (!graph_signature) return res.status(400).json({ error: 'graph_signature required' })
+    const prev = await UCB.findOne({ graph_signature })
+    const prevCounts = prev?.counts_json || {}
+    const prevRewards = prev?.rewards_json || {}
+    const nextCounts = { ...prevCounts }
+    const nextRewards = { ...prevRewards }
+    if (counts && typeof counts === 'object') {
+      for (const [c, n] of Object.entries(counts)) {
+        nextCounts[c] = (Number(nextCounts[c])||0) + (Number(n)||0)
+      }
+    }
+    if (rewards && typeof rewards === 'object') {
+      for (const [c, r] of Object.entries(rewards)) {
+        nextRewards[c] = (Number(nextRewards[c])||0) + (Number(r)||0)
+      }
+    }
+    const mergedTotal = (Number(prev?.total_pulls)||0) + (Number(totalPulls)||0)
+    await UCB.updateOne(
+      { graph_signature },
+      { $set: { graph_signature, counts_json: nextCounts, rewards_json: nextRewards, total_pulls: mergedTotal } },
+      { upsert: true }
+    )
+    res.json({ ok: true })
+  } catch (e) { res.status(500).json({ error: e.message }) }
+})
+
+// Graph strategy summary: features + strategy per signature
+app.get('/api/graphs/strategy', async (req, res)=>{
+  try {
+    const { signature } = req.query || {}
+    if (!signature) return res.status(400).json({ error: 'signature required' })
+    const doc = await Strategy.findOne({ graph_signature: signature })
+    if (!doc) return res.json(null)
+    res.json(doc.strategy_json || null)
+  } catch (e) { res.status(500).json({ error: e.message }) }
+})
+
+app.post('/api/graphs/strategy', async (req, res)=>{
+  try {
+    const { graph_signature, strategy } = req.body || {}
+    if (!graph_signature) return res.status(400).json({ error: 'graph_signature required' })
+    await Strategy.updateOne(
+      { graph_signature },
+      { $set: { graph_signature, strategy_json: strategy || {} } },
+      { upsert: true }
+    )
+    res.json({ ok: true })
+  } catch (e) { res.status(500).json({ error: e.message }) }
+})
+
+// SAT macro planner: generic Set Cover solver (greedy fallback)
+// Body: { universe: [id], sets: [{ id: string, elements: [id] }], k_max?: number }
+app.post('/api/sat/set-cover', async (req, res)=>{
+  try {
+    const { universe, sets, k_max } = req.body || {}
+    if (!Array.isArray(universe) || !Array.isArray(sets)) {
+      return res.status(400).json({ error: 'universe and sets array required' })
+    }
+    const U = new Set(universe)
+    const remaining = new Set(universe)
+    const chosen = []
+    const maxK = Number.isFinite(k_max) ? Math.max(1, Math.floor(k_max)) : 16
+    const byId = new Map(sets.map(s=>[s.id, new Set(s.elements||[])]))
+    let steps = 0
+    while(remaining.size>0 && steps < maxK){
+      let bestId = null; let bestGain = -1
+      for(const [sid, elems] of byId.entries()){
+        let gain = 0
+        for(const e of elems){ if(remaining.has(e)) gain++ }
+        if (gain > bestGain){ bestGain = gain; bestId = sid }
+      }
+      if (!bestId || bestGain<=0) break
+      chosen.push(bestId)
+      const elems = byId.get(bestId)
+      for(const e of elems){ remaining.delete(e) }
+      steps++
+    }
+    const covered = U.size - remaining.size
+    res.json({ chosen, covered })
+  } catch (e) { res.status(500).json({ error: e.message }) }
+})
+
 mongoose.connect(MONGODB_URI).then(()=>{
   app.listen(PORT, ()=>{ console.log(`[server] listening on http://localhost:${PORT}, db=${MONGODB_URI}`) })
 }).catch(err=>{
   console.error('[server] mongo connect error:', err)
   process.exit(1)
 })
+
+// Serve frontend static files (one-domain deploy)
+try {
+  const distDir = path.join(__dirname, '../dist')
+  app.use(express.static(distDir))
+  app.get('*', (req, res)=>{ res.sendFile(path.join(distDir, 'index.html')) })
+} catch {}

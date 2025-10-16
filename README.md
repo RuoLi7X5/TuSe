@@ -113,6 +113,9 @@ src/
 
 环境要求：Node.js 18+（推荐 20+）。
 
+在线部署地址
+- 生产环境：https://tuse-37e.pages.dev/
+
 开发启动：
 ```bash
 npm install

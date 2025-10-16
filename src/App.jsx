@@ -6,16 +6,24 @@ import TriangleCanvas from './components/TriangleCanvas'
 import Controls from './components/Controls'
 import StepsPanel from './components/StepsPanel'
 import HelpPage from './components/HelpPage'
+import CentralHub from './components/CentralHub'
 
 import { quantizeImage, setColorTuning } from './utils/color-utils'
 import { buildTriangleGrid, buildTriangleGridVertical, mapImageToGrid, isUniform, colorFrequency } from './utils/grid-utils'
 import { floodFillRegion, attachSolverToWindow, captureCanvasPNG } from './utils/solver'
-import { startRun as telemetryStartRun, logEvent as telemetryLogEvent, finishRun as telemetryFinishRun, makeGraphSignature, getRecommendation, getCachePath, putCachePath } from './utils/telemetry'
+import { hasPDB, loadPDBObject, loadPDBFromJSON, loadPDBFromURL, getPDBBaseURL } from './utils/pdb'
+import { startRun as telemetryStartRun, logEvent as telemetryLogEvent, finishRun as telemetryFinishRun, makeGraphSignature, getRecommendation, getCachePath, putCachePath, uploadStrategyAuto } from './utils/telemetry'
 
 // 设置默认的求解器开关与权重，并合并本地持久化配置（localStorage）
 if (typeof window !== 'undefined') {
   let persisted = null
   try { persisted = JSON.parse(localStorage.getItem('solverFlags') || 'null') } catch {}
+  // 根据环境推断后端地址：开发用 localhost:3001，生产同域
+  let serverBaseDefault = 'http://localhost:3001'
+  try {
+    const isLocal = String(window.location.hostname||'').toLowerCase() === 'localhost'
+    serverBaseDefault = isLocal ? 'http://localhost:3001' : (window.location.origin || '')
+  } catch {}
   // 默认初始配置：与性能调节窗口一致，开箱即用
   window.SOLVER_FLAGS = {
     // 基本搜索策略
@@ -30,15 +38,22 @@ if (typeof window !== 'undefined') {
     enableZeroExpandFilter: true,
     useDFSFirst: false,
     returnFirstFeasible: false,
+    // 严格模式（A* 最短路）
+    strictMode: false,
     logPerf: true,
+    // 学习优先级与 SAT 宏规划
+    enableLearningPrioritizer: true,
+    enableSATPlanner: false,
     // 后端遥测开关与服务地址
     enableTelemetry: true,
-    serverBaseUrl: 'http://localhost:3001',
+    serverBaseUrl: serverBaseDefault,
     // 进度与时间预算
     workerTimeBudgetMs: 300000,
     preprocessTimeBudgetMs: 20000,
     progressComponentsIntervalMs: 0,
     progressDFSIntervalMs: 100,
+    // A* 阶段进度节流
+    progressAStarIntervalMs: 80,
     // 权重参数（强调连通与桥接，避免面积偏好）
     adjAfterWeight: 0.6,
     bridgeWeight: 1.3,
@@ -60,9 +75,45 @@ if (typeof window !== 'undefined') {
     optimizeEnableWindow: true,
     optimizeEnableRemoval: true,
     optimizeSwapPasses: 1,
+    // 默认加载 PDB（通过代码控制）：开启后在启动时尝试加载默认 PDB
+    // 来源优先级：远程（pdbBaseUrl） > window.__PDB_AUTOLOAD__[key] > localStorage('PDB:'+key)
+    enablePDBAutoLoad: true,
+    // PDB 基础 URL（可通过面板或 env/window 覆写）：默认 '/pdb/'
+    pdbBaseUrl: '/pdb/',
     // 合并已有与持久化设置，持久化优先生效
     ...(window.SOLVER_FLAGS || {}),
     ...(persisted || {}),
+  }
+  // 启动时根据开关尝试默认加载 PDB（仅一次），优先远程
+  try {
+    if (window.SOLVER_FLAGS?.enablePDBAutoLoad) {
+      const key = 'pdb_6x6'
+      if (!hasPDB(key)) {
+        (async () => {
+          let loaded = false
+          try {
+            const base = getPDBBaseURL()
+            const url = `${base}${key}.json`
+            loaded = await loadPDBFromURL(key, url)
+            if (loaded) {
+              console.info(`[PDB] 已自动加载（远程）：${key} <- ${url}`)
+            }
+          } catch {}
+          if (!loaded) {
+            const sourceObj = (typeof window !== 'undefined' && window.__PDB_AUTOLOAD__ && window.__PDB_AUTOLOAD__[key]) ? window.__PDB_AUTOLOAD__[key] : null
+            const lsJson = localStorage?.getItem('PDB:' + key)
+            if (sourceObj && typeof sourceObj === 'object') {
+              loaded = !!loadPDBObject(key, sourceObj)
+            } else if (lsJson) {
+              loaded = !!loadPDBFromJSON(key, lsJson)
+            }
+            console.info(loaded ? `[PDB] 已自动加载（本地来源）：${key}` : `[PDB] 自动加载未找到数据：${key}`)
+          }
+        })()
+      }
+    }
+  } catch (e) {
+    console.warn('[PDB] 自动加载异常：', e)
   }
 }
 attachSolverToWindow()
@@ -75,6 +126,11 @@ function App() {
     window.addEventListener('hashchange', onHash)
     return () => window.removeEventListener('hashchange', onHash)
   }, [])
+  // 总站访问控制：简单密码校验（会话级）
+  const [hubAuthed, setHubAuthed] = useState(() => {
+    try { return sessionStorage.getItem('hubAuthed') === '1' } catch { return false }
+  })
+  const [hubPwd, setHubPwd] = useState('')
   const [imgBitmap, setImgBitmap] = useState(null)
   const [palette, setPalette] = useState([])
   const [grid, setGrid] = useState(null)
@@ -176,6 +232,15 @@ const [triangleSize, setTriangleSize] = useState(30)
   const progressLogRef = useRef(null)
   const importRef = useRef(null)
   const rebuildTimerRef = useRef(null)
+
+  // 将当前画布数据暴露到 window，便于性能调节面板进行基准测试
+  useEffect(() => {
+    try {
+      const lightTris = Array.isArray(triangles) ? triangles.map(t=>({ id:t.id, neighbors:t.neighbors, color:t.color, deleted:!!t.deleted })) : []
+      window.__CURRENT_TRIANGLES__ = lightTris
+      window.__CURRENT_PALETTE__ = Array.isArray(palette) ? [...palette] : []
+    } catch {}
+  }, [triangles, palette])
 
   // 居中视图（不改变缩放，仅设置偏移）
   const centerView = useCallback(() => {
@@ -691,6 +756,7 @@ const [triangleSize, setTriangleSize] = useState(30)
           setStatus(`缓存命中：起点 #${cachedStart}，步骤 ${cachedMin??cachedPath.length}`)
           setSolveProgress(null)
           try { if(__runId) await telemetryFinishRun(__runId, { status:'cache_hit', min_steps: cachedMin??cachedPath.length, best_start_id: cachedStart, time_ms: Date.now() - solveStartRef.current, graph_signature: graphSignature }) } catch {}
+          try { await uploadStrategyAuto(triangles, palette, 'auto_solve', cachedStart, cachedPath) } catch {}
           return
         }
       } catch {}
@@ -719,7 +785,12 @@ const [triangleSize, setTriangleSize] = useState(30)
                 const now = Date.now()
                 const flags = (window.SOLVER_FLAGS||{})
                 const compPhases = ['components','components_build','components_analysis']
-                const intervalCfg = compPhases.includes(p?.phase) ? (flags.progressComponentsIntervalMs ?? 0) : (flags.progressDFSIntervalMs ?? 100)
+                const strictPhases = ['strict_astar']
+                const intervalCfg = compPhases.includes(p?.phase)
+                  ? (flags.progressComponentsIntervalMs ?? 0)
+                  : strictPhases.includes(p?.phase)
+                    ? (flags.progressAStarIntervalMs ?? 80)
+                    : (flags.progressDFSIntervalMs ?? 100)
                 if (intervalCfg===0 || (now - progressLastRef.current) >= intervalCfg) {
                   const nodes = p?.nodes ?? 0
                   const sols = p?.solutions ?? 0
@@ -793,7 +864,12 @@ const [triangleSize, setTriangleSize] = useState(30)
             const now = Date.now()
             const flags = (window.SOLVER_FLAGS||{})
             const compPhases = ['components','components_build','components_analysis']
-            const intervalCfg = compPhases.includes(p?.phase) ? (flags.progressComponentsIntervalMs ?? 0) : (flags.progressDFSIntervalMs ?? 100)
+            const strictPhases = ['strict_astar']
+            const intervalCfg = compPhases.includes(p?.phase)
+              ? (flags.progressComponentsIntervalMs ?? 0)
+              : strictPhases.includes(p?.phase)
+                ? (flags.progressAStarIntervalMs ?? 80)
+                : (flags.progressDFSIntervalMs ?? 100)
             if (intervalCfg===0 || (now - progressLastRef.current) >= intervalCfg) {
             const nodes = p?.nodes ?? 0
             const sols = p?.solutions ?? 0
@@ -878,7 +954,12 @@ const [triangleSize, setTriangleSize] = useState(30)
                   const now2 = Date.now()
                   const flags2 = (window.SOLVER_FLAGS||{})
                   const compPhases2 = ['components','components_build','components_analysis']
-                  const intervalCfg2 = compPhases2.includes(p2?.phase) ? (flags2.progressComponentsIntervalMs ?? 0) : (flags2.progressDFSIntervalMs ?? 100)
+                  const strictPhases2 = ['strict_astar']
+                  const intervalCfg2 = compPhases2.includes(p2?.phase)
+                    ? (flags2.progressComponentsIntervalMs ?? 0)
+                    : strictPhases2.includes(p2?.phase)
+                      ? (flags2.progressAStarIntervalMs ?? 80)
+                      : (flags2.progressDFSIntervalMs ?? 100)
                   if (intervalCfg2===0 || (now2 - progressLastRef.current) >= intervalCfg2) {
                     const nodes2 = p2?.nodes ?? 0
                     const sols2 = p2?.solutions ?? 0
@@ -988,6 +1069,7 @@ const [triangleSize, setTriangleSize] = useState(30)
       setStatus(`计算完成（自动起点 #${result.bestStartId}），最少步骤：${result.minSteps}，合格分支：${unifiedPaths.length}`)
       setSolveProgress(null)
       try { await putCachePath(graphSignature, { path: unifiedPaths[0]||[], min_steps: result.minSteps, start_id: result.bestStartId, flags: window.SOLVER_FLAGS }) } catch {}
+      try { await uploadStrategyAuto(triangles, palette, 'auto_solve', result.bestStartId, unifiedPaths[0]||[]) } catch {}
       // 结束遥测 Run
       try { if(__runId) await telemetryFinishRun(__runId, { status:'finished', min_steps: result.minSteps, best_start_id: result.bestStartId, time_ms: Date.now() - solveStartRef.current, graph_signature: graphSignature }) } catch {}
     } catch (err) {
@@ -1009,6 +1091,29 @@ const [triangleSize, setTriangleSize] = useState(30)
       setSolveProgress({ phase: 'init' })
       setProgressLogs([])
       solveStartRef.current = Date.now()
+      // 启动遥测 Run（不阻塞）与缓存优先
+      const graphSignature2 = makeGraphSignature(triangles, palette)
+      let __runId2 = null
+      try { const __r2 = await telemetryStartRun(triangles, palette, { ...(window.SOLVER_FLAGS||{}), mode: 'continue_shortest' }); __runId2 = __r2?.runId || null } catch {}
+      const telemetrySafeLog2 = async (payload)=>{ try{ if(__runId2) await telemetryLogEvent(__runId2, payload) }catch{} }
+      // 尝试命中缓存，直接返回
+      try {
+        const cache = await getCachePath(graphSignature2)
+        const cachedPath = cache?.path
+        const cachedStart = cache?.start_id
+        const cachedMin = cache?.min_steps
+        if (cachedPath && cachedPath.length>0 && cachedStart!=null) {
+          const SNAPSHOT_LIMIT = 40
+          const snapshots = await captureCanvasPNG(canvasRef.current, triangles, cachedStart, cachedPath.slice(0, SNAPSHOT_LIMIT))
+          setSteps([{ path: cachedPath, images: snapshots }])
+          setBestStartId(cachedStart)
+          setStatus(`缓存命中：最短步骤 ${cachedMin??cachedPath.length}（起点 #${cachedStart}）`)
+          setSolveProgress(null)
+          try { if(__runId2) await telemetryFinishRun(__runId2, { status:'cache_hit', min_steps: cachedMin??cachedPath.length, best_start_id: cachedStart, time_ms: Date.now() - solveStartRef.current, graph_signature: graphSignature2 }) } catch {}
+          try { await uploadStrategyAuto(triangles, palette, 'continue_shortest', cachedStart, cachedPath) } catch {}
+          return
+        }
+      } catch {}
       await new Promise(r=>setTimeout(r,0))
       const maxBranches = 3
       let result = null
@@ -1030,17 +1135,26 @@ const [triangleSize, setTriangleSize] = useState(30)
                   : p?.phase === 'best_update' ? `已更新最优：起点 #${p?.bestStartId}，最少步骤 ${p?.minSteps}`
                   : `已探索节点：${nodes}，候选分支：${sols}`
                 setStatus(`正在继续计算最短步骤… ${phase}`)
-                setSolveProgress({
-                  phase: p?.phase,
-                  nodes: p?.nodes,
-                  solutions: p?.solutions,
-                  queue: p?.queue,
-                  components: p?.count,
-                  bestStartId: p?.bestStartId,
-                  minSteps: p?.minSteps,
-                  elapsedMs: now - solveStartRef.current,
-                  perf: p?.perf,
-                })
+            setSolveProgress({
+              phase: p?.phase,
+              nodes: p?.nodes,
+              solutions: p?.solutions,
+              queue: p?.queue,
+              components: p?.count,
+              bestStartId: p?.bestStartId,
+              minSteps: p?.minSteps,
+              elapsedMs: now - solveStartRef.current,
+              perf: p?.perf,
+            })
+            // 发送进度遥测
+            telemetrySafeLog2({
+              phase: p?.phase,
+              nodes: p?.nodes,
+              solutions: p?.solutions,
+              queue: p?.queue,
+              perf: p?.perf,
+              extra: { bestStartId: p?.bestStartId, minSteps: p?.minSteps, count: p?.count }
+            })
                 const perf = p?.perf || {}
                 const phaseRaw3 = p?.phase || 'search'
                 const compInfo3 = (phaseRaw3==='components' || phaseRaw3==='components_build')
@@ -1096,6 +1210,7 @@ const [triangleSize, setTriangleSize] = useState(30)
             const line = `[${((now - solveStartRef.current)/1000).toFixed(1)}s] phase=${p?.phase||'search'} nodes=${p?.nodes??0} queue=${p?.queue??0} sols=${p?.solutions??0} enq=${perf?.enqueued??'-'} exp=${perf?.expanded??'-'} zf=${perf?.filteredZero??'-'}`
             setProgressLogs(prev=>{ const next=[...prev,line]; return next.length>200 ? next.slice(next.length-200) : next })
             progressLastRef.current = now
+            telemetrySafeLog2({ phase: p?.phase, nodes: p?.nodes, solutions: p?.solutions, queue: p?.queue, perf: p?.perf, extra: { bestStartId: p?.bestStartId, minSteps: p?.minSteps, count: p?.count } })
           }
         }, maxStepsLimit)
       }
@@ -1134,9 +1249,13 @@ const [triangleSize, setTriangleSize] = useState(30)
       setBestStartId(result.bestStartId ?? null)
       setStatus(`已更新为最短步骤（自动起点 #${result.bestStartId}），最少步骤：${result.minSteps}`)
       setSolveProgress(null)
+      try { await putCachePath(graphSignature2, { path: unifiedPaths[0]||[], min_steps: result.minSteps, start_id: result.bestStartId, flags: window.SOLVER_FLAGS }) } catch {}
+      try { await uploadStrategyAuto(triangles, palette, 'continue_shortest', result.bestStartId, unifiedPaths[0]||[]) } catch {}
+      try { if(__runId2) await telemetryFinishRun(__runId2, { status:'finished', min_steps: result.minSteps, best_start_id: result.bestStartId, time_ms: Date.now() - solveStartRef.current, graph_signature: graphSignature2 }) } catch {}
     } catch (err) {
       console.error('Continue shortest error:', err)
       setStatus('继续计算最短步骤时发生错误')
+      try { if(__runId2) await telemetryFinishRun(__runId2, { status:'error', error: String(err?.message||err), time_ms: Date.now() - solveStartRef.current, graph_signature: graphSignature2 }) } catch {}
     } finally {
       setSolving(false)
     }
@@ -1153,6 +1272,11 @@ const [triangleSize, setTriangleSize] = useState(30)
       setSolveProgress({ phase: 'optimize_init' })
       setProgressLogs([])
       solveStartRef.current = Date.now()
+      // 启动遥测 Run（不阻塞）
+      const graphSignature3 = makeGraphSignature(triangles, palette)
+      let __runId3 = null
+      try { const __r3 = await telemetryStartRun(triangles, palette, { ...(window.SOLVER_FLAGS||{}), mode: 'optimize_path' }); __runId3 = __r3?.runId || null } catch {}
+      const telemetrySafeLog3 = async (payload)=>{ try{ if(__runId3) await telemetryLogEvent(__runId3, payload) }catch{} }
       await new Promise(r=>setTimeout(r,0))
       let result = null
       try {
@@ -1173,6 +1297,7 @@ const [triangleSize, setTriangleSize] = useState(30)
                 const line = `[${((now - solveStartRef.current)/1000).toFixed(1)}s] phase=${phase} crit=${p?.criticalCount??'-'} min=${p?.minSteps??'-'} enq=${perf?.enqueued??'-'} exp=${perf?.expanded??'-'}`
                 setProgressLogs(prev=>{ const next=[...prev,line]; return next.length>200 ? next.slice(next.length-200) : next })
                 progressLastRef.current = now
+                telemetrySafeLog3({ phase, perf, extra: { criticalCount: p?.criticalCount, minSteps: p?.minSteps, components: p?.count } })
               }
             } else if(type==='result'){
               clearTimeout(timeout)
@@ -1201,6 +1326,7 @@ const [triangleSize, setTriangleSize] = useState(30)
             const line = `[${((now - solveStartRef.current)/1000).toFixed(1)}s] phase=${phase} crit=${p?.criticalCount??'-'} min=${p?.minSteps??'-'}`
             setProgressLogs(prev=>{ const next=[...prev,line]; return next.length>200 ? next.slice(next.length-200) : next })
             progressLastRef.current = now
+            telemetrySafeLog3({ phase, extra: { criticalCount: p?.criticalCount, minSteps: p?.minSteps } })
           }
         })
       }
@@ -1229,13 +1355,19 @@ const [triangleSize, setTriangleSize] = useState(30)
         setSteps([{ path: result.optimizedPath, images: snapshots }])
         setBestStartId(result.bestStartId ?? sid)
         setStatus(`路径优化成功：由 ${originalPath.length} 步缩短为 ${result.optimizedLen} 步（起点 #${result.bestStartId ?? sid}）`)
+        try { await putCachePath(graphSignature3, { path: result.optimizedPath, min_steps: result.optimizedLen, start_id: result.bestStartId ?? sid, flags: window.SOLVER_FLAGS }) } catch {}
+        try { if(__runId3) await telemetryFinishRun(__runId3, { status:'finished', min_steps: result.optimizedLen, best_start_id: result.bestStartId ?? sid, time_ms: Date.now() - solveStartRef.current, graph_signature: graphSignature3 }) } catch {}
+        try { await uploadStrategyAuto(triangles, palette, 'optimize_path', (result.bestStartId ?? sid), result.optimizedPath, (result?.analysis?.critical||null)) } catch {}
       } else {
         setStatus('未发现更短且统一的路径（已完成关键节点分析，可查看日志）')
+        try { if(__runId3) await telemetryFinishRun(__runId3, { status:'finished', min_steps: originalPath?.length, best_start_id: sid, time_ms: Date.now() - solveStartRef.current, graph_signature: graphSignature3 }) } catch {}
+        try { await uploadStrategyAuto(triangles, palette, 'optimize_path', sid, originalPath, (result?.analysis?.critical||null)) } catch {}
       }
       setSolveProgress(null)
     } catch (err) {
       console.error('Optimize path error:', err)
       setStatus('路径优化时发生错误')
+      try { if(__runId3) await telemetryFinishRun(__runId3, { status:'error', error: String(err?.message||err), time_ms: Date.now() - solveStartRef.current, graph_signature: graphSignature3 }) } catch {}
     } finally {
       setSolving(false)
     }
@@ -1551,6 +1683,50 @@ const [triangleSize, setTriangleSize] = useState(30)
       <>
         <a href="#" className="help-link" style={{ position:'fixed', top:'12px', right:'16px', color:'var(--muted)', textDecoration:'none' }}>返回主页</a>
         <HelpPage />
+      </>
+    )
+  }
+
+  // 总站子页渲染：集中存储与聚合展示
+  if (route === '#/hub') {
+    if (!hubAuthed) {
+      const onSubmit = () => {
+        if ((hubPwd||'').trim() === 'ruoli') {
+          setHubAuthed(true)
+          try { sessionStorage.setItem('hubAuthed', '1') } catch {}
+        } else {
+          alert('无权限')
+          try { window.location.hash = '#/help' } catch { window.location.hash = '#/help' }
+        }
+      }
+      const onCancel = () => {
+        try { window.location.hash = '#/help' } catch { window.location.hash = '#/help' }
+      }
+      const onKeyDown = (e) => { if (e.key === 'Enter') onSubmit() }
+      return (
+        <div style={{ position:'fixed', inset:0, background:'rgba(0,0,0,0.35)', display:'flex', alignItems:'center', justifyContent:'center', zIndex:9999 }}>
+          <div className="panel" style={{ width:'360px', background:'var(--panel)', padding:'16px', boxShadow:'0 6px 24px rgba(0,0,0,.2)' }}>
+            <h3 style={{ margin:'0 0 12px 0', fontSize:'15px', color:'var(--muted)' }}>请输入密码</h3>
+            <input
+              type="password"
+              value={hubPwd}
+              onChange={e=>setHubPwd(e.target.value)}
+              onKeyDown={onKeyDown}
+              placeholder="密码"
+              style={{ width:'100%', padding:'8px', border:'1px solid var(--panel-border)', borderRadius:4, marginBottom:'12px', background:'var(--bg)' }}
+            />
+            <div style={{ display:'flex', gap:'8px', justifyContent:'flex-end' }}>
+              <button onClick={onCancel}>取消</button>
+              <button className="primary" onClick={onSubmit}>确认</button>
+            </div>
+          </div>
+        </div>
+      )
+    }
+    return (
+      <>
+        <a href="#/help" className="help-link" style={{ position:'fixed', top:'12px', right:'16px', color:'var(--muted)', textDecoration:'none' }}>说明</a>
+        <CentralHub />
       </>
     )
   }

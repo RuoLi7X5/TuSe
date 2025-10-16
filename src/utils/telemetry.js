@@ -1,6 +1,14 @@
-// Minimal telemetry client: compute graph signature/features and post to local server
-
-const defaultBase = (typeof window !== 'undefined' && window.SOLVER_FLAGS?.serverBaseUrl) || 'http://localhost:3001'
+// Minimal telemetry client: compute graph signature/features and post to server
+// 默认后端地址：在开发环境使用 localhost:3001；在生产环境优先同域
+const defaultBase = (function(){
+  if (typeof window === 'undefined') return 'http://localhost:3001'
+  try {
+    const isLocal = String(window.location.hostname||'').toLowerCase() === 'localhost'
+    return isLocal ? 'http://localhost:3001' : (window.location.origin || '')
+  } catch {
+    return 'http://localhost:3001'
+  }
+})()
 
 function djb2(str){
   let h = 5381
@@ -114,4 +122,61 @@ export async function getCachePath(signature){
 
 export async function putCachePath(graph_signature, data){
   try{ return await postJSON('/api/cache/path', { graph_signature, ...data }) }catch{ return null }
+}
+
+// UCB stats aggregation endpoints
+export async function getUCBStats(signature){
+  try{ return await getJSON(`/api/learn/ucb?signature=${encodeURIComponent(signature)}`) }catch{ return null }
+}
+export async function putUCBStats(graph_signature, data){
+  try{ return await postJSON('/api/learn/ucb', { graph_signature, ...data }) }catch{ return null }
+}
+
+// Strategy summary: compute and upload/get
+export function computeStrategySummary(triangles, palette, startId, path, flags, mode){
+  const features = computeFeatures(triangles, palette)
+  const idToIndex = new Map(triangles.map((t,i)=>[t.id,i]))
+  const colors = triangles.map(t=>t.color)
+  const startColor = (startId!=null && idToIndex.has(startId)) ? colors[idToIndex.get(startId)] : null
+  const seq = Array.isArray(path) ? path.slice() : []
+  const color_counts = {}
+  let transitions = 0, longest = 0, curStreak = 0, prev = null
+  for(const c of seq){
+    color_counts[c] = (color_counts[c]||0) + 1
+    if(prev==null){ curStreak = 1 } else { curStreak = (c===prev) ? (curStreak+1) : 1 }
+    if(prev!=null && c!==prev) transitions++
+    if(curStreak>longest) longest = curStreak
+    prev = c
+  }
+  const unique_colors_used = Object.keys(color_counts).length
+  return {
+    mode: mode || 'auto',
+    start_id: startId ?? null,
+    start_color: startColor ?? null,
+    path_len: seq.length,
+    transitions_count: transitions,
+    longest_streak: longest,
+    unique_colors_used,
+    color_counts,
+    flags: { ...(flags||{}) },
+    features,
+  }
+}
+
+export async function getStrategySummary(signature){
+  try{ return await getJSON(`/api/graphs/strategy?signature=${encodeURIComponent(signature)}`) }catch{ return null }
+}
+
+export async function putStrategySummary(graph_signature, strategy){
+  try{ return await postJSON('/api/graphs/strategy', { graph_signature, strategy }) }catch{ return null }
+}
+
+export async function uploadStrategyAuto(triangles, palette, mode, startId, path, criticalNodes){
+  try{
+    if(!(typeof window !== 'undefined' && window.SOLVER_FLAGS?.enableTelemetry)) return
+    const graph_signature = makeGraphSignature(triangles, palette)
+    const summary = computeStrategySummary(triangles, palette, startId, path, (typeof window!=='undefined'?window.SOLVER_FLAGS:{}), mode)
+    if (criticalNodes && Array.isArray(criticalNodes)) summary.critical_nodes = criticalNodes
+    await putStrategySummary(graph_signature, summary)
+  }catch{}
 }

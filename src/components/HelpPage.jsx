@@ -61,6 +61,14 @@ export default function HelpPage() {
           </div>
         </Section>
 
+        <Section title="发布与后端遥测配置">
+          <div>同域部署：推荐将前端打包后的 `dist` 由后端静态托管，与 API 共域名，避免跨域与混合内容。</div>
+          <div>后端地址：性能调节窗口“后端遥测与同域部署”提供 `enableTelemetry` 开关与 `serverBaseUrl` 设置。</div>
+          <div>默认规则：生产环境默认同域（`window.location.origin`）；开发默认 `http://localhost:3001`。</div>
+          <div>健康检查：点击“后端健康检查”将请求 `/api/health` 验证连通性。</div>
+          <div>跨域部署：如前端为 Cloudflare Pages，需在后端放通 CORS 源并确保 HTTPS，否则浏览器会拦截。</div>
+        </Section>
+
         <Section title="参数总览（与性能调节窗口一致）">
           <div style={{ fontWeight:'bold' }}>进度与时间预算</div>
           <div>组件阶段进度节流（ms）：减少状态频繁刷新造成的卡顿。</div>
@@ -98,6 +106,18 @@ export default function HelpPage() {
           <div style={{ color:'var(--muted)' }}>
             说明：如遇参数含义疑惑或效果异常，请以本节与性能调节窗口的中文提示为准；可先减小束宽、提高节流并放宽稀有色限制后再观察。
           </div>
+        </Section>
+
+        <Section title="详细参数解释与关系（补充）">
+          <div>严格 A* 与分层启发式：`strictMode=true` 且启用 `layered_*_max` 时仍可采纳（最优性可证）；`sum/weighted` 变体一般非可采纳，慎用于严格模式。</div>
+          <div>Best-First 排序：`useAStarInBestFirst` 用 f=g+h 排序更稳；`useStrongLBInBestFirst` 更保守，适合大图降噪。</div>
+          <div>束搜索收敛：`beamWidth` 配合 `beamDecay` 与 `beamMin` 控制深层复杂度；过小可能错过好解，过大耗时显著。</div>
+          <div>桥接与稀有：`enableBridgeFirst` 与稀有阈值共同影响是否优先跨分量；提高 `rareAllowBridgeMin`/`GateMin` 能抑制质量差的稀有桥接。</div>
+          <div>扩张过滤：`minDeltaRatio` 与 `lbImproveMin` 联合作用——要求“扩张比例”与“下界减少量”至少满足其一，否则过滤。</div>
+          <div>前瞻与时间预算：两步前瞻提升决策稳健性但更耗时；与 `workerTimeBudgetMs`、进度节流参数共同决定交互流畅度。</div>
+          <div>路径优化：窗口重排与交换回合在长路径时收益递减；过大窗口可能与严格阶段冲突，建议在非严格阶段使用。</div>
+          <div>学习优先器（UCB）：仅影响颜色排序，不改变严格下界；与束搜索结合能显著提速，不影响最终最短性证明。</div>
+          <div>PDB 插件：加载到对应 `pdb_*` 后，`*_max` 与严格下界取 max 保持可采纳；未加载时估计为 0，等效仅严格下界。</div>
         </Section>
 
         <Section title="相互影响与典型触发">
@@ -138,6 +158,21 @@ export default function HelpPage() {
           </div>
         </Section>
 
+        <Section title="数据互通与关键传递">
+          <div>全栈数据流：前端基于 `window.SOLVER_FLAGS` 控制求解与遥测；`telemetry.js` 使用 `serverBaseUrl` 与开关与后端交互。</div>
+          <div>开关位置：性能调节窗口“后端遥测与同域部署”可直接开启/关闭与配置地址。</div>
+          <div>总站页面：`#/hub` 可查看 UCB 统计与策略摘要，支持手动刷新与同步。</div>
+          <div>后端检查：`/api/health` 返回后端健康状态；策略摘要与统计分别在 `/api/graphs/strategy` 与 `/api/learn/ucb` 路由。</div>
+        </Section>
+
+        <Section title="发布前检查清单">
+          <div>1) 前端：生产环境 `serverBaseUrl` 留空以同域；启用遥测；打开帮助页与调节面板确认提示完整。</div>
+          <div>2) 后端：静态托管 `dist`；确认 `/api/health` 正常；如跨域部署，放通 CORS 并启用 HTTPS。</div>
+          <div>3) 数据库：设置 `MONGODB_URI` 环境变量；检查运行日志无连接错误；在总站页查看统计是否能刷新。</div>
+          <div>4) 全栈互通：执行一次自动求解，观察事件日志与策略上传；在总站页看到摘要更新。</div>
+          <div>5) 性能参数：根据画布规模校准束宽与时间预算；确保交互流畅无明显卡顿。</div>
+        </Section>
+
         <Section title="常见问题">
           <div>
             - 为什么 `queue=0`？DFS 使用递归栈非队列；队列指标只对 BFS/Best-First 有意义。
@@ -153,6 +188,16 @@ export default function HelpPage() {
         <Section title="联系作者">
           <div>
             联系作者：加QQ：3188789174 备注来意
+          </div>
+        </Section>
+
+        <Section title="总站（学习模型聚合）">
+          <div>
+            - 进入总站查看或上传本地学习统计：
+            <a href="#/hub" style={{ marginLeft:'8px', color:'#7aa2f7', textDecoration:'none' }}>打开总站子页</a>
+          </div>
+          <div style={{ color:'var(--muted)' }}>
+            说明：总站采用本地 MongoDB（开发环境），后端地址由 `serverBaseUrl` 控制；生产建议同域部署，跨域需 CORS 与 HTTPS。
           </div>
         </Section>
       </div>
