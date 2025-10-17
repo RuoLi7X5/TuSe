@@ -63,9 +63,8 @@ export default function HelpPage() {
 
         <Section title="发布与后端遥测配置">
           <div>同域部署：推荐将前端打包后的 `dist` 由后端静态托管，与 API 共域名，避免跨域与混合内容。</div>
-          <div>后端地址：性能调节窗口“后端遥测与同域部署”提供 `enableTelemetry` 开关与 `serverBaseUrl` 设置。</div>
-          <div>默认规则：生产环境默认同域（`window.location.origin`）；开发默认 `http://localhost:3001`。</div>
-          <div>健康检查：点击“后端健康检查”将请求 `/api/health` 验证连通性。</div>
+          <div>后端地址与开关：遥测默认开启且不在性能调节窗口展示；地址同域自动推断，开发环境默认 `http://localhost:3001`。</div>
+          <div>健康检查：后端提供 `/api/health` 接口用于部署联调；前端不再提供面板按钮。</div>
           <div>跨域部署：如前端为 Cloudflare Pages，需在后端放通 CORS 源并确保 HTTPS，否则浏览器会拦截。</div>
         </Section>
 
@@ -160,13 +159,14 @@ export default function HelpPage() {
 
         <Section title="数据互通与关键传递">
           <div>全栈数据流：前端基于 `window.SOLVER_FLAGS` 控制求解与遥测；`telemetry.js` 使用 `serverBaseUrl` 与开关与后端交互。</div>
-          <div>开关位置：性能调节窗口“后端遥测与同域部署”可直接开启/关闭与配置地址。</div>
+          <div>遥测开关：默认开启且不在性能调节窗口展示；如需查看状态，可检查 `window.SOLVER_FLAGS.enableTelemetry`。</div>
+          <div>地址策略：同域优先推断；开发默认为 `http://localhost:3001`。如需覆盖可在代码层设置 `serverBaseUrl`。</div>
           <div>总站页面：`#/hub` 可查看 UCB 统计与策略摘要，支持手动刷新与同步。</div>
           <div>后端检查：`/api/health` 返回后端健康状态；策略摘要与统计分别在 `/api/graphs/strategy` 与 `/api/learn/ucb` 路由。</div>
         </Section>
 
         <Section title="发布前检查清单">
-          <div>1) 前端：生产环境 `serverBaseUrl` 留空以同域；启用遥测；打开帮助页与调节面板确认提示完整。</div>
+          <div>1) 前端：生产环境 `serverBaseUrl` 留空以同域；遥测默认开启，无需在面板设置；打开帮助页确认提示完整。</div>
           <div>2) 后端：静态托管 `dist`；确认 `/api/health` 正常；如跨域部署，放通 CORS 并启用 HTTPS。</div>
           <div>3) 数据库：设置 `MONGODB_URI` 环境变量；检查运行日志无连接错误；在总站页查看统计是否能刷新。</div>
           <div>4) 全栈互通：执行一次自动求解，观察事件日志与策略上传；在总站页看到摘要更新。</div>

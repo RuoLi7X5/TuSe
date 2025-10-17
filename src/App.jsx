@@ -7,6 +7,7 @@ import Controls from './components/Controls'
 import StepsPanel from './components/StepsPanel'
 import HelpPage from './components/HelpPage'
 import CentralHub from './components/CentralHub'
+import AdminDashboard from './components/AdminDashboard'
 
 import { quantizeImage, setColorTuning } from './utils/color-utils'
 import { buildTriangleGrid, buildTriangleGridVertical, mapImageToGrid, isUniform, colorFrequency } from './utils/grid-utils'
@@ -84,6 +85,13 @@ if (typeof window !== 'undefined') {
     ...(window.SOLVER_FLAGS || {}),
     ...(persisted || {}),
   }
+  // 强制开启遥测：不受持久化配置影响，确保自动上传策略与学习统计
+  try {
+    window.SOLVER_FLAGS.enableTelemetry = true
+    // 写回本地，避免旧配置残留导致后续会话关闭遥测
+    const persistedNext = { ...(persisted||{}), enableTelemetry: true }
+    localStorage.setItem('solverFlags', JSON.stringify({ ...window.SOLVER_FLAGS, ...persistedNext }))
+  } catch {}
   // 启动时根据开关尝试默认加载 PDB（仅一次），优先远程
   try {
     if (window.SOLVER_FLAGS?.enablePDBAutoLoad) {
@@ -126,9 +134,13 @@ function App() {
     window.addEventListener('hashchange', onHash)
     return () => window.removeEventListener('hashchange', onHash)
   }, [])
-  // 总站访问控制：简单密码校验（会话级）
+  // 总站访问控制：令牌登录（会话/持久化）
   const [hubAuthed, setHubAuthed] = useState(() => {
-    try { return sessionStorage.getItem('hubAuthed') === '1' } catch { return false }
+    try {
+      const token = localStorage.getItem('adminToken')
+      if (token && token.length>0) return true
+      return sessionStorage.getItem('hubAuthed') === '1'
+    } catch { return false }
   })
   const [hubPwd, setHubPwd] = useState('')
   const [imgBitmap, setImgBitmap] = useState(null)
@@ -239,6 +251,12 @@ const [triangleSize, setTriangleSize] = useState(30)
       const lightTris = Array.isArray(triangles) ? triangles.map(t=>({ id:t.id, neighbors:t.neighbors, color:t.color, deleted:!!t.deleted })) : []
       window.__CURRENT_TRIANGLES__ = lightTris
       window.__CURRENT_PALETTE__ = Array.isArray(palette) ? [...palette] : []
+      // 计算并缓存最新签名，供总站页在未装载画布时回退读取
+      try {
+        const sig = makeGraphSignature(lightTris, Array.isArray(palette) ? [...palette] : [])
+        window.__LAST_SIG__ = sig
+        localStorage.setItem('lastSignature', sig)
+      } catch {}
     } catch {}
   }, [triangles, palette])
 
@@ -1040,10 +1058,16 @@ const [triangleSize, setTriangleSize] = useState(30)
             setSteps([{ path: heurPath, images: snapshots }])
             setStatus(`超时或未统一，已给出接近方案：起点 #${startIdLocal}，步骤 ${heurPath.length}`)
             setSolveProgress(null)
+            // 近似方案也上传策略摘要，并结束遥测 Run，确保总站可见
+            try { await uploadStrategyAuto(triangles, palette, 'auto_solve_fallback', startIdLocal, heurPath) } catch {}
+            try { if(__runId) await telemetryFinishRun(__runId, { status:'fallback', min_steps: heurPath.length, best_start_id: startIdLocal, time_ms: Date.now() - solveStartRef.current, graph_signature: graphSignature }) } catch {}
             return
           }
           setStatus('未能在上限内统一，也无法生成接近方案。请提高步数上限或重试。')
           setSolveProgress(null)
+          // 无解时亦上传空摘要并结束遥测，便于数据库与总站同步
+          try { await uploadStrategyAuto(triangles, palette, 'auto_solve_failed', startIdLocal, []) } catch {}
+          try { if(__runId) await telemetryFinishRun(__runId, { status:'no_solution', best_start_id: startIdLocal, time_ms: Date.now() - solveStartRef.current, graph_signature: graphSignature }) } catch {}
           return
         }
       }
@@ -1054,6 +1078,9 @@ const [triangleSize, setTriangleSize] = useState(30)
           setStatus('未找到可行解或超出计算上限')
         }
         setSolveProgress(null)
+        // 结束遥测并上传空策略摘要，确保特征与记录被采集
+        try { await uploadStrategyAuto(triangles, palette, result?.timedOut ? 'auto_solve_timeout' : 'auto_solve_none', result?.bestStartId ?? null, []) } catch {}
+        try { if(__runId) await telemetryFinishRun(__runId, { status: result?.timedOut ? 'timeout' : 'no_solution', min_steps: 0, best_start_id: result?.bestStartId ?? null, time_ms: Date.now() - solveStartRef.current, graph_signature: graphSignature }) } catch {}
         return
       }
       const stepImgs = []
@@ -1690,12 +1717,22 @@ const [triangleSize, setTriangleSize] = useState(30)
   // 总站子页渲染：集中存储与聚合展示
   if (route === '#/hub') {
     if (!hubAuthed) {
-      const onSubmit = () => {
-        if ((hubPwd||'').trim() === 'ruoli') {
-          setHubAuthed(true)
+      const onSubmit = async () => {
+        const pwd = (hubPwd||'').trim()
+        if (!pwd) { alert('请输入密码'); return }
+        try {
+          const base = (typeof window!=='undefined' && window.SOLVER_FLAGS?.serverBaseUrl) ? String(window.SOLVER_FLAGS.serverBaseUrl) : (typeof window!=='undefined' ? (window.location.origin || 'http://localhost:3001') : 'http://localhost:3001')
+          const res = await fetch(`${base}/api/auth/login`, { method:'POST', headers:{ 'Content-Type':'application/json' }, body: JSON.stringify({ password: pwd }) })
+          if (!res.ok) { throw new Error('unauthorized') }
+          const data = await res.json()
+          const token = String(data?.token||'')
+          if (!token) throw new Error('no_token')
+          try { localStorage.setItem('adminToken', token) } catch {}
+          try { window.ADMIN_TOKEN = token } catch {}
           try { sessionStorage.setItem('hubAuthed', '1') } catch {}
-        } else {
-          alert('无权限')
+          setHubAuthed(true)
+        } catch (e) {
+          alert('无权限或后端未启动')
           try { window.location.hash = '#/help' } catch { window.location.hash = '#/help' }
         }
       }
@@ -1727,6 +1764,51 @@ const [triangleSize, setTriangleSize] = useState(30)
       <>
         <a href="#/help" className="help-link" style={{ position:'fixed', top:'12px', right:'16px', color:'var(--muted)', textDecoration:'none' }}>说明</a>
         <CentralHub />
+      </>
+    )
+  }
+
+  // 管理子页渲染：后台数据列表与事件
+  if (route === '#/admin') {
+    if (!hubAuthed) {
+      const onSubmit = async () => {
+        const pwd = (hubPwd||'').trim()
+        if (!pwd) { alert('请输入密码'); return }
+        try {
+          const base = (typeof window!=='undefined' && window.SOLVER_FLAGS?.serverBaseUrl) ? String(window.SOLVER_FLAGS.serverBaseUrl) : (typeof window!=='undefined' ? (window.location.origin || 'http://localhost:3001') : 'http://localhost:3001')
+          const res = await fetch(`${base}/api/auth/login`, { method:'POST', headers:{ 'Content-Type':'application/json' }, body: JSON.stringify({ password: pwd }) })
+          if (!res.ok) { throw new Error('unauthorized') }
+          const data = await res.json()
+          const token = String(data?.token||'')
+          if (!token) throw new Error('no_token')
+          try { localStorage.setItem('adminToken', token) } catch {}
+          try { window.ADMIN_TOKEN = token } catch {}
+          try { sessionStorage.setItem('hubAuthed', '1') } catch {}
+          setHubAuthed(true)
+        } catch (e) {
+          alert('无权限或后端未启动')
+          try { window.location.hash = '#/help' } catch { window.location.hash = '#/help' }
+        }
+      }
+      const onCancel = () => { try { window.location.hash = '#/help' } catch { window.location.hash = '#/help' } }
+      const onKeyDown = (e) => { if (e.key === 'Enter') onSubmit() }
+      return (
+        <div style={{ position:'fixed', inset:0, background:'rgba(0,0,0,0.35)', display:'flex', alignItems:'center', justifyContent:'center', zIndex:9999 }}>
+          <div className="panel" style={{ width:'360px', background:'var(--panel)', padding:'16px', boxShadow:'0 6px 24px rgba(0,0,0,.2)' }}>
+            <h3 style={{ margin:'0 0 12px 0', fontSize:'15px', color:'var(--muted)' }}>请输入密码</h3>
+            <input type="password" value={hubPwd} onChange={e=>setHubPwd(e.target.value)} onKeyDown={onKeyDown} placeholder="密码" style={{ width:'100%', padding:'8px', border:'1px solid var(--panel-border)', borderRadius:4, marginBottom:'12px', background:'var(--bg)' }} />
+            <div style={{ display:'flex', gap:'8px', justifyContent:'flex-end' }}>
+              <button onClick={onCancel}>取消</button>
+              <button className="primary" onClick={onSubmit}>确认</button>
+            </div>
+          </div>
+        </div>
+      )
+    }
+    return (
+      <>
+        <a href="#/help" className="help-link" style={{ position:'fixed', top:'12px', right:'16px', color:'var(--muted)', textDecoration:'none' }}>说明</a>
+        <AdminDashboard />
       </>
     )
   }

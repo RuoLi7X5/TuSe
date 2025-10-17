@@ -95,6 +95,8 @@ export default function PerformanceTuner({ onClose }) {
         ...base,
         regionClassWeights: { ...defaults.regionClassWeights, ...(base.regionClassWeights || {}) },
         dimensionWeights: { ...defaults.dimensionWeights, ...(base.dimensionWeights || {}) },
+        // 遥测默认开启（不在性能调节面板展示，不允许被本地关闭）
+        enableTelemetry: true,
       }
     } catch {
       return defaults
@@ -519,22 +521,7 @@ export default function PerformanceTuner({ onClose }) {
           </Field>
         </Section>
 
-        {/* 发布与后端遥测配置（优先同域，无跨域更简单） */}
-        <Section title="后端遥测与同域部署">
-          <Field label="启用遥测与服务器交互" tooltip={"关闭后仅本地求解，不与后端交互（不上传策略/不拉取统计）。\n建议：生产环境一般开启；隐私/离线演示可关闭。"}>
-            <BoolInput value={flags.enableTelemetry} onChange={v=>setFlag('enableTelemetry', v)} />
-          </Field>
-          <Field label="后端基础地址（可选）" tooltip={"留空默认同域：生产从 window.location.origin 推断；开发默认 http://localhost:3001。\n示例：https://app.example.com 或 https://solver.example.cn。"}>
-            <TextInput value={flags.serverBaseUrl||''} onChange={v=>setFlag('serverBaseUrl', v)} placeholder={getServerBase()} />
-          </Field>
-          <Field label="后端健康检查" tooltip={"点击检查将向 /api/health 发起请求，返回状态。用于发布前联调。"}>
-            <div style={{ display:'flex', alignItems:'center', gap:'.5rem' }}>
-              <button onClick={onCheckHealth}>检查</button>
-              {healthOk!==null && <StatusBadge ok={!!healthOk} text={healthMsg || (healthOk ? '连接正常' : '连接失败')} />}
-            </div>
-          </Field>
-          <div style={{ gridColumn:'1 / -1', fontSize:'12px', color:'#93a0b7' }}>建议同域部署（后端静态托管 dist）以避免 CORS 与混合内容；Cloudflare Pages 需允许跨域并确保 HTTPS。</div>
-        </Section>
+        {/** 后端遥测相关设置已移除：默认开启且不在面板中展示 **/}
 
         <Section title="质量上报采样">
           <Field label="质量采样比例" tooltip="效果：在入队新分支时采样上报质量（delta、下界、优先级等），便于观察选择倾向与瓶颈。\n建议：0.05~0.20，过高会导致日志很多。">

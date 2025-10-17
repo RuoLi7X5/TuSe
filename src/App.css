@@ -32,6 +32,97 @@
   border: 1px solid var(--border);
   border-radius: 12px;
   padding: 1rem;
+  color-scheme: dark; /* 强制表单控件按深色外观渲染 */
+  accent-color: var(--accent);
+}
+
+/* 面板内的通用按钮样式：统一深色主题，避免默认白底 */
+.panel button {
+  padding: .5rem .75rem;
+  border-radius: 8px;
+  border: 1px solid var(--border) !important;
+  background: #1a1f2b !important;
+  color: var(--text);
+  cursor: pointer;
+  appearance: none;
+  -webkit-appearance: none;
+  background-image: none;
+  box-shadow: none;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+}
+.panel button:disabled {
+  background: #1a1f2b !important; /* 禁用仍保持深色背景，避免白底 */
+  color: var(--muted);
+  border-color: var(--border);
+  opacity: 0.6;
+  cursor: not-allowed;
+  box-shadow: none;
+}
+.panel button.primary {
+  border-color: var(--accent);
+}
+
+/* 总站页面按钮的强力覆盖，避免任何默认样式造成白底 */
+.hub-btn {
+  padding: .5rem .75rem;
+  border-radius: 8px;
+  border: 1px solid var(--border) !important;
+  background: #1a1f2b !important;
+  color: var(--text) !important;
+  cursor: pointer;
+  appearance: none;
+  -webkit-appearance: none;
+  background-image: none !important;
+  box-shadow: none !important;
+}
+.hub-btn:disabled {
+  background: #1a1f2b !important;
+  color: var(--muted) !important;
+  border-color: var(--border) !important;
+  opacity: 0.7;
+  cursor: not-allowed;
+  box-shadow: none !important;
+}
+
+/* 链接形式的小按钮：与 small-btn 保持一致的深色样式 */
+a.small-btn {
+  display: inline-block;
+  padding: .35rem .6rem;
+  border-radius: 8px;
+  border: 1px solid var(--border);
+  background: #1a1f2b;
+  color: var(--text);
+  text-decoration: none;
+  cursor: pointer;
+}
+a.small-btn:visited { color: var(--text); }
+a.small-btn:hover { border-color: var(--accent); }
+
+/* 角色按钮通用覆盖：在 panel 内任何 [role="button"] 都强制深色 */
+.panel [role="button"] {
+  padding: .5rem .75rem;
+  border-radius: 8px;
+  border: 1px solid var(--border) !important;
+  background: #1a1f2b !important;
+  color: var(--text) !important;
+  cursor: pointer;
+  appearance: none;
+  -webkit-appearance: none;
+  background-image: none !important;
+  box-shadow: none !important;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+}
+.panel [role="button"][aria-disabled="true"] {
+  background: #1a1f2b !important;
+  color: var(--muted) !important;
+  border-color: var(--border) !important;
+  opacity: 0.7;
+  cursor: not-allowed;
+  box-shadow: none !important;
 }
 
 .panel h2 {

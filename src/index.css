@@ -37,9 +37,20 @@ button {
   background-color: #1a1a1a;
   cursor: pointer;
   transition: border-color 0.25s;
+  appearance: none;
+  -webkit-appearance: none;
+  background-image: none;
+  box-shadow: none;
 }
 button:hover {
   border-color: #646cff;
+}
+button:disabled {
+  background-color: #1a1f2b; /* 深色主题下禁用按钮保持暗色 */
+  color: rgba(232, 238, 249, 0.45); /* 减弱文字亮度但仍可读 */
+  border-color: var(--border, #222636);
+  cursor: not-allowed;
+  opacity: 0.8;
 }
 button:focus,
 button:focus-visible {
@@ -54,7 +65,9 @@ button:focus-visible {
   a:hover {
     color: #747bff;
   }
+  /* 保持本应用统一深色按钮，无论系统是浅色还是深色模式 */
   button {
-    background-color: #f9f9f9;
+    background-color: #1a1f2b;
+    color: rgba(33, 53, 71, 0.92);
   }
 }

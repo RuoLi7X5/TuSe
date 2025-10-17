@@ -76,10 +76,17 @@ export function computeFeatures(triangles, palette){
   return { palette_size, n_triangles, n_components, bridge_density, dispersion_avg, boundary_len, color_entropy }
 }
 
+function authHeader(){
+  try{
+    const token = (typeof window!=='undefined' ? (window.ADMIN_TOKEN || localStorage.getItem('adminToken') || '') : '')
+    return token ? { Authorization: 'Bearer '+token } : {}
+  } catch { return {} }
+}
 async function postJSON(path, body){
   const base = (typeof window !== 'undefined' && window.SOLVER_FLAGS?.serverBaseUrl) || defaultBase
   const url = `${base}${path}`
-  const res = await fetch(url, { method:'POST', headers:{ 'Content-Type':'application/json' }, body: JSON.stringify(body||{}) })
+  const headers = { 'Content-Type':'application/json', ...authHeader() }
+  const res = await fetch(url, { method:'POST', headers, body: JSON.stringify(body||{}) })
   if(!res.ok) throw new Error(`HTTP ${res.status}`)
   return await res.json()
 }
@@ -87,7 +94,8 @@ async function postJSON(path, body){
 async function getJSON(path){
   const base = (typeof window !== 'undefined' && window.SOLVER_FLAGS?.serverBaseUrl) || defaultBase
   const url = `${base}${path}`
-  const res = await fetch(url)
+  const headers = { ...authHeader() }
+  const res = await fetch(url, { headers })
   if(!res.ok) throw new Error(`HTTP ${res.status}`)
   return await res.json()
 }
@@ -179,4 +187,9 @@ export async function uploadStrategyAuto(triangles, palette, mode, startId, path
     if (criticalNodes && Array.isArray(criticalNodes)) summary.critical_nodes = criticalNodes
     await putStrategySummary(graph_signature, summary)
   }catch{}
+}
+
+// Admin: list recent graphs
+export async function listGraphs(limit = 50){
+  try { return await getJSON(`/api/graphs/list?limit=${encodeURIComponent(String(limit))}`) } catch { return [] }
 }
