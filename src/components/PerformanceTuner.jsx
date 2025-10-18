@@ -7,24 +7,25 @@ export default function PerformanceTuner({ onClose }) {
   const existing = typeof window !== 'undefined' ? (window.SOLVER_FLAGS || {}) : {}
   // 默认值（与 solver.js / solver-worker.js 保持一致）
   const defaults = useMemo(() => ({
-    // 基本搜索策略（与默认初始设置一致）
+    // 基本搜索策略（更偏向“尽快拿到可行解”）
     enableLB: true,
     enableLookahead: true,
     enableLookaheadDepth2: false,
     enableIncremental: true,
-    enableBeam: false,
+    enableBeam: true,
     beamWidth: 32,
     // 动态束宽参数
     beamDecay: 0.85,
-    beamMin: 4,
+    beamMin: 8,
     enableBestFirst: true,
     // Best-First 行为细化
     useAStarInBestFirst: true,
     useStrongLBInBestFirst: false,
     enableBridgeFirst: true,
     enableZeroExpandFilter: true,
-    useDFSFirst: false,
-    returnFirstFeasible: false,
+    // 快速拿到候选解
+    useDFSFirst: true,
+    returnFirstFeasible: true,
     // 严格模式（A* 最短路）
     strictMode: false,
     useIDAStar: false,
@@ -48,14 +49,14 @@ export default function PerformanceTuner({ onClose }) {
     progressAStarIntervalMs: 80,
     // 权重参数
     adjAfterWeight: 0.6,
-    bridgeWeight: 1.0,
-    gateWeight: 0.4,
+    bridgeWeight: 1.3,
+    gateWeight: 0.6,
     richnessWeight: 0.5,
     boundaryWeight: 0.8,
-    regionClassWeights: { boundary: 0.8, bridge: 1.0, richness: 0.6 },
-    dimensionWeights: { expand: 1.0, connect: 0.8, barrier: 0.7 },
+    regionClassWeights: { boundary: 0.9, bridge: 1.4, richness: 0.6, saddle: 1.0 },
+    dimensionWeights: { expand: 1.2, connect: 1.5, barrier: 0.8, multiFront: 2.0 },
     bifrontWeight: 2.0,
-    // 稀有颜色 / 扩张过滤
+    // 稀有颜色 / 扩张过滤（更宽松）
     rareFreqRatio: 0.03,
     rareFreqAbs: 3,
     rareAllowBridgeMin: 2.0,
@@ -72,10 +73,10 @@ export default function PerformanceTuner({ onClose }) {
     qualitySampleRate: 0.15,
     gainDropWarnRatio: 0.01,
     // 路径优化
-    optimizeWindowSize: 5,
+    optimizeWindowSize: 6,
     optimizeEnableWindow: true,
     optimizeEnableRemoval: true,
-    optimizeSwapPasses: 1,
+    optimizeSwapPasses: 2,
     // 通过开关控制是否在启动/切换时自动加载默认 PDB（pdb_6x6）
     enablePDBAutoLoad: true,
     // PDB 基础 URL（远程优先自动加载使用），默认 '/pdb/'

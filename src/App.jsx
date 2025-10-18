@@ -27,18 +27,25 @@ if (typeof window !== 'undefined') {
   } catch {}
   // 默认初始配置：与性能调节窗口一致，开箱即用
   window.SOLVER_FLAGS = {
-    // 基本搜索策略
+    // 基本搜索策略（更偏向“尽快拿到可行解”）
     enableLB: true,
     enableLookahead: true,
     enableLookaheadDepth2: false,
     enableIncremental: true,
-    enableBeam: false,
+    enableBeam: true,
     beamWidth: 32,
+    // 动态束宽参数
+    beamDecay: 0.85,
+    beamMin: 8,
     enableBestFirst: true,
+    // Best-First 行为细化
+    useAStarInBestFirst: true,
+    useStrongLBInBestFirst: false,
     enableBridgeFirst: true,
     enableZeroExpandFilter: true,
-    useDFSFirst: false,
-    returnFirstFeasible: false,
+    // 快速拿到候选解
+    useDFSFirst: true,
+    returnFirstFeasible: true,
     // 严格模式（A* 最短路）
     strictMode: false,
     logPerf: true,
@@ -50,6 +57,7 @@ if (typeof window !== 'undefined') {
     serverBaseUrl: serverBaseDefault,
     // 进度与时间预算
     workerTimeBudgetMs: 300000,
+    parallelWorkers: 3,
     preprocessTimeBudgetMs: 20000,
     progressComponentsIntervalMs: 0,
     progressDFSIntervalMs: 100,
@@ -62,20 +70,20 @@ if (typeof window !== 'undefined') {
     richnessWeight: 0.5,
     boundaryWeight: 0.8,
     regionClassWeights: { boundary: 0.9, bridge: 1.4, richness: 0.6, saddle: 1.0 },
-    dimensionWeights: { expand: 1.2, connect: 1.5, barrier: 0.8, multiFront: 1.2 },
-    bifrontWeight: 2,
-    // 稀有颜色与扩张过滤
+    dimensionWeights: { expand: 1.2, connect: 1.5, barrier: 0.8, multiFront: 2.0 },
+    bifrontWeight: 2.0,
+    // 稀有颜色与扩张过滤（更宽松）
     rareFreqRatio: 0.03,
     rareFreqAbs: 3,
-    rareAllowBridgeMin: 2,
-    rareAllowGateMin: 1,
+    rareAllowBridgeMin: 2.0,
+    rareAllowGateMin: 1.0,
     minDeltaRatio: 0.02,
     lbImproveMin: 1,
     // 路径优化
-    optimizeWindowSize: 5,
+    optimizeWindowSize: 6,
     optimizeEnableWindow: true,
     optimizeEnableRemoval: true,
-    optimizeSwapPasses: 1,
+    optimizeSwapPasses: 2,
     // 默认加载 PDB（通过代码控制）：开启后在启动时尝试加载默认 PDB
     // 来源优先级：远程（pdbBaseUrl） > window.__PDB_AUTOLOAD__[key] > localStorage('PDB:'+key)
     enablePDBAutoLoad: true,
@@ -175,11 +183,24 @@ const [triangleSize, setTriangleSize] = useState(30)
   const [canvasOffset, setCanvasOffset] = useState({ x: 0, y: 0 })
   const canvasWrapRef = useRef(null)
   const [solving, setSolving] = useState(false)
-  // 自动求解步数上限（用于剪枝与性能控制），持久化到 localStorage
+  // 自动求解步数上限（用于剪枝与性能控制），持久化到 localStorage；允许为空表示不限制
   const [maxStepsLimit, setMaxStepsLimit] = useState(() => {
-    try { const v = localStorage.getItem('maxStepsLimit'); return v!=null ? parseInt(v,10) : 60 } catch { return 60 }
+    try {
+      const raw = localStorage.getItem('maxStepsLimit')
+      if (raw == null || raw === '') return null
+      const v = parseInt(raw, 10)
+      return Number.isFinite(v) ? Math.max(1, Math.min(200, v)) : null
+    } catch { return null }
   })
-  useEffect(()=>{ try{ localStorage.setItem('maxStepsLimit', String(maxStepsLimit)) }catch{} }, [maxStepsLimit])
+  useEffect(() => {
+    try {
+      if (maxStepsLimit == null) {
+        localStorage.removeItem('maxStepsLimit')
+      } else {
+        localStorage.setItem('maxStepsLimit', String(maxStepsLimit))
+      }
+    } catch {}
+  }, [maxStepsLimit])
   // 框选状态
   const [isDragging, setIsDragging] = useState(false)
   const [dragStart, setDragStart] = useState(null)
@@ -870,7 +891,10 @@ const [triangleSize, setTriangleSize] = useState(30)
             }
           })
           // 先同步求解器参数（flags），再启动自动求解
-          try { worker.postMessage({ type:'set_flags', flags: window.SOLVER_FLAGS }) } catch {}
+          const flagsInitial = Number.isFinite(maxStepsLimit)
+            ? { ...(window.SOLVER_FLAGS||{}), useDFSFirst: false, returnFirstFeasible: false, useStrongLBInBestFirst: true, enableBeam: true, beamWidth: Math.max(24, window.SOLVER_FLAGS?.beamWidth ?? 32), beamMin: Math.max(10, window.SOLVER_FLAGS?.beamMin ?? 8), bifrontWeight: Math.max(2.2, window.SOLVER_FLAGS?.bifrontWeight ?? 2.0), rareAllowBridgeMin: Math.max(2.2, window.SOLVER_FLAGS?.rareAllowBridgeMin ?? 2.0), rareAllowGateMin: Math.max(1.2, window.SOLVER_FLAGS?.rareAllowGateMin ?? 1.0), lbImproveMin: Math.max(2, window.SOLVER_FLAGS?.lbImproveMin ?? 1) }
+            : (window.SOLVER_FLAGS||{})
+          try { worker.postMessage({ type:'set_flags', flags: flagsInitial }) } catch {}
           const lightTris = triangles.map(t=>({ id: t.id, neighbors: t.neighbors, color: t.color, deleted: !!t.deleted }))
           worker.postMessage({ type:'auto', triangles: lightTris, palette, maxBranches, stepLimit: maxStepsLimit, preferredStartId })
           result = await resPromise
@@ -930,7 +954,7 @@ const [triangleSize, setTriangleSize] = useState(30)
             })
             progressLastRef.current = now
           }
-        }, maxStepsLimit)
+        }, Number.isFinite(maxStepsLimit) ? maxStepsLimit : 80)
         }
       }
       // 严格审核：仅允许输出最终颜色统一的方案
@@ -1025,7 +1049,9 @@ const [triangleSize, setTriangleSize] = useState(30)
                 }
               }
             })
-            const flagsStrong = { ...(window.SOLVER_FLAGS||{}), useDFSFirst: false, returnFirstFeasible: false, enableBridgeFirst: true, bifrontWeight: Math.max(2, (window.SOLVER_FLAGS?.bifrontWeight ?? 2)) }
+            const flagsStrong = Number.isFinite(maxStepsLimit)
+              ? { ...(window.SOLVER_FLAGS||{}), useDFSFirst: false, returnFirstFeasible: false, useStrongLBInBestFirst: true, enableBridgeFirst: true, bifrontWeight: Math.max(2.2, (window.SOLVER_FLAGS?.bifrontWeight ?? 2.0)) }
+              : { ...(window.SOLVER_FLAGS||{}), useDFSFirst: false, returnFirstFeasible: false, enableBridgeFirst: true, bifrontWeight: Math.max(2, (window.SOLVER_FLAGS?.bifrontWeight ?? 2)) }
             try { worker2.postMessage({ type:'set_flags', flags: flagsStrong }) } catch {}
             const lightTrisX = triangles.map(t=>({ id: t.id, neighbors: t.neighbors, color: t.color, deleted: !!t.deleted }))
             worker2.postMessage({ type:'auto', triangles: lightTrisX, palette, maxBranches, stepLimit: maxStepsLimit })
@@ -1051,7 +1077,7 @@ const [triangleSize, setTriangleSize] = useState(30)
         }
         if (!result || unifiedPaths.length === 0 || !result.bestStartId) {
           const startIdLocal = (result?.bestStartId!=null) ? result.bestStartId : (startId!=null ? startId : pickHeuristicStartId(triangles))
-          const heurLimit = Math.max(1, Math.min(40, maxStepsLimit))
+          const heurLimit = Number.isFinite(maxStepsLimit) ? Math.max(1, Math.min(40, maxStepsLimit)) : 40
           const heurPath = computeGreedyPath(triangles, palette, startIdLocal, heurLimit)
           if (heurPath && heurPath.length) {
             const snapshots = await captureCanvasPNG(canvasRef.current, triangles, startIdLocal, heurPath)
@@ -1213,8 +1239,10 @@ const [triangleSize, setTriangleSize] = useState(30)
             }
           }
         })
-        // 覆写 flags：关闭 DFS 与早停，采用标准 BFS/Best-First 求最短
-        const flags = { ...(window.SOLVER_FLAGS||{}), useDFSFirst: false, returnFirstFeasible: false }
+        // 覆写 flags：在有限步数时加强最短路搜索（关闭 DFS-first/早停，启用强下界）
+        const flags = Number.isFinite(maxStepsLimit)
+          ? { ...(window.SOLVER_FLAGS||{}), useDFSFirst: false, returnFirstFeasible: false, useStrongLBInBestFirst: true, enableBeam: true, beamWidth: Math.max(24, window.SOLVER_FLAGS?.beamWidth ?? 32), beamMin: Math.max(10, window.SOLVER_FLAGS?.beamMin ?? 8), bifrontWeight: Math.max(2.2, window.SOLVER_FLAGS?.bifrontWeight ?? 2.0), lbImproveMin: Math.max(2, window.SOLVER_FLAGS?.lbImproveMin ?? 1) }
+          : { ...(window.SOLVER_FLAGS||{}), useDFSFirst: false, returnFirstFeasible: false }
         try { worker.postMessage({ type:'set_flags', flags }) } catch {}
         const lightTris3 = triangles.map(t=>({ id: t.id, neighbors: t.neighbors, color: t.color, deleted: !!t.deleted }))
         worker.postMessage({ type:'auto', triangles: lightTris3, palette, maxBranches, stepLimit: maxStepsLimit })
@@ -1223,23 +1251,32 @@ const [triangleSize, setTriangleSize] = useState(30)
         try{ window.__solverWorker = null }catch{}
         // 回退到主线程
         const lightTris4 = triangles.map(t=>({ id: t.id, neighbors: t.neighbors, color: t.color, deleted: !!t.deleted }))
-        result = await window.Solver_minStepsAuto?.(lightTris4, palette, 3, (p)=>{
-          const now = Date.now()
-          if (now - progressLastRef.current > 200) {
-            const nodes = p?.nodes ?? 0
-            const sols = p?.solutions ?? 0
-            const phase = p?.phase === 'components' ? `已识别连通分量：${p?.count}`
-              : p?.phase === 'best_update' ? `已更新最优：起点 #${p?.bestStartId}，最少步骤 ${p?.minSteps}`
-              : `已探索节点：${nodes}，候选分支：${sols}`
-            setStatus(`正在继续计算最短步骤… ${phase}`)
-            setSolveProgress({ phase:p?.phase, nodes:p?.nodes, solutions:p?.solutions, queue:p?.queue, components:p?.count, bestStartId:p?.bestStartId, minSteps:p?.minSteps, elapsedMs: now - solveStartRef.current, perf: p?.perf })
-            const perf = p?.perf || {}
-            const line = `[${((now - solveStartRef.current)/1000).toFixed(1)}s] phase=${p?.phase||'search'} nodes=${p?.nodes??0} queue=${p?.queue??0} sols=${p?.solutions??0} enq=${perf?.enqueued??'-'} exp=${perf?.expanded??'-'} zf=${perf?.filteredZero??'-'}`
-            setProgressLogs(prev=>{ const next=[...prev,line]; return next.length>200 ? next.slice(next.length-200) : next })
-            progressLastRef.current = now
-            telemetrySafeLog2({ phase: p?.phase, nodes: p?.nodes, solutions: p?.solutions, queue: p?.queue, perf: p?.perf, extra: { bestStartId: p?.bestStartId, minSteps: p?.minSteps, count: p?.count } })
-          }
-        }, maxStepsLimit)
+        const __oldFlags = (window.SOLVER_FLAGS || {})
+        const __boundedFlags = Number.isFinite(maxStepsLimit)
+          ? { ...__oldFlags, useDFSFirst: false, returnFirstFeasible: false, useStrongLBInBestFirst: true, enableBeam: true, beamWidth: Math.max(24, __oldFlags.beamWidth ?? 32), beamMin: Math.max(10, __oldFlags.beamMin ?? 8), bifrontWeight: Math.max(2.2, __oldFlags.bifrontWeight ?? 2.0), lbImproveMin: Math.max(2, __oldFlags.lbImproveMin ?? 1) }
+          : __oldFlags
+        if (Number.isFinite(maxStepsLimit)) window.SOLVER_FLAGS = __boundedFlags
+        try {
+          result = await window.Solver_minStepsAuto?.(lightTris4, palette, 3, (p)=>{
+            const now = Date.now()
+            if (now - progressLastRef.current > 200) {
+              const nodes = p?.nodes ?? 0
+              const sols = p?.solutions ?? 0
+              const phase = p?.phase === 'components' ? `已识别连通分量：${p?.count}`
+                : p?.phase === 'best_update' ? `已更新最优：起点 #${p?.bestStartId}，最少步骤 ${p?.minSteps}`
+                : `已探索节点：${nodes}，候选分支：${sols}`
+              setStatus(`正在继续计算最短步骤… ${phase}`)
+              setSolveProgress({ phase:p?.phase, nodes:p?.nodes, solutions:p?.solutions, queue:p?.queue, components:p?.count, bestStartId:p?.bestStartId, minSteps:p?.minSteps, elapsedMs: now - solveStartRef.current, perf: p?.perf })
+              const perf = p?.perf || {}
+              const line = `[${((now - solveStartRef.current)/1000).toFixed(1)}s] phase=${p?.phase||'search'} nodes=${p?.nodes??0} queue=${p?.queue??0} sols=${p?.solutions??0} enq=${perf?.enqueued??'-'} exp=${perf?.expanded??'-'} zf=${perf?.filteredZero??'-'}`
+              setProgressLogs(prev=>{ const next=[...prev,line]; return next.length>200 ? next.slice(next.length-200) : next })
+              progressLastRef.current = now
+              telemetrySafeLog2({ phase: p?.phase, nodes: p?.nodes, solutions: p?.solutions, queue: p?.queue, perf: p?.perf, extra: { bestStartId: p?.bestStartId, minSteps: p?.minSteps, count: p?.count } })
+            }
+          }, Number.isFinite(maxStepsLimit) ? maxStepsLimit : 80)
+        } finally {
+          if (Number.isFinite(maxStepsLimit)) window.SOLVER_FLAGS = __oldFlags
+        }
       }
 
       // 最终展示最短方案
@@ -1857,13 +1894,15 @@ const [triangleSize, setTriangleSize] = useState(30)
               type="number"
               min={1}
               max={200}
-              value={maxStepsLimit}
+              value={maxStepsLimit ?? ''}
               onChange={(e)=>{
-                const v = parseInt(e.target.value, 10)
-                setMaxStepsLimit(Number.isFinite(v) ? Math.max(1, Math.min(200, v)) : 60)
+                const str = e.target.value
+                if (str === '' || str == null) { setMaxStepsLimit(null); return }
+                const v = parseInt(str, 10)
+                setMaxStepsLimit(Number.isFinite(v) ? Math.max(1, Math.min(200, v)) : null)
               }}
               style={{ width:'64px', padding:'2px 6px', borderRadius:'6px', border:'1px solid var(--border)', background:'#1a1f2b', color:'var(--text)' }}
-              title="自动求解最多执行的步骤数量，越小越快"
+              title="自动求解最多执行的步骤数量（留空表示不限制）"
             />
           </span>
           {editMode ? (
