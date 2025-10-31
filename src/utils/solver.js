@@ -5,7 +5,7 @@ import { mctsSolve } from './mcts'
 import { satMacroColorPlan } from './sat'
 import { UCBColorPrioritizer } from './learn'
 import { localRepair } from './local-repair'
-import { bitsetAlloc, bitsetClone, bitsetSet, bitsetHas, bitsetOr, bitsetCount, bitsetToIds } from './bitset'
+import { bitsetAlloc, bitsetSet, bitsetHas, bitsetCount, bitsetToIds } from './bitset'
 
 export function floodFillRegion(triangles, startId, targetColor) {
   const startColor = triangles.find(t => t.id === startId)?.color
@@ -1115,9 +1115,34 @@ export function attachSolverToWindow(){
         const boundarySeedCount=seeds.length
         enlargePotential.set(c, boundarySeedCount*1.0 + Math.max(0, boundarySeedCount - compCountB)*0.5)
         const visitedS=new Set(); const compSizes=[]
-        for(const s of seeds){ if(visitedS.has(s)) continue; let size=0; const q=[s]; visitedS.add(s); while(q.length){ const u=q.shift(); size++; const uIdx=idToIndex.get(u); for(const v of neighbors[uIdx]){ const vIdx=idToIndex.get(v); if(vIdx==null) continue; if(!visitedS.has(v) && colors[vIdx]===c){ visitedS.add(v); q.push(v) } } } }
+        for(const s of seeds){ if(visitedS.has(s)) continue; let size=0; const q=[s]; visitedS.add(s); while(q.length){ const u=q.shift(); size++; const uIdx=idToIndex.get(u); for(const v of neighbors[uIdx]){ const vIdx=idToIndex.get(v); if(vIdx==null) continue; if(!visitedS.has(v) && colors[vIdx]===c){ visitedS.add(v); q.push(v) } } } compSizes.push(size) }
         compSizes.sort((a,b)=>b-a)
         saddlePotential.set(c, compSizes.length)
+      }
+      function computeAdjAfterSize(color, curColors, regionSet){
+        const tmp = curColors.slice()
+        for(const id of regionIds(regionSet)){ tmp[idToIndex.get(id)] = color }
+        const newRegion = new Set(regionIds(regionSet))
+        const q=[...regionIds(regionSet)]
+        const visited2 = new Uint8Array(triangles.length); for(const id of regionIds(regionSet)){ const ii=idToIndex.get(id); if(ii!=null) visited2[ii]=1 }
+        while(q.length){
+          const tid=q.shift(); const idx=idToIndex.get(tid)
+          for(const nb of neighbors[idx]){
+            const nidx=idToIndex.get(nb); if(nidx==null) continue
+            const tri=triangles[nidx]; const cc=tmp[nidx]
+            if(!visited2[nidx] && !tri.deleted && tri.color!=='transparent' && cc===color){ visited2[nidx]=1; newRegion.add(nb); q.push(nb) }
+          }
+        }
+        const adjSet = new Set()
+        for(const tid2 of newRegion){
+          const idx2=idToIndex.get(tid2)
+          for(const nb2 of neighbors[idx2]){
+            const nidx2=idToIndex.get(nb2); if(nidx2==null) continue
+            const tri2=triangles[nidx2]; const cc2=tmp[nidx2]
+            if(!tri2.deleted && cc2 && cc2!=='transparent' && cc2!==color){ adjSet.add(cc2) }
+          }
+        }
+        return adjSet.size
       }
       const tryColors = tryColorsRaw
         .map(c=>{
@@ -1290,7 +1315,7 @@ export function attachSolverToWindow(){
       // 让出事件循环，保证 UI 可渲染
       await new Promise(r=>setTimeout(r,0))
       // SAT 宏规划：基于边界的集合覆盖，先行滚动颜色序列；若成功覆盖则直接优化返回
-      if (!!FLAGS.enableSATPlanner) {
+      if (FLAGS.enableSATPlanner) {
         try {
           const plan = await satMacroColorPlan(triangles, comp.startId, palette)
           const order = Array.isArray(plan?.order) ? plan.order : []
@@ -1330,7 +1355,7 @@ export function attachSolverToWindow(){
         } catch (e){ console.warn('[SAT macro planner] failed', e) }
       }
       // 严格模式：若开启则优先用 A* 求最短路（主线程回退）
-      if (!!FLAGS.strictMode) {
+      if (FLAGS.strictMode) {
         const useIDA = !!FLAGS.useIDAStar
         const resStrict = useIDA
           ? await window.StrictIDAStarMinSteps?.(triangles, comp.startId, palette, (p)=>{ if (onProgress) { try { onProgress({ phase:'subsearch', startId: comp.startId, ...p }) } catch {} } }, stepLimit)
@@ -1438,7 +1463,6 @@ export function attachSolverToWindow(){
 
   // 多 Worker 并行自动求解：为若干候选起点分别启动 worker 并行搜索，取最优
   window.Solver_minStepsAutoParallel = async function(triangles, palette, maxBranches=3, onProgress, stepLimit=Infinity){
-    const startTime = Date.now()
     const FLAGS = (typeof window !== 'undefined' && window.SOLVER_FLAGS) ? window.SOLVER_FLAGS : {}
     const PARALLEL_WORKERS = Number.isFinite(FLAGS?.parallelWorkers) ? Math.max(1, FLAGS.parallelWorkers) : 3
     const idToIndex = new Map(triangles.map((t,i)=>[t.id,i]))
@@ -1489,11 +1513,11 @@ export function attachSolverToWindow(){
       // 传入全局 flags（包含 preferredStartId），保证与主线程配置一致
       worker.postMessage({ type:'set_flags', flags: { ...(FLAGS||{}), preferredStartId: pick.startId } })
       const p = new Promise((resolve)=>{
-        let configured = false
+
         worker.onmessage = (e)=>{
           const { type, payload } = e.data || {}
           if(type==='flags_set'){
-            configured = true
+
             const ragOptions = { enable: !!FLAGS.enableRAGMacro }
             worker.postMessage({ type:'auto', triangles, palette, maxBranches, stepLimit, ragOptions })
           }
@@ -1517,7 +1541,6 @@ export function attachSolverToWindow(){
 
   // 方案后处理优化：对已统一颜色路径进行反思、拆解与压缩（主线程回退）
   window.OptimizeSolution = async function(triangles, palette, startId, path, onProgress){
-    const startTime = Date.now()
     const TIME_BUDGET_MS = Math.min(120000, 4000 + triangles.length * 10)
     const idToIndex = new Map(triangles.map((t,i)=>[t.id,i]))
     const neighbors = triangles.map(t=>t.neighbors)
@@ -1583,12 +1606,7 @@ export function attachSolverToWindow(){
         for(const tid of region0){ const idx=idToIndex2.get(tid); for(const nb of neighbors2[idx]){ const nidx=idToIndex2.get(nb); const tri=triangles[nidx]; const c=colors0[nidx]; if(c!==rc && c && c!=='transparent' && !tri.deleted){ set.add(c) } } }
         return set.size
       }
-      const adjAfter = (function(){
-        const q=[...region]; const visited=new Set([...region]); const newRegion=new Set([...region])
-        const tmp = curColors.slice(); for(const id of region) tmp[idToIndex2.get(id)] = color
-        while(q.length){ const tid=q.shift(); const idx=idToIndex2.get(tid); for(const nb of neighbors2[idx]){ const nidx=idToIndex2.get(nb); const tri=triangles[nidx]; if(!visited.has(nb) && !tri.deleted && tri.color!=='transparent' && tmp[nidx]===color){ visited.add(nb); newRegion.add(nb); q.push(nb) } } }
-        return newRegion.size
-      })()
+
       const bdBefore = boundaryDistinctLocal(curColors, region)
       const tmp2 = curColors.slice(); for(const id of region) tmp2[idToIndex2.get(id)] = color
       const bdAfter = boundaryDistinctLocal(tmp2, region)

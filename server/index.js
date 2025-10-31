@@ -34,6 +34,8 @@ const Recommendation = require('./models/Recommendation')
 const Cache = require('./models/Cache')
 const UCB = require('./models/UCB')
 const Strategy = require('./models/Strategy')
+const RunScore = require('./models/RunScore')
+const AlgoScore = require('./models/AlgoScore')
 
 // Health
 app.get('/api/health', (req, res)=>{ res.json({ ok: true }) })
@@ -160,28 +162,51 @@ app.get('/api/graphs/list', async (req, res)=>{
   } catch (e) { res.status(500).json({ error: e.message }) }
 })
 
+// Helper: suspicious path detection (approx mistakenly marked as final)
+function isPathSuspicious(path){
+  try {
+    if (!Array.isArray(path) || path.length===0) return true
+    const invalid = new Set(['', 'transparent', null, undefined])
+    let prev = null
+    for (const c of path) {
+      if (invalid.has(c)) return true
+      if (prev!==null && c===prev) return true
+      prev = c
+    }
+    return false
+  } catch { return true }
+}
 // Cache lookup
 app.get('/api/cache/path', async (req, res)=>{
   try {
-    const { signature } = req.query
+    const { signature, only_final } = req.query
     if (!signature) return res.status(400).json({ error: 'signature required' })
     const c = await Cache.findOne({ graph_signature: signature })
     if (!c) return res.json(null)
-    res.json({ path: c.path, min_steps: c.min_steps, start_id: c.start_id, flags: c.flags_json })
+    // 可选：仅返回正解；同时过滤可疑路径（连续同色或非法颜色）
+    if (String(only_final||'').toLowerCase()==='true'){
+      if (!(c.is_unified===true && c.quality==='final')) return res.json(null)
+      if (isPathSuspicious(c.path)) return res.json(null)
+    }
+    res.json({ path: c.path, min_steps: c.min_steps, start_id: c.start_id, flags: c.flags_json, is_unified: c.is_unified===true, quality: c.quality||'final' })
   } catch (e) { res.status(500).json({ error: e.message }) }
 })
 
 // Cache write
 app.post('/api/cache/path', async (req, res)=>{
   try {
-    const { graph_signature, path, min_steps, start_id, flags } = req.body || {}
+    const { graph_signature, path, min_steps, start_id, flags, is_unified, quality } = req.body || {}
     if (!graph_signature) return res.status(400).json({ error: 'graph_signature required' })
+    // 默认质量：根据 is_unified 推断，并对可疑路径降级为 approx
+    const suspicious = isPathSuspicious(path)
+    const q = quality || ((is_unified===false || suspicious) ? 'approx' : 'final')
+    const unified = (is_unified!==false) && !suspicious
     await Cache.updateOne(
       { graph_signature },
-      { $set: { graph_signature, path: path||[], min_steps, start_id, flags_json: flags||{} } },
+      { $set: { graph_signature, path: path||[], min_steps, start_id, flags_json: flags||{}, is_unified: unified, quality: q } },
       { upsert: true }
     )
-    res.json({ ok: true })
+    res.json({ ok: true, downgraded: suspicious })
   } catch (e) { res.status(500).json({ error: e.message }) }
 })
 
@@ -225,6 +250,161 @@ app.post('/api/learn/ucb', async (req, res)=>{
   } catch (e) { res.status(500).json({ error: e.message }) }
 })
 
+// Run scoring: record result and update algo aggregation
+app.post('/api/score/run', async (req, res)=>{
+  try {
+    const { graph_signature, run_id, algo_name, min_steps, best_start_id, time_ms, is_unified, quality, source, flags } = req.body || {}
+    if (!graph_signature) return res.status(400).json({ error: 'graph_signature required' })
+    const q = quality || ((is_unified===false) ? 'approx' : 'final')
+    await RunScore.create({ graph_signature, run_id, algo_name, min_steps, best_start_id, time_ms, is_unified: is_unified!==false, quality: q, source: source||'auto_solve', flags_json: flags||{} })
+    if (algo_name) {
+      const prev = await AlgoScore.findOne({ algo_name, graph_signature })
+      const t = (Number(prev?.total_runs)||0) + 1
+      const sPrev = Number(prev?.avg_min_steps)||0
+      const mPrev = Number(prev?.avg_time_ms)||0
+      const sNext = Number.isFinite(min_steps) ? ((sPrev*(t-1) + (min_steps||0))/t) : sPrev
+      const mNext = Number.isFinite(time_ms) ? ((mPrev*(t-1) + (time_ms||0))/t) : mPrev
+      const fuPrev = Number(prev?.final_unified_runs)||0
+      const fuNext = fuPrev + ((is_unified!==false && q==='final') ? 1 : 0)
+      await AlgoScore.updateOne(
+        { algo_name, graph_signature },
+        { $set: { algo_name, graph_signature, total_runs: t, avg_min_steps: sNext, avg_time_ms: mNext, final_unified_runs: fuNext } },
+        { upsert: true }
+      )
+    }
+    res.json({ ok: true })
+  } catch (e) { res.status(500).json({ error: e.message }) }
+})
+
+// Score aggregation per signature (optional algo)
+app.get('/api/score/aggregate', async (req, res)=>{
+  try {
+    const { signature, algo } = req.query || {}
+    if (!signature) return res.status(400).json({ error: 'signature required' })
+    const q = { graph_signature: signature }
+    if (algo) q.algo_name = algo
+    const docs = await RunScore.find(q).sort({ createdAt: -1 }).limit(500)
+    const total = docs.length
+    let sumSteps=0, sumTime=0, finalCount=0
+    for(const d of docs){
+      sumSteps += Number(d.min_steps)||0
+      sumTime += Number(d.time_ms)||0
+      if (d.is_unified===true && (d.quality||'final')==='final') finalCount++
+    }
+    res.json({
+      signature,
+      total_runs: total,
+      avg_min_steps: total ? (sumSteps/total) : 0,
+      avg_time_ms: total ? (sumTime/total) : 0,
+      final_unified_rate: total ? (finalCount/total) : 0,
+    })
+  } catch (e) { res.status(500).json({ error: e.message }) }
+})
+
+// Per-algorithm aggregated scores
+app.get('/api/score/algo', async (req, res)=>{
+  try {
+    const { signature } = req.query || {}
+    if (!signature) return res.status(400).json({ error: 'signature required' })
+    const docs = await AlgoScore.find({ graph_signature: signature }).sort({ updatedAt: -1 })
+    res.json(docs.map(d=>({
+      algo_name: d.algo_name,
+      total_runs: d.total_runs||0,
+      final_unified_runs: d.final_unified_runs||0,
+      avg_min_steps: d.avg_min_steps||0,
+      avg_time_ms: d.avg_time_ms||0,
+    })))
+  } catch (e) { res.status(500).json({ error: e.message }) }
+})
+
+// 新增：学习评分上传，仅正解参与
+app.post('/api/learn/score', async (req, res)=>{
+  try {
+    const { run_id, graph_signature, is_unified, path_len, algo_scores } = req.body || {}
+    if (!graph_signature) return res.status(400).json({ error: 'graph_signature required' })
+    if (is_unified !== true) return res.json({ ok: true, ignored: true })
+    const payload = {
+      graph_signature,
+      run_id,
+      algo_name: 'module',
+      min_steps: Number(path_len)||undefined,
+      best_start_id: undefined,
+      time_ms: undefined,
+      is_unified: true,
+      quality: 'final',
+      source: 'learn_score',
+      flags_json: {},
+      path_len: Number(path_len)||undefined,
+      algo_scores: Array.isArray(algo_scores) ? algo_scores : [],
+    }
+    if (run_id) {
+      await RunScore.updateOne({ run_id }, { $set: payload }, { upsert: true })
+    } else {
+      await RunScore.create(payload)
+    }
+    // 聚合每个模块的分数与指标
+    if (Array.isArray(algo_scores)){
+      for(const s of algo_scores){
+        const key = String(s?.key||'')
+        if (!key) continue
+        const prev = await AlgoScore.findOne({ graph_signature, algorithm_key: key })
+        const runsCount = (Number(prev?.runs_count)||0) + 1
+        const successCount = (Number(prev?.success_count)||0) + 1
+        const totalScore = (Number(prev?.total_score)||0) + (Number(s?.score)||0)
+        const avgScore = runsCount>0 ? (totalScore / runsCount) : 0
+        const mt = { ...(prev?.metrics_total||{}) }
+        const metrics = s?.metrics || {}
+        for(const [m,v] of Object.entries(metrics)){
+          mt[m] = (Number(mt[m])||0) + (Number(v)||0)
+        }
+        await AlgoScore.updateOne(
+          { graph_signature, algorithm_key: key },
+          { $set: { graph_signature, algorithm_key: key, runs_count: runsCount, success_count: successCount, total_score: totalScore, avg_score: avgScore, metrics_total: mt } },
+          { upsert: true }
+        )
+      }
+    }
+    res.json({ ok: true })
+  } catch (e) { res.status(500).json({ error: e.message }) }
+})
+
+// 学习评分聚合查询（按图签名）
+app.get('/api/learn/scores', async (req, res)=>{
+  try {
+    const { signature } = req.query || {}
+    if (!signature) return res.status(400).json({ error: 'signature required' })
+    const docs = await AlgoScore.find({ graph_signature: signature, algorithm_key: { $exists: true } }).sort({ updatedAt: -1 })
+    res.json(docs.map(d=>({
+      graph_signature: d.graph_signature,
+      key: d.algorithm_key || d.algo_name,
+      runs_count: d.runs_count||0,
+      success_count: d.success_count||0,
+      total_score: d.total_score||0,
+      avg_score: d.avg_score||0,
+      metrics_total: d.metrics_total||{},
+    })))
+  } catch (e) { res.status(500).json({ error: e.message }) }
+})
+
+// 管理员查看模块评分聚合（全局/按图）
+app.get('/api/admin/scores', authMiddleware, async (req, res)=>{
+  try {
+    const limit = Math.min(200, Math.max(1, parseInt(String(req.query?.limit||'50'), 10) || 50))
+    const skip = Math.max(0, parseInt(String(req.query?.skip||'0'), 10) || 0)
+    const sig = req.query?.signature
+    const q = sig ? { graph_signature: sig, algorithm_key: { $exists: true } } : { algorithm_key: { $exists: true } }
+    const docs = await AlgoScore.find(q).sort({ updatedAt: -1 }).skip(skip).limit(limit)
+    res.json(docs.map(d=>({
+      graph_signature: d.graph_signature,
+      key: d.algorithm_key || d.algo_name,
+      runs_count: d.runs_count||0,
+      success_count: d.success_count||0,
+      total_score: d.total_score||0,
+      avg_score: d.avg_score||0,
+      metrics_total: d.metrics_total||{},
+    })))
+  } catch (e) { res.status(500).json({ error: e.message }) }
+})
 // Graph strategy summary: features + strategy per signature
 app.get('/api/graphs/strategy', async (req, res)=>{
   try {
@@ -409,5 +589,29 @@ app.get('/api/admin/ucbs', authMiddleware, async (req, res)=>{
     const q = sig ? { graph_signature: sig } : {}
     const docs = await UCB.find(q).sort({ updatedAt: -1 }).skip(skip).limit(limit)
     res.json(docs)
+  } catch (e) { res.status(500).json({ error: e.message }) }
+})
+// Admin-only: sanitize caches historically marked as final but suspicious
+app.post('/api/cache/sanitize', authMiddleware, async (req, res)=>{
+  try {
+    const { signature, limit, dry_run } = req.body || {}
+    const query = signature ? { graph_signature: String(signature) } : {}
+    const lim = Math.min(1000, Math.max(1, Number(limit)||200))
+    const docs = await Cache.find(query).limit(lim)
+    let inspected = 0, changed = 0
+    const sample_changes = []
+    for (const c of docs){
+      inspected++
+      const suspicious = isPathSuspicious(c.path)
+      const willDemote = suspicious && (c.quality==='final' || c.is_unified===true)
+      if (willDemote){
+        if (!dry_run){
+          await Cache.updateOne({ _id: c._id }, { $set: { quality: 'approx', is_unified: false } })
+        }
+        changed++
+        if (sample_changes.length < 50){ sample_changes.push({ graph_signature: c.graph_signature, reason: 'suspicious_path', old_quality: c.quality, new_quality: 'approx' }) }
+      }
+    }
+    res.json({ inspected, changed, dry_run: !!dry_run, sample_changes })
   } catch (e) { res.status(500).json({ error: e.message }) }
 })

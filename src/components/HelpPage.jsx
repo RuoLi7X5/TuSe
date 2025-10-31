@@ -161,7 +161,7 @@ export default function HelpPage() {
           <div>全栈数据流：前端基于 `window.SOLVER_FLAGS` 控制求解与遥测；`telemetry.js` 使用 `serverBaseUrl` 与开关与后端交互。</div>
           <div>遥测开关：默认开启且不在性能调节窗口展示；如需查看状态，可检查 `window.SOLVER_FLAGS.enableTelemetry`。</div>
           <div>地址策略：同域优先推断；开发默认为 `http://localhost:3001`。如需覆盖可在代码层设置 `serverBaseUrl`。</div>
-          <div>总站页面：`#/hub` 可查看 UCB 统计与策略摘要，支持手动刷新与同步。</div>
+          <div>学习模型数据汇总仅在管理员后台展示（#/admin）；如需访问请联系管理员。</div>
           <div>后端检查：`/api/health` 返回后端健康状态；策略摘要与统计分别在 `/api/graphs/strategy` 与 `/api/learn/ucb` 路由。</div>
         </Section>
 
@@ -190,16 +190,7 @@ export default function HelpPage() {
             联系作者：加QQ：3188789174 备注来意
           </div>
         </Section>
-
-        <Section title="总站（学习模型聚合）">
-          <div>
-            - 进入总站查看或上传本地学习统计：
-            <a href="#/hub" style={{ marginLeft:'8px', color:'#7aa2f7', textDecoration:'none' }}>打开总站子页</a>
-          </div>
-          <div style={{ color:'var(--muted)' }}>
-            说明：总站采用本地 MongoDB（开发环境），后端地址由 `serverBaseUrl` 控制；生产建议同域部署，跨域需 CORS 与 HTTPS。
-          </div>
-        </Section>
+        {/* 已移除前台“总站（学习模型聚合）”入口；学习数据仅在后台管理员页面展示 */}
       </div>
     </div>
   )

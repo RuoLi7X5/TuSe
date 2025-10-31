@@ -125,7 +125,7 @@ export async function getRecommendation(signature){
 }
 
 export async function getCachePath(signature){
-  try{ return await getJSON(`/api/cache/path?signature=${encodeURIComponent(signature)}`) }catch{ return null }
+  try{ return await getJSON(`/api/cache/path?signature=${encodeURIComponent(signature)}&only_final=true`) }catch{ return null }
 }
 
 export async function putCachePath(graph_signature, data){
@@ -192,4 +192,31 @@ export async function uploadStrategyAuto(triangles, palette, mode, startId, path
 // Admin: list recent graphs
 export async function listGraphs(limit = 50){
   try { return await getJSON(`/api/graphs/list?limit=${encodeURIComponent(String(limit))}`) } catch { return [] }
+}
+
+// Run scoring helpers
+export async function recordRunScore(graph_signature, data){
+  try{ return await postJSON('/api/score/run', { graph_signature, ...data }) }catch{ return null }
+}
+export async function getScoreStats(signature){
+  try{ return await getJSON(`/api/score/aggregate?signature=${encodeURIComponent(signature)}`) }catch{ return null }
+}
+export async function getAlgoScores(signature){
+  try{ return await getJSON(`/api/score/algo?signature=${encodeURIComponent(signature)}`) }catch{ return [] }
+}
+
+// 新增：学习评分上传与查询
+export async function postLearnScore(graph_signature, data){
+  try{ return await postJSON('/api/learn/score', { graph_signature, ...data }) }catch{ return null }
+}
+export async function getLearnScores(signature){
+  try{ return await getJSON(`/api/learn/scores?signature=${encodeURIComponent(signature)}`) }catch{ return [] }
+}
+export async function getAdminScores(signature, limit = 50, skip = 0){
+  const qp = []
+  if (signature) qp.push(`signature=${encodeURIComponent(signature)}`)
+  qp.push(`limit=${encodeURIComponent(String(limit))}`)
+  qp.push(`skip=${encodeURIComponent(String(skip))}`)
+  const q = qp.length ? ('?'+qp.join('&')) : ''
+  try{ return await getJSON(`/api/admin/scores${q}`) }catch{ return [] }
 }

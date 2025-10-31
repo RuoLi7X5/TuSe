@@ -6,14 +6,13 @@ import TriangleCanvas from './components/TriangleCanvas'
 import Controls from './components/Controls'
 import StepsPanel from './components/StepsPanel'
 import HelpPage from './components/HelpPage'
-import CentralHub from './components/CentralHub'
 import AdminDashboard from './components/AdminDashboard'
 
 import { quantizeImage, setColorTuning } from './utils/color-utils'
 import { buildTriangleGrid, buildTriangleGridVertical, mapImageToGrid, isUniform, colorFrequency } from './utils/grid-utils'
 import { floodFillRegion, attachSolverToWindow, captureCanvasPNG } from './utils/solver'
 import { hasPDB, loadPDBObject, loadPDBFromJSON, loadPDBFromURL, getPDBBaseURL } from './utils/pdb'
-import { startRun as telemetryStartRun, logEvent as telemetryLogEvent, finishRun as telemetryFinishRun, makeGraphSignature, getRecommendation, getCachePath, putCachePath, uploadStrategyAuto } from './utils/telemetry'
+import { startRun as telemetryStartRun, logEvent as telemetryLogEvent, finishRun as telemetryFinishRun, makeGraphSignature, getRecommendation, getCachePath, putCachePath, uploadStrategyAuto, recordRunScore, postLearnScore } from './utils/telemetry'
 
 // 设置默认的求解器开关与权重，并合并本地持久化配置（localStorage）
 if (typeof window !== 'undefined') {
@@ -262,6 +261,7 @@ const [triangleSize, setTriangleSize] = useState(30)
   const canvasRef = useRef(null)
   const progressLastRef = useRef(0)
   const solveStartRef = useRef(0)
+const contribRef = useRef({ branch_pruned: 0, enqueued: 0, expanded: 0, critical_hits: 0, path_len_reduction: 0, lb_improve_total: 0 })
   const progressLogRef = useRef(null)
   const importRef = useRef(null)
   const rebuildTimerRef = useRef(null)
@@ -775,6 +775,7 @@ const [triangleSize, setTriangleSize] = useState(30)
       setSolveProgress({ phase: 'init' })
       setProgressLogs([])
       solveStartRef.current = Date.now()
+      contribRef.current = { branch_pruned: 0, enqueued: 0, expanded: 0, critical_hits: 0, path_len_reduction: 0, lb_improve_total: 0 }
       // 启动遥测 Run（不阻塞求解）
       const graphSignature = makeGraphSignature(triangles, palette)
       let __runId = null
@@ -789,14 +790,47 @@ const [triangleSize, setTriangleSize] = useState(30)
         const cachedStart = cache?.start_id
         const cachedMin = cache?.min_steps
         if (cachedPath && cachedPath.length>0 && cachedStart!=null) {
-          const snapshots = await captureCanvasPNG(canvasRef.current, triangles, cachedStart, cachedPath.slice(0, Math.max(1, Math.min(40, cachedPath.length))))
-          setSteps([{ path: cachedPath, images: snapshots }])
-          setBestStartId(cachedStart)
-          setStatus(`缓存命中：起点 #${cachedStart}，步骤 ${cachedMin??cachedPath.length}`)
-          setSolveProgress(null)
-          try { if(__runId) await telemetryFinishRun(__runId, { status:'cache_hit', min_steps: cachedMin??cachedPath.length, best_start_id: cachedStart, time_ms: Date.now() - solveStartRef.current, graph_signature: graphSignature }) } catch {}
-          try { await uploadStrategyAuto(triangles, palette, 'auto_solve', cachedStart, cachedPath) } catch {}
-          return
+          // 前端统一性二次验证，避免错误缓存直接使用
+          const idToIndex = new Map(triangles.map((t,i)=>[t.id,i]))
+          const neighbors = triangles.map(t=>t.neighbors)
+          const checkUniformPathCached = (startIdLocal, pathLocal)=>{
+            if (startIdLocal==null || !Array.isArray(pathLocal) || pathLocal.length===0) return false
+            const idxStart = idToIndex.get(startIdLocal)
+            if (idxStart==null) return false
+            let colorsLocal = triangles.map(t=>t.color)
+            for(let i=0;i<pathLocal.length;i++){
+              const stepColor = pathLocal[i]
+              const startColorCur = colorsLocal[idxStart]
+              if (stepColor===startColorCur) { return false }
+              const regionSet = new Set(); const q=[startIdLocal]; const visited=new Set([startIdLocal])
+              while(q.length){
+                const id=q.shift(); const idx=idToIndex.get(id)
+                if (idx==null) return false
+                if (colorsLocal[idx]!==startColorCur) continue
+                regionSet.add(id)
+                const nbs = neighbors[idx] || []
+                for(const nb of nbs){ if(!visited.has(nb)){ visited.add(nb); q.push(nb) } }
+              }
+              if (regionSet.size===0) return false
+              for(const id of regionSet){ colorsLocal[idToIndex.get(id)] = stepColor }
+            }
+            const finalTris = triangles.map((t,i)=>({ ...t, color: colorsLocal[i] }))
+            return isUniform(finalTris)
+          }
+          const okUniform = checkUniformPathCached(cachedStart, cachedPath)
+          const okFlags = (cache?.is_unified===true && cache?.quality==='final')
+          if (okUniform && okFlags) {
+            const snapshots = await captureCanvasPNG(canvasRef.current, triangles, cachedStart, cachedPath.slice(0, Math.max(1, Math.min(40, cachedPath.length))))
+            setSteps([{ path: cachedPath, images: snapshots }])
+            setBestStartId(cachedStart)
+            setStatus(`缓存预览：起点 #${cachedStart}，步骤 ${cachedMin??cachedPath.length}（继续计算中）`)
+            setSolveProgress(null)
+            try { await telemetrySafeLog({ status:'cache_preview', min_steps: cachedMin??cachedPath.length, best_start_id: cachedStart, graph_signature: graphSignature }) } catch {}
+            try { await uploadStrategyAuto(triangles, palette, 'auto_solve', cachedStart, cachedPath) } catch {}
+          } else {
+            setStatus('缓存存在但未通过统一性校验，继续计算…')
+            await telemetrySafeLog({ status:'cache_validation_failed', reason: okUniform? 'flag_not_final' : 'not_uniform', cached_len: cachedPath.length })
+          }
         }
       } catch {}
       // 获取推荐参数与优先起点
@@ -875,6 +909,9 @@ const [triangleSize, setTriangleSize] = useState(30)
                 }
                 return ''
               })()
+              if (typeof perf?.filteredZero === 'number') { contribRef.current.branch_pruned += perf.filteredZero }
+              if (typeof perf?.enqueued === 'number') { contribRef.current.enqueued += perf.enqueued }
+              if (typeof perf?.expanded === 'number') { contribRef.current.expanded += perf.expanded }
               const line = `[${((now - solveStartRef.current)/1000).toFixed(1)}s] phase=${phaseRaw}${compInfo}${extra} nodes=${p?.nodes??0} queue=${p?.queue??0} sols=${p?.solutions??0} enq=${perf?.enqueued??'-'} exp=${perf?.expanded??'-'} zf=${perf?.filteredZero??'-'}`
               setProgressLogs(prev=>{
                 const next = [...prev, line]
@@ -947,6 +984,9 @@ const [triangleSize, setTriangleSize] = useState(30)
                   }
                   return ''
                 })()
+                if (typeof perf?.filteredZero === 'number') { contribRef.current.branch_pruned += perf.filteredZero }
+                if (typeof perf?.enqueued === 'number') { contribRef.current.enqueued += perf.enqueued }
+                if (typeof perf?.expanded === 'number') { contribRef.current.expanded += perf.expanded }
                 const line = `[${((now - solveStartRef.current)/1000).toFixed(1)}s] phase=${phaseRaw2}${compInfo2}${extra2} nodes=${p?.nodes??0} queue=${p?.queue??0} sols=${p?.solutions??0} enq=${perf?.enqueued??'-'} exp=${perf?.expanded??'-'} zf=${perf?.filteredZero??'-'}`
             setProgressLogs(prev=>{
               const next = [...prev, line]
@@ -1086,6 +1126,7 @@ const [triangleSize, setTriangleSize] = useState(30)
             setSolveProgress(null)
             // 近似方案也上传策略摘要，并结束遥测 Run，确保总站可见
             try { await uploadStrategyAuto(triangles, palette, 'auto_solve_fallback', startIdLocal, heurPath) } catch {}
+            
             try { if(__runId) await telemetryFinishRun(__runId, { status:'fallback', min_steps: heurPath.length, best_start_id: startIdLocal, time_ms: Date.now() - solveStartRef.current, graph_signature: graphSignature }) } catch {}
             return
           }
@@ -1106,6 +1147,7 @@ const [triangleSize, setTriangleSize] = useState(30)
         setSolveProgress(null)
         // 结束遥测并上传空策略摘要，确保特征与记录被采集
         try { await uploadStrategyAuto(triangles, palette, result?.timedOut ? 'auto_solve_timeout' : 'auto_solve_none', result?.bestStartId ?? null, []) } catch {}
+        
         try { if(__runId) await telemetryFinishRun(__runId, { status: result?.timedOut ? 'timeout' : 'no_solution', min_steps: 0, best_start_id: result?.bestStartId ?? null, time_ms: Date.now() - solveStartRef.current, graph_signature: graphSignature }) } catch {}
         return
       }
@@ -1121,13 +1163,16 @@ const [triangleSize, setTriangleSize] = useState(30)
       setBestStartId(result.bestStartId ?? null)
       setStatus(`计算完成（自动起点 #${result.bestStartId}），最少步骤：${result.minSteps}，合格分支：${unifiedPaths.length}`)
       setSolveProgress(null)
-      try { await putCachePath(graphSignature, { path: unifiedPaths[0]||[], min_steps: result.minSteps, start_id: result.bestStartId, flags: window.SOLVER_FLAGS }) } catch {}
+      try { await putCachePath(graphSignature, { path: unifiedPaths[0]||[], min_steps: result.minSteps, start_id: result.bestStartId, flags: window.SOLVER_FLAGS, is_unified: true, quality: 'final' }) } catch {}
       try { await uploadStrategyAuto(triangles, palette, 'auto_solve', result.bestStartId, unifiedPaths[0]||[]) } catch {}
+      try { await recordRunScore(graphSignature, { run_id: __runId, algo_name: (window.SOLVER_FLAGS?.heuristicName||'default'), min_steps: result.minSteps, best_start_id: result.bestStartId, time_ms: Date.now() - solveStartRef.current, is_unified: true, quality: 'final', source: 'auto_solve', flags: window.SOLVER_FLAGS }) } catch {}
+      try { await postLearnScore(graphSignature, { run_id: __runId, graph_signature: graphSignature, is_unified: true, path_len: result.minSteps, algo_scores: (()=>{ const m = { lb_improve_total: contribRef.current.lb_improve_total||0, branch_pruned_count: contribRef.current.branch_pruned||0, expansion_saved_est: Math.max(0, (contribRef.current.enqueued||0)-(contribRef.current.expanded||0)), critical_hits: contribRef.current.critical_hits||0, path_len_reduction: contribRef.current.path_len_reduction||0 }; const w = { lb:0.35, prune:0.25, expand:0.25, critical:0.10, path:0.05 }; const denom = Math.max(1, m.lb_improve_total + m.branch_pruned_count + m.expansion_saved_est + m.critical_hits + m.path_len_reduction); const norm = { lb: m.lb_improve_total/denom, prune: m.branch_pruned_count/denom, expand: m.expansion_saved_est/denom, critical: m.critical_hits/denom, path: m.path_len_reduction/denom }; const f = window.SOLVER_FLAGS||{}; const mods = []; const add=(key, engaged)=>{ if(!engaged) return; const score=100*(w.lb*norm.lb + w.prune*norm.prune + w.expand*norm.expand + w.critical*norm.critical + w.path*norm.path); mods.push({ key, score, metrics: m })}; add('ucb_prioritizer', !!f.enableLearningPrioritizer); add('bridge_first', !!f.enableBridgeFirst); add('best_first', !!f.enableBestFirst); add('a_star_lb', !!f.useAStarInBestFirst || !!f.useStrongLBInBestFirst); add('beam_search', !!f.enableBeam); add('lookahead', !!f.enableLookahead || !!f.enableLookaheadDepth2); add('zero_expand_filter', !!f.enableZeroExpandFilter); add('pdb', !!f.enablePDBAutoLoad); add('local_repair', !!f.optimizeEnableWindow || !!f.optimizeEnableRemoval || (Number(f.optimizeSwapPasses)||0)>0 ); add('sat_planner', !!f.enableSATPlanner); return mods; })() }) } catch {}
       // 结束遥测 Run
       try { if(__runId) await telemetryFinishRun(__runId, { status:'finished', min_steps: result.minSteps, best_start_id: result.bestStartId, time_ms: Date.now() - solveStartRef.current, graph_signature: graphSignature }) } catch {}
     } catch (err) {
       console.error('Auto-solve error:', err)
       setStatus('求解过程中发生错误')
+      
       try { if(__runId) await telemetryFinishRun(__runId, { status:'error', error: String(err?.message||err), time_ms: Date.now() - solveStartRef.current, graph_signature: graphSignature }) } catch {}
     } finally {
       setSolving(false)
@@ -1156,15 +1201,41 @@ const [triangleSize, setTriangleSize] = useState(30)
         const cachedStart = cache?.start_id
         const cachedMin = cache?.min_steps
         if (cachedPath && cachedPath.length>0 && cachedStart!=null) {
-          const SNAPSHOT_LIMIT = 40
-          const snapshots = await captureCanvasPNG(canvasRef.current, triangles, cachedStart, cachedPath.slice(0, SNAPSHOT_LIMIT))
-          setSteps([{ path: cachedPath, images: snapshots }])
-          setBestStartId(cachedStart)
-          setStatus(`缓存命中：最短步骤 ${cachedMin??cachedPath.length}（起点 #${cachedStart}）`)
-          setSolveProgress(null)
-          try { if(__runId2) await telemetryFinishRun(__runId2, { status:'cache_hit', min_steps: cachedMin??cachedPath.length, best_start_id: cachedStart, time_ms: Date.now() - solveStartRef.current, graph_signature: graphSignature2 }) } catch {}
-          try { await uploadStrategyAuto(triangles, palette, 'continue_shortest', cachedStart, cachedPath) } catch {}
-          return
+          // 前端统一性二次验证
+          const idToIndex = new Map(triangles.map((t,i)=>[t.id,i]))
+          const neighbors = triangles.map(t=>t.neighbors)
+          const checkUniformPathCached = (startIdLocal, pathLocal)=>{
+            if (startIdLocal==null || !Array.isArray(pathLocal) || pathLocal.length===0) return false
+            const idxStart = idToIndex.get(startIdLocal)
+            if (idxStart==null) return false
+            let colorsLocal = triangles.map(t=>t.color)
+            for(let i=0;i<pathLocal.length;i++){
+              const stepColor = pathLocal[i]
+              const startColorCur = colorsLocal[idxStart]
+              if (stepColor===startColorCur) { return false }
+              const regionSet = new Set(); const q=[startIdLocal]; const visited=new Set([startIdLocal])
+              while(q.length){ const id=q.shift(); const idx=idToIndex.get(id); if (idx==null) return false; if (colorsLocal[idx]!==startColorCur) continue; regionSet.add(id); const nbs = neighbors[idx] || []; for(const nb of nbs){ if(!visited.has(nb)){ visited.add(nb); q.push(nb) } } }
+              if (regionSet.size===0) return false
+              for(const id of regionSet){ colorsLocal[idToIndex.get(id)] = stepColor }
+            }
+            const finalTris = triangles.map((t,i)=>({ ...t, color: colorsLocal[i] }))
+            return isUniform(finalTris)
+          }
+          const okUniform = checkUniformPathCached(cachedStart, cachedPath)
+          const okFlags = (cache?.is_unified===true && cache?.quality==='final')
+          if (okUniform && okFlags) {
+            const SNAPSHOT_LIMIT = 40
+            const snapshots = await captureCanvasPNG(canvasRef.current, triangles, cachedStart, cachedPath.slice(0, SNAPSHOT_LIMIT))
+            setSteps([{ path: cachedPath, images: snapshots }])
+            setBestStartId(cachedStart)
+            setStatus(`缓存预览：步骤 ${cachedMin??cachedPath.length}（起点 #${cachedStart}，继续计算中）`)
+            setSolveProgress(null)
+            try { await telemetrySafeLog({ status:'cache_preview', min_steps: cachedMin??cachedPath.length, best_start_id: cachedStart, graph_signature: graphSignature2 }) } catch {}
+            try { await uploadStrategyAuto(triangles, palette, 'continue_shortest', cachedStart, cachedPath) } catch {}
+          } else {
+            setStatus('缓存存在但未通过统一性校验，继续计算…')
+            await telemetrySafeLog2({ status:'cache_validation_failed', reason: okUniform? 'flag_not_final' : 'not_uniform', cached_len: cachedPath.length })
+          }
         }
       } catch {}
       await new Promise(r=>setTimeout(r,0))
@@ -1224,6 +1295,10 @@ const [triangleSize, setTriangleSize] = useState(30)
                   }
                   return ''
                 })()
+                if (phaseRaw3==='branch_quality' && typeof p?.lb === 'number') { contribRef.current.lb_improve_total += Math.max(0, p.lb) }
+                if (typeof perf?.filteredZero === 'number') { contribRef.current.branch_pruned += perf.filteredZero }
+                if (typeof perf?.enqueued === 'number') { contribRef.current.enqueued += perf.enqueued }
+                if (typeof perf?.expanded === 'number') { contribRef.current.expanded += perf.expanded }
                 const line = `[${((now - solveStartRef.current)/1000).toFixed(1)}s] phase=${phaseRaw3}${compInfo3}${extra3} nodes=${p?.nodes??0} queue=${p?.queue??0} sols=${p?.solutions??0} enq=${perf?.enqueued??'-'} exp=${perf?.expanded??'-'} zf=${perf?.filteredZero??'-'}`
                 setProgressLogs(prev=>{
                   const next = [...prev, line]
@@ -1268,6 +1343,9 @@ const [triangleSize, setTriangleSize] = useState(30)
               setStatus(`正在继续计算最短步骤… ${phase}`)
               setSolveProgress({ phase:p?.phase, nodes:p?.nodes, solutions:p?.solutions, queue:p?.queue, components:p?.count, bestStartId:p?.bestStartId, minSteps:p?.minSteps, elapsedMs: now - solveStartRef.current, perf: p?.perf })
               const perf = p?.perf || {}
+              if (typeof perf?.filteredZero === 'number') { contribRef.current.branch_pruned += perf.filteredZero }
+              if (typeof perf?.enqueued === 'number') { contribRef.current.enqueued += perf.enqueued }
+              if (typeof perf?.expanded === 'number') { contribRef.current.expanded += perf.expanded }
               const line = `[${((now - solveStartRef.current)/1000).toFixed(1)}s] phase=${p?.phase||'search'} nodes=${p?.nodes??0} queue=${p?.queue??0} sols=${p?.solutions??0} enq=${perf?.enqueued??'-'} exp=${perf?.expanded??'-'} zf=${perf?.filteredZero??'-'}`
               setProgressLogs(prev=>{ const next=[...prev,line]; return next.length>200 ? next.slice(next.length-200) : next })
               progressLastRef.current = now
@@ -1313,12 +1391,15 @@ const [triangleSize, setTriangleSize] = useState(30)
       setBestStartId(result.bestStartId ?? null)
       setStatus(`已更新为最短步骤（自动起点 #${result.bestStartId}），最少步骤：${result.minSteps}`)
       setSolveProgress(null)
-      try { await putCachePath(graphSignature2, { path: unifiedPaths[0]||[], min_steps: result.minSteps, start_id: result.bestStartId, flags: window.SOLVER_FLAGS }) } catch {}
+      try { await putCachePath(graphSignature2, { path: unifiedPaths[0]||[], min_steps: result.minSteps, start_id: result.bestStartId, flags: window.SOLVER_FLAGS, is_unified: true, quality: 'final' }) } catch {}
       try { await uploadStrategyAuto(triangles, palette, 'continue_shortest', result.bestStartId, unifiedPaths[0]||[]) } catch {}
+      try { await recordRunScore(graphSignature2, { run_id: __runId2, algo_name: (window.SOLVER_FLAGS?.heuristicName||'default'), min_steps: result.minSteps, best_start_id: result.bestStartId, time_ms: Date.now() - solveStartRef.current, is_unified: true, quality: 'final', source: 'continue_shortest', flags: window.SOLVER_FLAGS }) } catch {}
+            try { await postLearnScore(graphSignature2, { run_id: __runId2, graph_signature: graphSignature2, is_unified: true, path_len: result.minSteps, algo_scores: (()=>{ const m = { lb_improve_total: contribRef.current.lb_improve_total||0, branch_pruned_count: contribRef.current.branch_pruned||0, expansion_saved_est: Math.max(0, (contribRef.current.enqueued||0)-(contribRef.current.expanded||0)), critical_hits: contribRef.current.critical_hits||0, path_len_reduction: contribRef.current.path_len_reduction||0 }; const w = { lb:0.35, prune:0.25, expand:0.25, critical:0.10, path:0.05 }; const denom = Math.max(1, m.lb_improve_total + m.branch_pruned_count + m.expansion_saved_est + m.critical_hits + m.path_len_reduction); const norm = { lb: m.lb_improve_total/denom, prune: m.branch_pruned_count/denom, expand: m.expansion_saved_est/denom, critical: m.critical_hits/denom, path: m.path_len_reduction/denom }; const f = window.SOLVER_FLAGS||{}; const mods = []; const add=(key, engaged)=>{ if(!engaged) return; const score=100*(w.lb*norm.lb + w.prune*norm.prune + w.expand*norm.expand + w.critical*norm.critical + w.path*norm.path); mods.push({ key, score, metrics: m })}; add('ucb_prioritizer', !!f.enableLearningPrioritizer); add('bridge_first', !!f.enableBridgeFirst); add('best_first', !!f.enableBestFirst); add('a_star_lb', !!f.useAStarInBestFirst || !!f.useStrongLBInBestFirst); add('beam_search', !!f.enableBeam); add('lookahead', !!f.enableLookahead || !!f.enableLookaheadDepth2); add('zero_expand_filter', !!f.enableZeroExpandFilter); add('pdb', !!f.enablePDBAutoLoad); add('local_repair', !!f.optimizeEnableWindow || !!f.optimizeEnableRemoval || (Number(f.optimizeSwapPasses)||0)>0 ); add('sat_planner', !!f.enableSATPlanner); return mods; })() }) } catch {}
       try { if(__runId2) await telemetryFinishRun(__runId2, { status:'finished', min_steps: result.minSteps, best_start_id: result.bestStartId, time_ms: Date.now() - solveStartRef.current, graph_signature: graphSignature2 }) } catch {}
     } catch (err) {
       console.error('Continue shortest error:', err)
       setStatus('继续计算最短步骤时发生错误')
+      
       try { if(__runId2) await telemetryFinishRun(__runId2, { status:'error', error: String(err?.message||err), time_ms: Date.now() - solveStartRef.current, graph_signature: graphSignature2 }) } catch {}
     } finally {
       setSolving(false)
@@ -1358,6 +1439,9 @@ const [triangleSize, setTriangleSize] = useState(30)
                 setStatus(`正在路径优化… 阶段：${phase}`)
                 setSolveProgress({ phase, criticalCount: p?.criticalCount, minSteps: p?.minSteps, components: p?.count })
                 const perf = p?.perf || {}
+                if (typeof p?.criticalCount === 'number') { contribRef.current.critical_hits += p.criticalCount }
+                if (typeof perf?.enqueued === 'number') { contribRef.current.enqueued += perf.enqueued }
+                if (typeof perf?.expanded === 'number') { contribRef.current.expanded += perf.expanded }
                 const line = `[${((now - solveStartRef.current)/1000).toFixed(1)}s] phase=${phase} crit=${p?.criticalCount??'-'} min=${p?.minSteps??'-'} enq=${perf?.enqueued??'-'} exp=${perf?.expanded??'-'}`
                 setProgressLogs(prev=>{ const next=[...prev,line]; return next.length>200 ? next.slice(next.length-200) : next })
                 progressLastRef.current = now
@@ -1387,6 +1471,7 @@ const [triangleSize, setTriangleSize] = useState(30)
           if (now - progressLastRef.current > 200) {
             setStatus(`正在路径优化… 阶段：${phase}`)
             setSolveProgress({ phase, criticalCount: p?.criticalCount, minSteps: p?.minSteps })
+            if (typeof p?.criticalCount === 'number') { contribRef.current.critical_hits += p.criticalCount }
             const line = `[${((now - solveStartRef.current)/1000).toFixed(1)}s] phase=${phase} crit=${p?.criticalCount??'-'} min=${p?.minSteps??'-'}`
             setProgressLogs(prev=>{ const next=[...prev,line]; return next.length>200 ? next.slice(next.length-200) : next })
             progressLastRef.current = now
@@ -1419,11 +1504,16 @@ const [triangleSize, setTriangleSize] = useState(30)
         setSteps([{ path: result.optimizedPath, images: snapshots }])
         setBestStartId(result.bestStartId ?? sid)
         setStatus(`路径优化成功：由 ${originalPath.length} 步缩短为 ${result.optimizedLen} 步（起点 #${result.bestStartId ?? sid}）`)
-        try { await putCachePath(graphSignature3, { path: result.optimizedPath, min_steps: result.optimizedLen, start_id: result.bestStartId ?? sid, flags: window.SOLVER_FLAGS }) } catch {}
+        try { await putCachePath(graphSignature3, { path: result.optimizedPath, min_steps: result.optimizedLen, start_id: result.bestStartId ?? sid, flags: window.SOLVER_FLAGS, is_unified: true, quality: 'final' }) } catch {}
+        try { await recordRunScore(graphSignature3, { run_id: __runId3, algo_name: (window.SOLVER_FLAGS?.heuristicName||'default'), min_steps: result.optimizedLen, best_start_id: result.bestStartId ?? sid, time_ms: Date.now() - solveStartRef.current, is_unified: true, quality: 'final', source: 'optimize_path', flags: window.SOLVER_FLAGS }) } catch {}
+        try { contribRef.current.path_len_reduction += Math.max(0, (originalPath?.length||0) - result.optimizedLen) } catch {}
+        try { await postLearnScore(graphSignature3, { run_id: __runId3, graph_signature: graphSignature3, is_unified: true, path_len: result.optimizedLen, algo_scores: (()=>{ const m = { lb_improve_total: contribRef.current.lb_improve_total||0, branch_pruned_count: contribRef.current.branch_pruned||0, expansion_saved_est: Math.max(0, (contribRef.current.enqueued||0)-(contribRef.current.expanded||0)), critical_hits: contribRef.current.critical_hits||0, path_len_reduction: contribRef.current.path_len_reduction||0 }; const w = { lb:0.35, prune:0.25, expand:0.25, critical:0.10, path:0.05 }; const denom = Math.max(1, m.lb_improve_total + m.branch_pruned_count + m.expansion_saved_est + m.critical_hits + m.path_len_reduction); const norm = { lb: m.lb_improve_total/denom, prune: m.branch_pruned_count/denom, expand: m.expansion_saved_est/denom, critical: m.critical_hits/denom, path: m.path_len_reduction/denom }; const f = window.SOLVER_FLAGS||{}; const mods = []; const add=(key, engaged)=>{ if(!engaged) return; const score=100*(w.lb*norm.lb + w.prune*norm.prune + w.expand*norm.expand + w.critical*norm.critical + w.path*norm.path); mods.push({ key, score, metrics: m })}; add('ucb_prioritizer', !!f.enableLearningPrioritizer); add('bridge_first', !!f.enableBridgeFirst); add('best_first', !!f.enableBestFirst); add('a_star_lb', !!f.useAStarInBestFirst || !!f.useStrongLBInBestFirst); add('beam_search', !!f.enableBeam); add('lookahead', !!f.enableLookahead || !!f.enableLookaheadDepth2); add('zero_expand_filter', !!f.enableZeroExpandFilter); add('pdb', !!f.enablePDBAutoLoad); add('local_repair', !!f.optimizeEnableWindow || !!f.optimizeEnableRemoval || (Number(f.optimizeSwapPasses)||0)>0 ); add('sat_planner', !!f.enableSATPlanner); return mods; })() }) } catch {}
         try { if(__runId3) await telemetryFinishRun(__runId3, { status:'finished', min_steps: result.optimizedLen, best_start_id: result.bestStartId ?? sid, time_ms: Date.now() - solveStartRef.current, graph_signature: graphSignature3 }) } catch {}
         try { await uploadStrategyAuto(triangles, palette, 'optimize_path', (result.bestStartId ?? sid), result.optimizedPath, (result?.analysis?.critical||null)) } catch {}
       } else {
         setStatus('未发现更短且统一的路径（已完成关键节点分析，可查看日志）')
+        const isUniformOrig = checkUniformPath(triangles, sid, originalPath)
+        
         try { if(__runId3) await telemetryFinishRun(__runId3, { status:'finished', min_steps: originalPath?.length, best_start_id: sid, time_ms: Date.now() - solveStartRef.current, graph_signature: graphSignature3 }) } catch {}
         try { await uploadStrategyAuto(triangles, palette, 'optimize_path', sid, originalPath, (result?.analysis?.critical||null)) } catch {}
       }
@@ -1431,6 +1521,7 @@ const [triangleSize, setTriangleSize] = useState(30)
     } catch (err) {
       console.error('Optimize path error:', err)
       setStatus('路径优化时发生错误')
+      
       try { if(__runId3) await telemetryFinishRun(__runId3, { status:'error', error: String(err?.message||err), time_ms: Date.now() - solveStartRef.current, graph_signature: graphSignature3 }) } catch {}
     } finally {
       setSolving(false)
@@ -1751,59 +1842,6 @@ const [triangleSize, setTriangleSize] = useState(30)
     )
   }
 
-  // 总站子页渲染：集中存储与聚合展示
-  if (route === '#/hub') {
-    if (!hubAuthed) {
-      const onSubmit = async () => {
-        const pwd = (hubPwd||'').trim()
-        if (!pwd) { alert('请输入密码'); return }
-        try {
-          const base = (typeof window!=='undefined' && window.SOLVER_FLAGS?.serverBaseUrl) ? String(window.SOLVER_FLAGS.serverBaseUrl) : (typeof window!=='undefined' ? (window.location.origin || 'http://localhost:3001') : 'http://localhost:3001')
-          const res = await fetch(`${base}/api/auth/login`, { method:'POST', headers:{ 'Content-Type':'application/json' }, body: JSON.stringify({ password: pwd }) })
-          if (!res.ok) { throw new Error('unauthorized') }
-          const data = await res.json()
-          const token = String(data?.token||'')
-          if (!token) throw new Error('no_token')
-          try { localStorage.setItem('adminToken', token) } catch {}
-          try { window.ADMIN_TOKEN = token } catch {}
-          try { sessionStorage.setItem('hubAuthed', '1') } catch {}
-          setHubAuthed(true)
-        } catch (e) {
-          alert('无权限或后端未启动')
-          try { window.location.hash = '#/help' } catch { window.location.hash = '#/help' }
-        }
-      }
-      const onCancel = () => {
-        try { window.location.hash = '#/help' } catch { window.location.hash = '#/help' }
-      }
-      const onKeyDown = (e) => { if (e.key === 'Enter') onSubmit() }
-      return (
-        <div style={{ position:'fixed', inset:0, background:'rgba(0,0,0,0.35)', display:'flex', alignItems:'center', justifyContent:'center', zIndex:9999 }}>
-          <div className="panel" style={{ width:'360px', background:'var(--panel)', padding:'16px', boxShadow:'0 6px 24px rgba(0,0,0,.2)' }}>
-            <h3 style={{ margin:'0 0 12px 0', fontSize:'15px', color:'var(--muted)' }}>请输入密码</h3>
-            <input
-              type="password"
-              value={hubPwd}
-              onChange={e=>setHubPwd(e.target.value)}
-              onKeyDown={onKeyDown}
-              placeholder="密码"
-              style={{ width:'100%', padding:'8px', border:'1px solid var(--panel-border)', borderRadius:4, marginBottom:'12px', background:'var(--bg)' }}
-            />
-            <div style={{ display:'flex', gap:'8px', justifyContent:'flex-end' }}>
-              <button onClick={onCancel}>取消</button>
-              <button className="primary" onClick={onSubmit}>确认</button>
-            </div>
-          </div>
-        </div>
-      )
-    }
-    return (
-      <>
-        <a href="#/help" className="help-link" style={{ position:'fixed', top:'12px', right:'16px', color:'var(--muted)', textDecoration:'none' }}>说明</a>
-        <CentralHub />
-      </>
-    )
-  }
 
   // 管理子页渲染：后台数据列表与事件
   if (route === '#/admin') {

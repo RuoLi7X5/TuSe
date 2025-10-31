@@ -575,7 +575,7 @@ export default function PerformanceTuner({ onClose }) {
           <Field label="桥接权重（Bridge）" tooltip="效果：提高能连接不同分量颜色的优先级，快速减少分量数。\n建议：分量多或断裂明显时提高；单一大分量内收束时降低。">
             <NumInput value={flags.bridgeWeight} onChange={v=>setFlag('bridgeWeight', v)} step={0.1} />
           </Field>
-          <Field label="闸门权重（Gate）" tooltip="效果：偏好能打通狭窄通道的颜色，利于跨越瓶颈。\n建议：迷宫/通道型结构提高；空间开阔时可降低。">
+          <Field label="闸门权重（Gate）" tooltip="效果：偏好能打通狭窄通道的颜色，利于跨越瓶颈。\n建议：迷宫/通道型结构高；空间开阔时可降低。">
             <NumInput value={flags.gateWeight} onChange={v=>setFlag('gateWeight', v)} step={0.1} />
           </Field>
           <Field label="丰富度权重（Richness）" tooltip="效果：奖励增加不同邻接颜色的步骤，使后续选择更灵活。\n建议：早期略高（0.5~0.8），后期收束时降低以避免引入多余颜色。">
@@ -584,7 +584,7 @@ export default function PerformanceTuner({ onClose }) {
           <Field label="边界权重（Boundary）" tooltip="效果：鼓励减少不同颜色的边界，利于统一。\n建议：中后期提高（0.8~1.2），早期探索阶段适中（0.6~0.8）。">
             <NumInput value={flags.boundaryWeight} onChange={v=>setFlag('boundaryWeight', v)} step={0.1} />
           </Field>
-          <Field label="双前沿权重（Bifront）" tooltip="效果：在两个相对前沿接触时偏向于促成合并，减少中间隔离区。\n建议：图案呈条带/对称双侧推进时提高；无明显双前沿时保持默认。">
+          <Field label="双前沿权重（Bifront）" tooltip="效果：在两个相对前沿接触时偏向于促成合并，减少中间隔离区。\n建议：图案呈条带/对称双侧推进时高；无明显双前沿时保持默认。">
             <NumInput value={flags.bifrontWeight} onChange={v=>setFlag('bifrontWeight', v)} step={0.1} />
           </Field>
           <Field label="类别权重：边界" tooltip="效果：在路径重排与压缩中提升边界类步骤的相对重要性。\n建议：中后期增大，配合收束。">
@@ -626,6 +626,12 @@ export default function PerformanceTuner({ onClose }) {
           <Field label="下界改进最小值" tooltip="效果：若该步无法至少减少一定的颜色种类数（下界不改善），则过滤。\n建议：1（默认）。更激进可设 2；若希望更自由探索设 0。">
             <NumInput value={flags.lbImproveMin} onChange={v=>setFlag('lbImproveMin', v)} step={1} min={0} />
           </Field>
+          <Field label="稀有守卫放松系数" tooltip="效果：根据剩余步数与局部压力动态放松对稀有色的限制。\n建议：0.3~0.7。越大越宽松（后期更容易放行稀有色）。">
+            <NumInput value={flags.rareRelaxScale} onChange={v=>setFlag('rareRelaxScale', v)} step={0.05} min={0} max={2} />
+          </Field>
+          <Field label="下界改进放松系数" tooltip="效果：根据剩余步数与局部压力动态放松“下界必须改善”的要求。\n建议：0.3~0.7。越大越宽松（末端更容易保留微小改进步）。">
+            <NumInput value={flags.lbImproveRelaxScale} onChange={v=>setFlag('lbImproveRelaxScale', v)} step={0.05} min={0} max={2} />
+          </Field>
         </Section>
 
         <Section title="路径优化">
@@ -654,6 +660,26 @@ export default function PerformanceTuner({ onClose }) {
         </div>
 
       </div>
+    </div>
+  )
+}
+
+function Section({ title, children }){
+  return (
+    <div style={{ background:'#0b1020', border:'1px solid #222a3f', borderRadius:'8px', padding:'10px', marginBottom:'8px' }}>
+      <div style={{ fontWeight:700, color:'#9fb2d9', marginBottom:'8px' }}>{title}</div>
+      <div style={{ display:'grid', gridTemplateColumns:'1fr 1fr', gap:'8px' }}>{children}</div>
+    </div>
+  )
+}
+function Field({ label, tooltip, children }){
+  return (
+    <div>
+      <div style={{ display:'flex', alignItems:'center', justifyContent:'space-between', marginBottom:'4px' }}>
+        <div style={{ fontSize:'12px', color:'#cbd3e1' }}>{label}</div>
+        {tooltip && <div style={{ fontSize:'11px', color:'#93a0b7' }} title={tooltip}>ⓘ</div>}
+      </div>
+      {children}
     </div>
   )
 }
@@ -729,7 +755,6 @@ function Benchmark({ flags, setFlag }){
         }
       }
 
-      // 恢复原始 flags
       window.SOLVER_FLAGS = originalFlags
       try { window.__solverWorker?.postMessage({ type:'set_flags', flags: originalFlags }) } catch {}
       setRunning(false)
