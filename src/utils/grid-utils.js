@@ -1,5 +1,13 @@
 import { nearestPaletteFromLab, rgb2lab, distLab } from './color-utils'
 
+// 简单的 hex 转 lab 辅助函数
+function hex2lab(hex) {
+  const r = parseInt(hex.slice(1, 3), 16)
+  const g = parseInt(hex.slice(3, 5), 16)
+  const b = parseInt(hex.slice(5, 7), 16)
+  return rgb2lab(r, g, b)
+}
+
 // 轴对齐矩形裁剪（Sutherland–Hodgman）：将越界三角形裁剪为画布内的多边形
 function clipPolygonToRect(poly, width, height) {
   const clipEdge = (points, edge) => {
@@ -196,11 +204,68 @@ export function buildTriangleGridVertical(width, height, side) {
   return { width, height, side, H, triangles }
 }
 
+export function denoiseGrid(triangles) {
+  const idToIndex = new Map(triangles.map((t, i) => [t.id, i]))
+  const colorLabCache = new Map()
+
+  const getLab = (c) => {
+    if (!colorLabCache.has(c)) colorLabCache.set(c, hex2lab(c))
+    return colorLabCache.get(c)
+  }
+
+  // 迭代 2 次以传播修正，消除孤立噪点
+  for (let iter = 0; iter < 2; iter++) {
+    const updates = []
+    for (const t of triangles) {
+      if (t.deleted || t.color === 'transparent') continue
+
+      const neighbors = t.neighbors.map(nid => triangles[idToIndex.get(nid)])
+        .filter(n => n && !n.deleted && n.color !== 'transparent')
+      
+      if (neighbors.length === 0) continue
+
+      const counts = new Map()
+      for (const n of neighbors) {
+        counts.set(n.color, (counts.get(n.color) || 0) + 1)
+      }
+
+      let bestColor = null
+      let maxCount = 0
+      for (const [c, count] of counts.entries()) {
+        if (count > maxCount) {
+          maxCount = count
+          bestColor = c
+        }
+      }
+
+      // 规则：如果众数颜色占比超过 50%（绝对多数），且色差较小，则同化
+      if (maxCount > neighbors.length * 0.5 && bestColor !== t.color) {
+        const labCurrent = getLab(t.color)
+        const labBest = getLab(bestColor)
+        const dist = distLab(labCurrent, labBest)
+        // 阈值 20：足够容忍同色系的微小差异，但保留明显的边界
+        if (dist < 20) {
+          updates.push({ index: idToIndex.get(t.id), color: bestColor })
+        }
+      }
+    }
+
+    if (updates.length === 0) break
+    for (const u of updates) {
+      triangles[u.index].color = u.color
+    }
+  }
+  return triangles
+}
+
 export async function mapImageToGrid(bitmap, grid, palette) {
   const canvas = document.createElement('canvas')
   canvas.width = bitmap.width; canvas.height = bitmap.height
   const ctx = canvas.getContext('2d')
+  // 1. 预处理：轻微模糊以平滑噪点和压缩伪影
+  ctx.filter = 'blur(1px)'
   ctx.drawImage(bitmap, 0, 0)
+  ctx.filter = 'none' // 恢复
   const img = ctx.getImageData(0, 0, canvas.width, canvas.height)
   const data = img.data
   const labAt = (x, y) => {
@@ -223,10 +288,11 @@ export async function mapImageToGrid(bitmap, grid, palette) {
   const insidePoint = (p, c, alpha=0.15) => ({ x: p.x*(1-alpha)+c.x*alpha, y: p.y*(1-alpha)+c.y*alpha })
   const midPoint = (a, b) => ({ x: (a.x+b.x)/2, y: (a.y+b.y)/2 })
 
-  return grid.triangles.map(t => {
+  const mappedTriangles = grid.triangles.map(t => {
     const c = t.drawCentroid || t.centroid
     const verts = t.drawVertices || t.vertices
     const v0=verts[0], v1=verts[1], v2=verts[2]
+    // 采样点分布：质心 + 顶点内缩 + 边中点内缩
     const pts = [
       c,
       insidePoint(v0, c, 0.20),
@@ -238,18 +304,73 @@ export async function mapImageToGrid(bitmap, grid, palette) {
     ]
     const labs = pts.map(p=>labAt(p.x, p.y))
     const weights = [2,1,1,1,1.2,1.2,1.2]
-    // 初始均值
-    const mean1 = weightedMeanLab(labs, weights)
-    // 去除离群：与初始均值距离过大者剔除（阈值 25），保留至少 5 个样本
-    const ds = labs.map(l=>distLab(l, mean1))
-    const order = ds.map((d,i)=>({d,i})).sort((a,b)=>a.d-b.d)
-    const keepIdx = order.slice(0, Math.max(5, labs.length-2)).map(o=>o.i)
-    const labs2 = keepIdx.map(i=>labs[i])
-    const weights2 = keepIdx.map(i=>weights[i])
-    const mean2 = weightedMeanLab(labs2, weights2)
-    const color = nearestPaletteFromLab(mean2, palette)
+
+    // 2. 改进的颜色决策：密度聚类（Mode Seeking）
+    // 目的：如果采样点横跨两种颜色（边界处），选择权重密度最大的一簇，而不是简单的平均
+    
+    // 计算每个点在阈值（例如 Lab 距离 12）内的邻居权重之和（密度）
+    const DENSITY_RADIUS = 12
+    const densities = labs.map((l1, i) => {
+      let d = 0
+      for(let j=0; j<labs.length; j++) {
+        if (distLab(l1, labs[j]) < DENSITY_RADIUS) {
+          d += weights[j]
+        }
+      }
+      return { index: i, density: d }
+    })
+    
+    // 找到密度最大的点作为“核心点”
+    densities.sort((a, b) => b.density - a.density)
+    const coreIndex = densities[0].index
+    const coreLab = labs[coreIndex]
+
+    // 只聚合与核心点接近的点
+    const clusterIndices = []
+    for(let i=0; i<labs.length; i++) {
+      if (distLab(labs[i], coreLab) < DENSITY_RADIUS) {
+        clusterIndices.push(i)
+      }
+    }
+
+    const labsCluster = clusterIndices.map(i => labs[i])
+    const weightsCluster = clusterIndices.map(i => weights[i])
+    const meanLab = weightedMeanLab(labsCluster, weightsCluster)
+
+    // 禁用调色板映射：直接使用像素的平均 Lab 转回 RGB
+    // 强制使用“真实”颜色，避免被旧调色板或相近色“吸附”
+    // const color = nearestPaletteFromLab(meanLab, palette) 
+    
+    // Lab -> RGB -> Hex (不依赖调色板)
+    // 需要引入 lab2rgb 转换
+    return { ...t, meanLab }
+  })
+  
+  // 第二阶段：统一映射到当前调色板
+  // 此时 palette 已经是基于 targetCount 重新计算过的精确调色板
+  // 这一步确保所有三角形最终都只使用 palette 中的颜色
+  const finalTriangles = mappedTriangles.map(t => {
+    const color = nearestPaletteFromLab(t.meanLab, palette)
     return { ...t, color }
   })
+  
+  // 3. 后处理：去噪（孤立点消除）
+  return denoiseGrid(finalTriangles)
+}
+
+function lab2rgb(L, a, b) {
+  // 简化的 lab2rgb 实现，用于内部转换
+  let y = (L + 16) / 116, x = a / 500 + y, z = y - b / 200
+  x = 0.95047 * (x * x * x > 0.008856 ? x * x * x : (x - 16 / 116) / 7.787)
+  y = 1.00000 * (y * y * y > 0.008856 ? y * y * y : (y - 16 / 116) / 7.787)
+  z = 1.08883 * (z * z * z > 0.008856 ? z * z * z : (z - 16 / 116) / 7.787)
+  let r = x * 3.2406 + y * -1.5372 + z * -0.4986
+  let g = x * -0.9689 + y * 1.8758 + z * 0.0415
+  let b_val = x * 0.0557 + y * -0.2040 + z * 1.0570
+  r = Math.round(Math.max(0, Math.min(255, (r > 0.0031308 ? (1.055 * Math.pow(r, 1 / 2.4) - 0.055) : 12.92 * r) * 255)))
+  g = Math.round(Math.max(0, Math.min(255, (g > 0.0031308 ? (1.055 * Math.pow(g, 1 / 2.4) - 0.055) : 12.92 * g) * 255)))
+  b_val = Math.round(Math.max(0, Math.min(255, (b_val > 0.0031308 ? (1.055 * Math.pow(b_val, 1 / 2.4) - 0.055) : 12.92 * b_val) * 255)))
+  return `#{r.toString(16).padStart(2,'0')}{g.toString(16).padStart(2,'0')}{b_val.toString(16).padStart(2,'0')}`
 }
 
 export function isUniform(triangles) {

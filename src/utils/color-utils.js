@@ -108,10 +108,43 @@ function hueDistDeg(lab1, lab2){
 }
 
 function kmeans(pixels, K=8, iter=6){
-  // init
-  const centers=[]
-  const step = Math.max(1, Math.floor(pixels.length/K))
-  for(let i=0;i<K;i++) centers.push(pixels[i*step])
+  // K-means++ Initialization
+  const centers = []
+  if (pixels.length === 0) return []
+  
+  // 1. Choose first center uniformly at random
+  const firstIdx = Math.floor(Math.random() * pixels.length)
+  centers.push(pixels[firstIdx])
+
+  // 2. Choose remaining K-1 centers
+  const dists = new Array(pixels.length).fill(Infinity)
+  
+  for (let c = 1; c < K; c++) {
+    let sumSqDist = 0
+    // Update squared distances to nearest center
+    for (let i = 0; i < pixels.length; i++) {
+      const d = distLab(pixels[i].lab, centers[centers.length - 1].lab)
+      const d2 = d * d
+      if (d2 < dists[i]) {
+        dists[i] = d2
+      }
+      sumSqDist += dists[i]
+    }
+
+    // Choose next center with probability proportional to D(x)^2
+    let r = Math.random() * sumSqDist
+    let nextIdx = -1
+    for (let i = 0; i < pixels.length; i++) {
+      r -= dists[i]
+      if (r <= 0) {
+        nextIdx = i
+        break
+      }
+    }
+    if (nextIdx === -1) nextIdx = pixels.length - 1 // Fallback
+    centers.push(pixels[nextIdx])
+  }
+
   let labels = new Array(pixels.length).fill(0)
   for(let t=0;t<iter;t++){
     // assign
@@ -197,11 +230,22 @@ function lab2rgb(L,a,b){
   return [comp(r), comp(g), comp(b2)]
 }
 
-export async function quantizeImage(bitmap){
+export async function quantizeImage(bitmap, targetCount){
   const canvas=document.createElement('canvas')
   canvas.width=bitmap.width; canvas.height=bitmap.height
   const ctx=canvas.getContext('2d')
   ctx.drawImage(bitmap,0,0)
+  
+  // 如果用户未指定数量，尝试从底部区域（Footer）提取调色板
+  if (!targetCount || targetCount < 2) {
+    // 假设底部 15% 为控制栏，且右侧包含调色板色块
+    const footerPalette = extractFooterPalette(ctx, bitmap.width, bitmap.height)
+    if (footerPalette && footerPalette.length >= 2) {
+      console.log('[AutoPalette] Detected from footer:', footerPalette)
+      return { palette: footerPalette }
+    }
+  }
+
   const img=ctx.getImageData(0,0,canvas.width,canvas.height)
   const data=img.data
   const stride=4
@@ -213,16 +257,206 @@ export async function quantizeImage(bitmap){
       samples.push({ rgb:[r,g,b], lab: rgb2lab(r,g,b) })
     }
   }
-  // 适度提高 K 的上限，避免灰色被压缩掉
-  const K=Math.min(10, Math.max(3, Math.round(Math.sqrt(samples.length/800))))
+  
+  // 如果用户指定了 targetCount，则使用“相异模式搜索”策略来保证颜色多样性
+  const tc = parseInt(targetCount)
+  if (Number.isFinite(tc) && tc >= 2) {
+    console.log('[ColorUtils] Force distinct colors:', tc)
+    const distinctColors = findDistinctColors(samples, tc)
+    // 强制返回指定数量的颜色
+    return { palette: distinctColors.map(c => hex(c.rgb[0], c.rgb[1], c.rgb[2])) }
+  }
+
+  // 默认 K-Means 流程
+  const K = Math.min(10, Math.max(3, Math.round(Math.sqrt(samples.length/800))))
   let centers=kmeans(samples, K, 6)
-  centers=mergeCenters(centers, 10)
+  
+  // 仅在未指定 targetCount 时进行合并
+  if (!Number.isFinite(tc) || tc < 2) {
+    centers=mergeCenters(centers, 10)
+  }
+
   const palette=centers.map(c=>{
     const [r,g,b]=lab2rgb(c.lab[0],c.lab[1],c.lab[2])
     return hex(r,g,b)
   })
   return { palette }
 }
+
+function findDistinctColors(samples, K) {
+  if (samples.length === 0) return []
+  
+  // 1. 简单的网格分桶统计（加速密度计算）
+  // 使用 5位 精度 (32x32x32 buckets)
+  const bucketMap = new Map()
+  const bucketSize = 32
+  
+  for (const s of samples) {
+    const key = `${Math.floor(s.rgb[0]/bucketSize)},${Math.floor(s.rgb[1]/bucketSize)},${Math.floor(s.rgb[2]/bucketSize)}`
+    const entry = bucketMap.get(key)
+    if (entry) {
+      entry.count++
+      // 累加 Lab 以便求平均中心
+      entry.lSum += s.lab[0]
+      entry.aSum += s.lab[1]
+      entry.bSum += s.lab[2]
+      entry.rSum += s.rgb[0]
+      entry.gSum += s.rgb[1]
+      entry.bSumRGB += s.rgb[2]
+    } else {
+      bucketMap.set(key, { 
+        count: 1, 
+        lSum: s.lab[0], aSum: s.lab[1], bSum: s.lab[2],
+        rSum: s.rgb[0], gSum: s.rgb[1], bSumRGB: s.rgb[2]
+      })
+    }
+  }
+  
+  // 转换为候选列表
+  let candidates = []
+  for (const entry of bucketMap.values()) {
+    candidates.push({
+      count: entry.count,
+      lab: [entry.lSum/entry.count, entry.aSum/entry.count, entry.bSum/entry.count],
+      rgb: [Math.round(entry.rSum/entry.count), Math.round(entry.gSum/entry.count), Math.round(entry.bSumRGB/entry.count)]
+    })
+  }
+  
+  // 按像素数量降序排序（优先考虑大面积颜色）
+  candidates.sort((a, b) => b.count - a.count)
+  
+  const chosen = []
+  // 最小排斥距离（Lab 空间）：避免选出太相近的颜色
+  // 动态调整：如果找不到 K 个，可以降低阈值重试
+  let minDistance = 25 
+  
+  // 贪心选择
+  for (let attempt = 0; attempt < 3; attempt++) {
+    chosen.length = 0
+    const pool = [...candidates]
+    
+    while (chosen.length < K && pool.length > 0) {
+      // 每一轮，重新按“当前有效权重”排序？或者简单地按原始频率遍历并过滤
+      // 这里采用简单过滤法：按频率高低遍历，如果与已选颜色距离都大于阈值，则选中
+      for (let i = 0; i < pool.length; i++) {
+        const cand = pool[i]
+        let tooClose = false
+        for (const exist of chosen) {
+          if (distLab(cand.lab, exist.lab) < minDistance) {
+            tooClose = true; break
+          }
+        }
+        if (!tooClose) {
+          chosen.push(cand)
+          // 移除该候选，并跳出内层循环继续找下一个（如果需要严格顺序）
+          // 但其实可以直接继续遍历 pool，因为 pool 已经按频率排序
+          pool.splice(i, 1)
+          i-- 
+          if (chosen.length >= K) break
+        }
+      }
+      
+      // 如果一轮遍历后不够 K 个，说明阈值太高，剩下的都被过滤了
+      // 此时需要降低阈值，或者在剩下的里面选“最远”的
+      if (chosen.length < K) {
+        break // 退出 while，进入外层 retry 降低阈值
+      }
+    }
+    
+    if (chosen.length >= K) break
+    minDistance *= 0.6 // 降低阈值重试
+  }
+  
+  // 如果还是不够 K 个（比如图片本来就只有 2 种颜色），补足
+  while (chosen.length < K && candidates.length > 0) {
+    // 找一个与当前集合距离最远的
+    let bestCand = null
+    let maxMinDist = -1
+    
+    for (const cand of candidates) {
+      if (chosen.includes(cand)) continue
+      let minDist = 1e9
+      for (const exist of chosen) {
+        const d = distLab(cand.lab, exist.lab)
+        if (d < minDist) minDist = d
+      }
+      if (minDist > maxMinDist) {
+        maxMinDist = minDist
+        bestCand = cand
+      }
+    }
+    
+    if (bestCand) {
+      chosen.push(bestCand)
+      // 从 candidates 中移除以免重复计算（虽然 includes 检查了）
+      const idx = candidates.indexOf(bestCand)
+      if (idx > -1) candidates.splice(idx, 1)
+    } else {
+      break // 实在没有候选了
+    }
+  }
+  
+  return chosen.slice(0, K)
+}
+
+function extractFooterPalette(ctx, width, height) {
+  try {
+    // 扫描底部 12% 的区域（避开最底部的边缘）
+    const scanHeight = Math.floor(height * 0.12)
+    const yStart = height - scanHeight
+    // 仅扫描右侧 60% 区域（避开左侧按钮）
+    const xStart = Math.floor(width * 0.35)
+    const scanWidth = width - xStart
+    
+    if (scanHeight < 10 || scanWidth < 10) return null
+
+    const img = ctx.getImageData(xStart, yStart, scanWidth, scanHeight)
+    const data = img.data
+    
+    // 采样中间一行
+    const midY = Math.floor(scanHeight / 2)
+    const rowOffset = midY * scanWidth * 4
+    
+    const runs = []
+    let cur = { r: data[rowOffset], g: data[rowOffset+1], b: data[rowOffset+2], count: 0 }
+    
+    const isSim = (c1, c2) => Math.abs(c1.r-c2.r)+Math.abs(c1.g-c2.g)+Math.abs(c1.b-c2.b) < 30
+    const isDark = (c) => (c.r+c.g+c.b) < 60 // 忽略黑色背景
+
+    for (let x = 0; x < scanWidth; x++) {
+      const i = rowOffset + x * 4
+      const px = { r: data[i], g: data[i+1], b: data[i+2] }
+      
+      if (isSim(cur, px)) {
+        cur.r = (cur.r * cur.count + px.r) / (cur.count + 1)
+        cur.g = (cur.g * cur.count + px.g) / (cur.count + 1)
+        cur.b = (cur.b * cur.count + px.b) / (cur.count + 1)
+        cur.count++
+      } else {
+        if (cur.count > scanWidth * 0.05 && !isDark(cur)) { // 宽度 > 5% 且非黑
+          runs.push(hex(Math.round(cur.r), Math.round(cur.g), Math.round(cur.b)))
+        }
+        cur = { r: px.r, g: px.g, b: px.b, count: 1 }
+      }
+    }
+    // push last
+    if (cur.count > scanWidth * 0.05 && !isDark(cur)) {
+       runs.push(hex(Math.round(cur.r), Math.round(cur.g), Math.round(cur.b)))
+    }
+
+    // 去重
+    const unique = []
+    for (const c of runs) {
+      if (!unique.includes(c)) unique.push(c)
+    }
+    
+    return unique.length > 0 ? unique : null
+  } catch (e) {
+    console.warn('Footer scan failed', e)
+    return null
+  }
+}
+
 
 // 基于 Lab 的调色板近邻，并对暖色相（b*>5）相对灰色增加轻微惩罚，降低米黄误判为灰色的概率。
 const TUNING = {

@@ -173,7 +173,7 @@ const [triangleSize, setTriangleSize] = useState(30)
   const [editMode, setEditMode] = useState(true)
   const [rotation, setRotation] = useState(0)
   // 网格排列方向：horizontal（底边水平）/ vertical（底边竖直）
-  const [gridArrangement, setGridArrangement] = useState('horizontal')
+  const [gridArrangement, setGridArrangement] = useState('vertical')
   // 网格分辨率因子：实际用于构建网格的边长 = 基础尺寸 / 分辨率因子
   const [resolutionScale, setResolutionScale] = useState(1)
   // 画布显示缩放（仅影响展示尺寸）
@@ -219,6 +219,29 @@ const [triangleSize, setTriangleSize] = useState(30)
   const [pickMode, setPickMode] = useState(false)
   // 导入选项：仅加载画布用色（忽略快照中的 palette）
   const [importPaletteOnlyFromTriangles, setImportPaletteOnlyFromTriangles] = useState(false)
+  // 目标颜色数量（用户强制指定）
+  const [targetColorCount, setTargetColorCount] = useState('')
+
+  // 监听 targetColorCount 变化，实时重新识别
+  useEffect(() => {
+    if (imgBitmap && targetColorCount !== '') {
+      const run = async () => {
+        setStatus(`正在重新识别为 ${targetColorCount} 种颜色...`)
+        const { palette } = await quantizeImage(imgBitmap, parseInt(targetColorCount))
+        setPalette(palette)
+        setInitialPalette(palette)
+        if (grid) {
+          const mapped = await mapImageToGrid(imgBitmap, grid, palette)
+          setTriangles(mapped)
+          setUndoStack([mapped.map(t => t.color)])
+          setRedoStack([])
+          setStatus(`已重新生成（强制 ${palette.length} 色）`)
+        }
+      }
+      run()
+    }
+  }, [targetColorCount, imgBitmap])
+
   // 点击“添加颜色”始终进入色带选择；选择后由 onAddColorFromPicker 进行泼涂或加入集合
   const onStartAddColorPick = useCallback(() => {
     setPickMode(true)
@@ -355,7 +378,7 @@ const contribRef = useRef({ branch_pruned: 0, enqueued: 0, expanded: 0, critical
     setSelectedIds([])
     setSteps([])
     setEditMode(true)
-  }, [triangleSize, gridArrangement, resolutionScale])
+  }, [triangleSize, gridArrangement, resolutionScale, targetColorCount])
 
   useEffect(() => {
     // 根据分离强度调节颜色匹配参数
@@ -1892,7 +1915,7 @@ const contribRef = useRef({ branch_pruned: 0, enqueued: 0, expanded: 0, critical
     <div className="app">
       <div className="panel upload">
         <h2>上传图片 / 截图</h2>
-        <UploadPanel onImage={handleImage} />
+        <UploadPanel onImage={handleImage} targetColorCount={targetColorCount} setTargetColorCount={setTargetColorCount} />
         <div className="status">{status}</div>
       </div>
 
