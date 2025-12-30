@@ -212,7 +212,9 @@ a.small-btn:hover { border-color: var(--accent); }
   /* 按视口高度作为画布窗口，便于铺满与居中 */
   height: var(--canvas-window-height);
   max-height: var(--canvas-window-height);
-  overflow: auto; /* 内容超出容器时可滚动查看 */
+  overflow: auto; /* 恢复滚动条 */
+  display: flex; /* 使用 Flex 布局 */
+  /* 不设置 align-items/justify-content，让子元素的 margin: auto 处理居中与溢出 */
 }
 
 canvas {
@@ -220,8 +222,9 @@ canvas {
   /* 使用画布的固有像素尺寸展示，避免受容器宽度拉伸/压缩 */
   width: auto;
   height: auto;
-  transform: translate(var(--canvas-offset-x), var(--canvas-offset-y)) scale(var(--canvas-scale));
-  transform-origin: top left;
+  /* transform 由外层容器控制，避免双重缩放 */
+  /* transform: translate(var(--canvas-offset-x), var(--canvas-offset-y)) scale(var(--canvas-scale)); */
+  /* transform-origin: top left; */
 }
 
 .steps {

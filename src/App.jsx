@@ -9,10 +9,11 @@ import HelpPage from './components/HelpPage'
 import AdminDashboard from './components/AdminDashboard'
 
 import { quantizeImage, setColorTuning } from './utils/color-utils'
-import { buildTriangleGrid, buildTriangleGridVertical, mapImageToGrid, isUniform, colorFrequency } from './utils/grid-utils'
+import { buildTriangleGrid, buildTriangleGridVertical, mapImageToGrid, isUniform, colorFrequency, generateAiDebugImage } from './utils/grid-utils'
 import { floodFillRegion, attachSolverToWindow, captureCanvasPNG } from './utils/solver'
 import { hasPDB, loadPDBObject, loadPDBFromJSON, loadPDBFromURL, getPDBBaseURL } from './utils/pdb'
 import { startRun as telemetryStartRun, logEvent as telemetryLogEvent, finishRun as telemetryFinishRun, makeGraphSignature, getRecommendation, getCachePath, putCachePath, uploadStrategyAuto, recordRunScore, postLearnScore } from './utils/telemetry'
+import AIService from './utils/ai-service'
 
 // 设置默认的求解器开关与权重，并合并本地持久化配置（localStorage）
 if (typeof window !== 'undefined') {
@@ -178,9 +179,25 @@ const [triangleSize, setTriangleSize] = useState(30)
   const [resolutionScale, setResolutionScale] = useState(1)
   // 画布显示缩放（仅影响展示尺寸）
   const [canvasScale, setCanvasScale] = useState(1)
-  // 画布位置偏移（仅影响展示位置）
-  const [canvasOffset, setCanvasOffset] = useState({ x: 0, y: 0 })
   const canvasWrapRef = useRef(null)
+  
+  // 使用 Ref 追踪最新的 scale，解决闭包过期问题
+  const scaleRef = useRef(canvasScale)
+  // 用于在缩放后恢复锚点的 Ref
+  const pendingScrollRef = useRef(null)
+
+  useEffect(() => { scaleRef.current = canvasScale }, [canvasScale])
+  
+  // 监听缩放变化，应用锚定滚动位置
+  useEffect(() => {
+    if (pendingScrollRef.current && canvasWrapRef.current) {
+      const { left, top } = pendingScrollRef.current
+      canvasWrapRef.current.scrollLeft = left
+      canvasWrapRef.current.scrollTop = top
+      pendingScrollRef.current = null
+    }
+  }, [canvasScale])
+
   const [solving, setSolving] = useState(false)
   // 自动求解步数上限（用于剪枝与性能控制），持久化到 localStorage；允许为空表示不限制
   const [maxStepsLimit, setMaxStepsLimit] = useState(() => {
@@ -221,6 +238,9 @@ const [triangleSize, setTriangleSize] = useState(30)
   const [importPaletteOnlyFromTriangles, setImportPaletteOnlyFromTriangles] = useState(false)
   // 目标颜色数量（用户强制指定）
   const [targetColorCount, setTargetColorCount] = useState('')
+  // AI 智能校准状态
+  const [isAiProcessing, setIsAiProcessing] = useState(false)
+  const [aiSegmentationMap, setAiSegmentationMap] = useState(null)
 
   // 监听 targetColorCount 变化，实时重新识别
   useEffect(() => {
@@ -276,6 +296,202 @@ const [triangleSize, setTriangleSize] = useState(30)
     setSelectedColor(prev => next.includes(prev) ? prev : (next[0] ?? null))
     setStatus(`已清理调色板（保留画布用色，共 ${next.length} 色）`)
   }, [triangles])
+
+  // 独立的后台 AI 分析逻辑
+  const runBackgroundAiAnalysis = useCallback(async (bitmap, currentGrid, currentPalette, currentTriangles) => {
+    if (!bitmap || !currentGrid || !currentTriangles || currentTriangles.length === 0) return
+    if (isAiProcessing) return
+
+    setIsAiProcessing(true)
+    // 静默状态更新，不干扰用户主流程
+    // setStatus('后台 AI 分析中...') 
+    
+    try {
+      // 1. 离屏 Canvas 准备
+      const maxDim = 512
+      const scale = Math.min(1, maxDim / Math.max(bitmap.width, bitmap.height))
+      const w = Math.round(bitmap.width * scale)
+      const h = Math.round(bitmap.height * scale)
+      
+      const offCanvas = document.createElement('canvas')
+      offCanvas.width = w
+      offCanvas.height = h
+      const ctx = offCanvas.getContext('2d')
+      ctx.drawImage(bitmap, 0, 0, w, h)
+      
+      const blob = await new Promise(resolve => offCanvas.toBlob(resolve, 'image/jpeg', 0.9))
+      const url = URL.createObjectURL(blob)
+      
+      // 2. 生成 Prompts
+      const prompts = []
+      const colorMap = new Map()
+      currentTriangles.forEach(t => {
+        if (t.deleted || t.color === 'transparent') return
+        if (!colorMap.has(t.color)) colorMap.set(t.color, [])
+        colorMap.get(t.color).push(t)
+      })
+      
+      // 重新实现 Prompt 生成逻辑 (复用 onAiRectify 的核心代码，但更健壮)
+      const idToIndex = new Map(currentTriangles.map((t, i) => [t.id, i]))
+      
+      colorMap.forEach((tris, color) => {
+        const visited = new Set()
+        for (const t of tris) {
+          if (visited.has(t.id)) continue
+          const component = []
+          const q = [t]
+          visited.add(t.id)
+          component.push(t)
+          let head = 0
+          while(head < q.length) {
+            const curr = q[head++]
+            for (const nid of curr.neighbors) {
+              const idx = idToIndex.get(nid)
+              if (idx !== undefined) {
+                const neighbor = currentTriangles[idx]
+                if (!visited.has(neighbor.id) && neighbor.color === color && !neighbor.deleted) {
+                  visited.add(neighbor.id)
+                  component.push(neighbor)
+                  q.push(neighbor)
+                }
+              }
+            }
+          }
+          if (component.length > 5) {
+             let sumX = 0, sumY = 0
+             component.forEach(c => { sumX += c.centroid.x; sumY += c.centroid.y })
+             prompts.push({ x: (sumX/component.length)*scale, y: (sumY/component.length)*scale, label: 1, color })
+          }
+        }
+      })
+      
+      if (prompts.length === 0) prompts.push({ x: w/2, y: h/2, label: 1, color: currentPalette[0] || '#000000' })
+
+      // 3. 调用 本地几何引擎
+      const output = await AIService.segmentImageWithPoints(url, prompts)
+      URL.revokeObjectURL(url)
+      
+      // 4. 保存结果，准备校准
+      setAiSegmentationMap({ ...output, aiScale: scale, originalSize: { width: w, height: h } })
+      setStatus(`几何分析已就绪。点击“几何校准”以复核纠正。`)
+      
+    } catch (e) {
+      console.error('Local Analysis Error:', e)
+      setStatus('几何分析失败，请手动校准')
+    } finally {
+      setIsAiProcessing(false)
+    }
+  }, [isAiProcessing])
+
+  // 执行 几何校准 (应用已有的分析结果)
+  const onAiRectify = useCallback(async () => {
+    if (!imgBitmap || !grid) { setStatus('请先上传图片'); return }
+    
+    // 如果后台分析还没跑或者失败了，尝试现场跑一次
+    if (!aiSegmentationMap) {
+        if (!isAiProcessing) {
+            setStatus('正在启动几何分析...')
+            await runBackgroundAiAnalysis(imgBitmap, grid, palette, triangles)
+            return 
+        } else {
+            setStatus('几何引擎正在分析中，请稍候...')
+            return
+        }
+    }
+
+    setStatus('正在应用几何校准...')
+    
+    try {
+      // 强力纠正模式：传入 aiSegmentationMap
+      const mapped = await mapImageToGrid(imgBitmap, grid, palette, { 
+          aiSegmentation: aiSegmentationMap, 
+          aiScale: aiSegmentationMap.aiScale,
+          rectifyMode: true, // 新增标志，指示这是强力纠正
+          applyDenoise: false // 禁止同化逻辑，确保涂色不被“平滑”掉
+      })
+      
+      setTriangles(mapped)
+      setUndoStack(prev => [...prev, mapped.map(t => t.color)])
+      setStatus('几何校准已完成：已根据色块边界优化网格。')
+      
+    } catch (err) {
+      console.error('Rectify Apply Error:', err)
+      setStatus(`应用校准失败: ${err.message}`)
+    }
+  }, [imgBitmap, grid, palette, triangles, aiSegmentationMap, isAiProcessing, runBackgroundAiAnalysis])
+
+  // 辅助函数：计算 Mask 的边界框
+  const getMaskBBox = (data, w, h) => {
+    let minX = w, minY = h, maxX = 0, maxY = 0
+    let hasFg = false
+    for (let y = 0; y < h; y++) {
+      for (let x = 0; x < w; x++) {
+        if (data[y * w + x] > 0) {
+          hasFg = true
+          if (x < minX) minX = x
+          if (x > maxX) maxX = x
+          if (y < minY) minY = y
+          if (y > maxY) maxY = y
+        }
+      }
+    }
+    return hasFg ? { x: minX, y: minY, w: maxX - minX + 1, h: maxY - minY + 1 } : null
+  }
+
+  // 导出 AI 调试数据
+  const onExportAiDebug = useCallback(async () => {
+    if (!aiSegmentationMap || !imgBitmap) { setStatus('无可用 AI 数据'); return }
+    
+    setStatus('正在生成 AI 调试报告...')
+    
+    // 1. 导出 JSON 数据（Prompts & Meta）
+      const debugData = {
+        aiScale: aiSegmentationMap.aiScale,
+        originalSize: aiSegmentationMap.originalSize,
+        errors: aiSegmentationMap.errors || [],
+        // 新增：提取所有多边形顶点（Approximate Polygons）
+        // 为了方便查看，我们对 maskRaw 进行简单的轮廓提取（Marching Squares 或 简单遍历）
+        // 这里为了简化，我们只导出 mask 的边界框和中心点，以及原始 Prompt 点
+        results: aiSegmentationMap.results.map((r, i) => ({
+          id: i,
+          color: r.point?.color,
+          point: r.point, // 提示点坐标（原始图像空间）
+          score: r.score,
+          maskInfo: r.maskRaw ? {
+            width: r.maskRaw.width,
+            height: r.maskRaw.height,
+            // 简单计算边界框
+            bbox: getMaskBBox(r.maskRaw.data, r.maskRaw.width, r.maskRaw.height)
+          } : null
+        }))
+      }
+    
+    try {
+      const jsonBlob = new Blob([JSON.stringify(debugData, null, 2)], { type: 'application/json' })
+      const jsonUrl = URL.createObjectURL(jsonBlob)
+      const a1 = document.createElement('a')
+      a1.href = jsonUrl
+      a1.download = `ai-debug-meta-${Date.now()}.json`
+      a1.click()
+      URL.revokeObjectURL(jsonUrl)
+      
+      // 2. 导出可视化图像 (Masks Overlay)
+      const dataUrl = await generateAiDebugImage(imgBitmap, aiSegmentationMap)
+      if (dataUrl) {
+        const a2 = document.createElement('a')
+        a2.href = dataUrl
+        a2.download = `ai-debug-viz-${Date.now()}.png`
+        a2.click()
+      }
+      
+      setStatus('已导出 AI 分析数据（请查看下载的 JSON 和 PNG）')
+    } catch (e) {
+      console.error('Export AI Debug Failed:', e)
+      setStatus('导出 AI 数据失败')
+    }
+  }, [aiSegmentationMap, imgBitmap])
+
+
   // 自动求解进度（显示实时状态）
   const [solveProgress, setSolveProgress] = useState(null)
   // 实时滚动小窗口：进度日志
@@ -309,16 +525,15 @@ const contribRef = useRef({ branch_pruned: 0, enqueued: 0, expanded: 0, critical
     try {
       const wrap = canvasWrapRef.current
       if (!wrap || !grid) return
+      
       const swap = rotation === 90 || rotation === 270
-      const cw = swap ? grid.height : grid.width
-      const ch = swap ? grid.width : grid.height
+      const cw = (swap ? grid.height : grid.width) * canvasScale
+      const ch = (swap ? grid.width : grid.height) * canvasScale
       const ww = wrap.clientWidth
       const wh = wrap.clientHeight
-      if (ww <= 0 || wh <= 0 || cw <= 0 || ch <= 0) return
-      const s = canvasScale || 1
-      const ox = (ww - cw * s) / 2
-      const oy = (wh - ch * s) / 2
-      setCanvasOffset({ x: ox, y: oy })
+      
+      if (cw > ww) wrap.scrollLeft = (cw - ww) / 2
+      if (ch > wh) wrap.scrollTop = (ch - wh) / 2
     } catch {}
   }, [grid, rotation, canvasScale])
 
@@ -341,6 +556,12 @@ const contribRef = useRef({ branch_pruned: 0, enqueued: 0, expanded: 0, critical
     // 尊重 EXIF 方向，确保宽高与物理图像一致，避免比例失真
     const bitmap = await createImageBitmap(blob, { imageOrientation: 'from-image' })
     setImgBitmap(bitmap)
+    
+    // 重置状态，确保每次上传新图片都使用自动模式
+    setTargetColorCount('')
+    setLoadedProject(false)
+
+    // 强制使用自动颜色数量进行初次识别
     const { palette } = await quantizeImage(bitmap)
     setPalette(palette)
     setInitialPalette(palette)
@@ -378,7 +599,13 @@ const contribRef = useRef({ branch_pruned: 0, enqueued: 0, expanded: 0, critical
     setSelectedIds([])
     setSteps([])
     setEditMode(true)
-  }, [triangleSize, gridArrangement, resolutionScale, targetColorCount])
+    
+    // 自动触发后台 AI 分析
+    // 使用 setTimeout 将其放入下一次事件循环，避免阻塞主线程渲染
+    setTimeout(() => {
+        runBackgroundAiAnalysis(bitmap, grid, palette, mapped)
+    }, 500)
+  }, [triangleSize, gridArrangement, resolutionScale, runBackgroundAiAnalysis]) // 移除 targetColorCount 依赖，避免闭包陈旧
 
   useEffect(() => {
     // 根据分离强度调节颜色匹配参数
@@ -432,15 +659,7 @@ const contribRef = useRef({ branch_pruned: 0, enqueued: 0, expanded: 0, critical
     try { document.documentElement.style.setProperty('--canvas-scale', String(canvasScale)) } catch {}
   }, [canvasScale])
 
-  // 将画布偏移写入 CSS 变量（支持键盘平移）
-  useEffect(() => {
-    try {
-      document.documentElement.style.setProperty('--canvas-offset-x', `${canvasOffset.x}px`)
-      document.documentElement.style.setProperty('--canvas-offset-y', `${canvasOffset.y}px`)
-    } catch {}
-  }, [canvasOffset])
-
-  // Ctrl+滚轮缩放：向下滚轮放大，向上缩小（锚定指针位置）
+  // Ctrl+滚轮缩放：锚定鼠标位置
   const getMinScale = useCallback(() => {
     try {
       const wrap = canvasWrapRef.current
@@ -459,25 +678,61 @@ const contribRef = useRef({ branch_pruned: 0, enqueued: 0, expanded: 0, critical
     const wrap = canvasWrapRef.current
     if (!wrap) return
     const onWheel = (e) => {
+      // 支持 Ctrl+滚轮
       if (!e.ctrlKey) return
+      
+      const currentWrap = canvasWrapRef.current
+      if (!currentWrap) return
+
       e.preventDefault()
-      const rect = wrap.getBoundingClientRect()
-      const cx = e.clientX - rect.left
-      const cy = e.clientY - rect.top
-      setCanvasScale(prev => {
-        const rawNext = prev * (e.deltaY < 0 ? 1.12 : 0.88)
-        const next = Math.max(0.1, Math.min(6, rawNext))
-        setCanvasOffset(offPrev => {
-          const Px = (cx - offPrev.x) / prev
-          const Py = (cy - offPrev.y) / prev
-          return { x: cx - Px * next, y: cy - Py * next }
-        })
-        return next
-      })
+      
+      const delta = e.deltaY !== 0 ? e.deltaY : e.deltaX
+      if (delta === 0) return
+
+      const rect = currentWrap.getBoundingClientRect()
+      // 获取实际的内容元素（第一个子元素），用于计算基于内容的坐标
+      const content = currentWrap.firstElementChild
+      if (!content) return
+      const contentRect = content.getBoundingClientRect()
+      
+      // 1. 获取鼠标在 Content 中的相对位置
+      // 修正：之前使用 scrollLeft 仅在左对齐时有效，居中时需用 contentRect
+      const mouseContentX = e.clientX - contentRect.left
+      const mouseContentY = e.clientY - contentRect.top
+      
+      const prevScale = scaleRef.current
+      
+      // 2. 计算鼠标在“原始无缩放网格”上的位置
+      const mouseGridX = mouseContentX / prevScale
+      const mouseGridY = mouseContentY / prevScale
+      
+      // 3. 计算新缩放
+      const rawNextScale = prevScale * (delta < 0 ? 1.12 : 0.88)
+      const nextScale = Math.max(0.1, Math.min(6, rawNextScale))
+      
+      // 4. 计算新的 Scroll 位置
+      // 目标：缩放后，MouseGridX * NextScale (新内容坐标) 应该出现在 鼠标当前的视口坐标 处
+      // 鼠标当前的视口相对坐标：MouseViewportX = e.clientX - rect.left
+      // 理想的 ContentLeft 应该是：rect.left + MouseViewportX - (MouseGridX * NextScale)
+      // 而 ScrollLeft = -(ContentLeft - rect.left)  (近似理解，实际是反向偏移)
+      // 更直接的公式：
+      // nextScrollLeft = (MouseGridX * NextScale) - MouseViewportX
+      
+      const mouseClientX = e.clientX - rect.left
+      const mouseClientY = e.clientY - rect.top
+      
+      const nextScrollLeft = mouseGridX * nextScale - mouseClientX
+      const nextScrollTop = mouseGridY * nextScale - mouseClientY
+      
+      // 记录预期滚动位置，待渲染完成后应用
+      pendingScrollRef.current = { left: nextScrollLeft, top: nextScrollTop }
+      
+      scaleRef.current = nextScale
+      setCanvasScale(nextScale)
     }
     wrap.addEventListener('wheel', onWheel, { passive: false })
     return () => wrap.removeEventListener('wheel', onWheel)
-  }, [getMinScale])
+  }, [])
 
   // 保证视图始终铺满窗口：网格变化或旋转时，限制到最小填充缩放并居中
   useEffect(() => {
@@ -506,7 +761,7 @@ const contribRef = useRef({ branch_pruned: 0, enqueued: 0, expanded: 0, critical
     setTimeout(() => centerView(), 0)
   }, [centerView])
 
-  // 键盘平移：WASD 与方向键（按缩放系数调整步长）
+  // 键盘平移：WASD 与方向键 (操作滚动条)
   useEffect(() => {
     const onKeyPan = (e) => {
       const target = e.target
@@ -514,24 +769,80 @@ const contribRef = useRef({ branch_pruned: 0, enqueued: 0, expanded: 0, critical
       const isTyping = tag === 'INPUT' || tag === 'TEXTAREA' || target?.isContentEditable
       if (isTyping) return
       const key = e.key
-      const step = 40 / (canvasScale || 1)
+      // 滚动步长
+      const step = 40
+      const wrap = canvasWrapRef.current
+      if (!wrap) return
+      
       let dx = 0, dy = 0
       if (key === 'ArrowLeft') dx = -step
       else if (key === 'ArrowRight') dx = step
-      else if (key === 'a' || key === 'A') dx = step
-      else if (key === 'd' || key === 'D') dx = -step
+      else if (key === 'a' || key === 'A') dx = -step
+      else if (key === 'd' || key === 'D') dx = step
       else if (key === 'ArrowUp') dy = -step
       else if (key === 'ArrowDown') dy = step
-      else if (key === 'w' || key === 'W') dy = step
-      else if (key === 's' || key === 'S') dy = -step
+      else if (key === 'w' || key === 'W') dy = -step
+      else if (key === 's' || key === 'S') dy = step
       if (dx !== 0 || dy !== 0) {
         e.preventDefault()
-        setCanvasOffset(prev => ({ x: prev.x + dx, y: prev.y + dy }))
+        wrap.scrollLeft += dx
+        wrap.scrollTop += dy
       }
     }
     window.addEventListener('keydown', onKeyPan)
     return () => window.removeEventListener('keydown', onKeyPan)
-  }, [canvasScale])
+  }, [])
+
+  // 鼠标拖拽平移画布（中键或按住空格）
+  useEffect(() => {
+    const wrap = canvasWrapRef.current
+    if (!wrap) return
+    
+    let isPanning = false
+    let lastX = 0
+    let lastY = 0
+
+    const onMouseDown = (e) => {
+      // 中键 (1) 或 按住空格时的左键 (0)
+      if (e.button === 1 || (e.button === 0 && e.code === 'Space')) {
+        e.preventDefault()
+        isPanning = true
+        lastX = e.clientX
+        lastY = e.clientY
+        wrap.style.cursor = 'grabbing'
+      }
+    }
+
+    const onMouseMove = (e) => {
+      if (!isPanning) return
+      e.preventDefault()
+      const dx = e.clientX - lastX
+      const dy = e.clientY - lastY
+      lastX = e.clientX
+      lastY = e.clientY
+      
+      // 拖拽逻辑：鼠标往左移，滚动条往右滚（视图左移）
+      wrap.scrollLeft -= dx
+      wrap.scrollTop -= dy
+    }
+
+    const onMouseUp = () => {
+      if (isPanning) {
+        isPanning = false
+        wrap.style.cursor = ''
+      }
+    }
+
+    wrap.addEventListener('mousedown', onMouseDown)
+    window.addEventListener('mousemove', onMouseMove)
+    window.addEventListener('mouseup', onMouseUp)
+
+    return () => {
+      wrap.removeEventListener('mousedown', onMouseDown)
+      window.removeEventListener('mousemove', onMouseMove)
+      window.removeEventListener('mouseup', onMouseUp)
+    }
+  }, [])
 
   const onClickTriangle = useCallback((id, e) => {
     // 取色已改为彩虹色带点击，不使用画布取色；保持原选择逻辑
@@ -789,6 +1100,8 @@ const contribRef = useRef({ branch_pruned: 0, enqueued: 0, expanded: 0, critical
   }, [computeRegion, expandedSize, isUniformColors])
 
   const onSolve = useCallback(async () => {
+    let __runId = null
+    let graphSignature = null
     try {
       if (editMode) { setStatus('请先保存编辑，再进行自动求解'); return }
       if (triangles.length === 0) { setStatus('当前画布为空，无法求解'); return }
@@ -800,8 +1113,7 @@ const contribRef = useRef({ branch_pruned: 0, enqueued: 0, expanded: 0, critical
       solveStartRef.current = Date.now()
       contribRef.current = { branch_pruned: 0, enqueued: 0, expanded: 0, critical_hits: 0, path_len_reduction: 0, lb_improve_total: 0 }
       // 启动遥测 Run（不阻塞求解）
-      const graphSignature = makeGraphSignature(triangles, palette)
-      let __runId = null
+      graphSignature = makeGraphSignature(triangles, palette)
       try { const __r = await telemetryStartRun(triangles, palette, window.SOLVER_FLAGS); __runId = __r?.runId || null } catch {}
       const telemetrySafeLog = async (payload)=>{ try{ if(__runId) await telemetryLogEvent(__runId, payload) }catch{} }
       // 让出一次事件循环，确保“计算中…”与状态文案先渲染
@@ -1204,6 +1516,8 @@ const contribRef = useRef({ branch_pruned: 0, enqueued: 0, expanded: 0, critical
 
   // 继续计算最短步骤：在已有可行方案基础上，切换到 BFS/Best-First 求全局最短
   const onContinueShortest = useCallback(async () => {
+    let __runId2 = null
+    let graphSignature2 = null
     try {
       if (editMode) { setStatus('请先保存编辑，再继续计算最短步骤'); return }
       if (!steps || steps.length === 0) { setStatus('暂无可行方案，先执行自动求解'); return }
@@ -1213,8 +1527,7 @@ const contribRef = useRef({ branch_pruned: 0, enqueued: 0, expanded: 0, critical
       setProgressLogs([])
       solveStartRef.current = Date.now()
       // 启动遥测 Run（不阻塞）与缓存优先
-      const graphSignature2 = makeGraphSignature(triangles, palette)
-      let __runId2 = null
+      graphSignature2 = makeGraphSignature(triangles, palette)
       try { const __r2 = await telemetryStartRun(triangles, palette, { ...(window.SOLVER_FLAGS||{}), mode: 'continue_shortest' }); __runId2 = __r2?.runId || null } catch {}
       const telemetrySafeLog2 = async (payload)=>{ try{ if(__runId2) await telemetryLogEvent(__runId2, payload) }catch{} }
       // 尝试命中缓存，直接返回
@@ -1253,7 +1566,7 @@ const contribRef = useRef({ branch_pruned: 0, enqueued: 0, expanded: 0, critical
             setBestStartId(cachedStart)
             setStatus(`缓存预览：步骤 ${cachedMin??cachedPath.length}（起点 #${cachedStart}，继续计算中）`)
             setSolveProgress(null)
-            try { await telemetrySafeLog({ status:'cache_preview', min_steps: cachedMin??cachedPath.length, best_start_id: cachedStart, graph_signature: graphSignature2 }) } catch {}
+            try { await telemetrySafeLog2({ status:'cache_preview', min_steps: cachedMin??cachedPath.length, best_start_id: cachedStart, graph_signature: graphSignature2 }) } catch {}
             try { await uploadStrategyAuto(triangles, palette, 'continue_shortest', cachedStart, cachedPath) } catch {}
           } else {
             setStatus('缓存存在但未通过统一性校验，继续计算…')
@@ -1431,6 +1744,8 @@ const contribRef = useRef({ branch_pruned: 0, enqueued: 0, expanded: 0, critical
 
   // 路径优化（反思/压缩）：利用 OptimizeSolution 分析关键节点并尝试缩短
   const onOptimizePath = useCallback(async () => {
+    let __runId3 = null
+    let graphSignature3 = null
     try {
       if (!steps || steps.length === 0) { setStatus('暂无可行方案，先执行自动求解'); return }
       const originalPath = steps[0]?.path
@@ -1441,8 +1756,7 @@ const contribRef = useRef({ branch_pruned: 0, enqueued: 0, expanded: 0, critical
       setProgressLogs([])
       solveStartRef.current = Date.now()
       // 启动遥测 Run（不阻塞）
-      const graphSignature3 = makeGraphSignature(triangles, palette)
-      let __runId3 = null
+      graphSignature3 = makeGraphSignature(triangles, palette)
       try { const __r3 = await telemetryStartRun(triangles, palette, { ...(window.SOLVER_FLAGS||{}), mode: 'optimize_path' }); __runId3 = __r3?.runId || null } catch {}
       const telemetrySafeLog3 = async (payload)=>{ try{ if(__runId3) await telemetryLogEvent(__runId3, payload) }catch{} }
       await new Promise(r=>setTimeout(r,0))
@@ -1925,21 +2239,42 @@ const contribRef = useRef({ branch_pruned: 0, enqueued: 0, expanded: 0, critical
       <div className="panel">
         <h2>画布</h2>
         <div className="canvas-wrap" ref={canvasWrapRef}>
-          <TriangleCanvas
-            key={rotation}
-            ref={canvasRef}
-            grid={grid}
-            triangles={triangles}
-            onClickTriangle={onClickTriangle}
-            selectedIds={selectedIds}
-            rotation={rotation}
-            selectionRect={dragRect}
-            lassoPath={lassoPath}
-            lassoClosed={lassoClosed}
-            onDragStart={onDragStart}
-            onDragMove={onDragMove}
-            onDragEnd={onDragEnd}
-          />
+          {/* 
+             缩放容器：
+             1. 显式设置宽高，撑开父容器的滚动条
+             2. 内置 TriangleCanvas 使用 scale 进行渲染
+             3. 注意处理旋转导致的宽高互换
+          */}
+          <div style={{
+             width: (rotation===90||rotation===270 ? (grid?.height||0) : (grid?.width||0)) * canvasScale,
+             height: (rotation===90||rotation===270 ? (grid?.width||0) : (grid?.height||0)) * canvasScale,
+             // 保证内容居中（当小于视口时）
+             // 移除 flexShrink，使用 margin: auto 在 block 布局下实现居中
+             margin: 'auto'
+          }}>
+            <div style={{ 
+               width: '100%', 
+               height: '100%', 
+               transformOrigin: '0 0',
+               transform: `scale(${canvasScale})` 
+            }}>
+              <TriangleCanvas
+                key={rotation}
+                ref={canvasRef}
+                grid={grid}
+                triangles={triangles}
+                onClickTriangle={onClickTriangle}
+                selectedIds={selectedIds}
+                rotation={rotation}
+                selectionRect={dragRect}
+                lassoPath={lassoPath}
+                lassoClosed={lassoClosed}
+                onDragStart={onDragStart}
+                onDragMove={onDragMove}
+                onDragEnd={onDragEnd}
+              />
+            </div>
+          </div>
         </div>
         <div className="toolbar" style={{ marginTop: '.75rem' }}>
           <button className="primary" onClick={onPaint} disabled={!selectedColor || startId==null}>泼涂</button>
@@ -2023,6 +2358,9 @@ const contribRef = useRef({ branch_pruned: 0, enqueued: 0, expanded: 0, critical
           onAddColorFromPicker={onAddColorFromPicker}
           onCancelPick={onCancelPick}
           onCleanPalette={onCleanPaletteToCanvasColors}
+          onAiRectify={onAiRectify}
+          onExportAiDebug={onExportAiDebug}
+          canExportAiDebug={!!aiSegmentationMap}
         />
         <div className="grid-controls">
           <div className="row">

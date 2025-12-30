@@ -1,21 +1,27 @@
 import { useState } from 'react'
 import PerformanceTuner from './PerformanceTuner.jsx'
 
-export default function Controls({ palette, selectedColor, onSelectColor, onStartAddColorPick, pickMode, onAddColorFromPicker, onCancelPick, onCleanPalette }) {
+export default function Controls({ palette, selectedColor, onSelectColor, onStartAddColorPick, pickMode, onAddColorFromPicker, onCancelPick, onCleanPalette, onAiRectify, onExportAiDebug, canExportAiDebug }) {
   const [showTuner, setShowTuner] = useState(false)
+
   return (
     <div>
       <div style={{ marginBottom: '.5rem', color: '#a9b3c9', display:'flex', alignItems:'center', justifyContent:'space-between' }}>
         <span>颜色</span>
         <div style={{ display:'flex', gap:'.5rem' }}>
-          <button onClick={onStartAddColorPick} style={{ padding: '.25rem .5rem', borderRadius: '6px', border: '1px solid var(--border)', background: pickMode? '#26417a':'#1a1f2b', color: 'var(--text)' }}>
-            {pickMode? '添加颜色中…（点击色带）' : '添加颜色'}
+          <div style={{ display: 'flex', gap: '2px' }}>
+            <button onClick={onAiRectify} style={{ padding: '.25rem .5rem', borderRadius: '6px', border: '1px solid var(--border)', background: 'linear-gradient(135deg, #6366f1 0%, #a855f7 100%)', color: '#fff', fontWeight:'bold' }} title="使用本地几何算法优化边界">
+              ✨ 几何校准
+            </button>
+          </div>
+          <button onClick={onStartAddColorPick} disabled={pickMode} style={{ padding: '.25rem .5rem', borderRadius: '6px', border: '1px solid var(--border)', background: pickMode ? '#374151' : 'var(--bg)', color: pickMode ? '#9ca3af' : 'var(--text)' }} title="添加新颜色">
+            {pickMode ? '正在取色...' : '+ 添加颜色'}
           </button>
-          <button onClick={onCleanPalette} style={{ padding: '.25rem .5rem', borderRadius: '6px', border: '1px solid var(--border)', background: '#1a1f2b', color: 'var(--text)' }} title="清理：仅保留当前画布出现的颜色">
-            清理调色板
+          <button onClick={onCleanPalette} style={{ padding: '.25rem .5rem', borderRadius: '6px', border: '1px solid var(--border)', background: 'var(--bg)', color: 'var(--text)' }} title="清理调色板">
+            清理
           </button>
-          <button onClick={()=>setShowTuner(true)} style={{ padding: '.25rem .5rem', borderRadius: '6px', border: '1px solid var(--border)', background: '#1a1f2b', color: 'var(--text)' }} title="调整自动求解的性能参数">
-            性能调节
+          <button onClick={() => setShowTuner(true)} style={{ padding: '.25rem .5rem', borderRadius: '6px', border: '1px solid var(--border)', background: 'var(--bg)', color: 'var(--text)' }} title="打开求解器性能设置">
+            ⚙️ 性能
           </button>
         </div>
       </div>

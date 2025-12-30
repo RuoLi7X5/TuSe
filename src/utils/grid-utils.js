@@ -206,59 +206,236 @@ export function buildTriangleGridVertical(width, height, side) {
 
 export function denoiseGrid(triangles) {
   const idToIndex = new Map(triangles.map((t, i) => [t.id, i]))
-  const colorLabCache = new Map()
 
-  const getLab = (c) => {
-    if (!colorLabCache.has(c)) colorLabCache.set(c, hex2lab(c))
-    return colorLabCache.get(c)
-  }
-
-  // 迭代 2 次以传播修正，消除孤立噪点
-  for (let iter = 0; iter < 2; iter++) {
+  // 阶段一：局部去噪（基于邻居颜色投票）
+  // 规则更新：
+  // 1. 内部三角形 (3邻居): 
+  //    - 必须没有同色邻居 (User: "只有两个是B色，一个是A色...不能被同化")
+  //    - 允许 2B+1C 的情况同化为 B (User: "两个B，一个C时也同化为B")
+  //    - 当然也包含 3B 的情况
+  // 2. 边界三角形 (2邻居):
+  //    - 只要没有同色邻居，就同化 (User: "边界上...周围不存在与自身颜色相同的...就被同化")
+  
+  const MAX_ITER = 50
+  for (let iter = 0; iter < MAX_ITER; iter++) {
     const updates = []
+    let hasChange = false
+
     for (const t of triangles) {
       if (t.deleted || t.color === 'transparent') continue
-
+      
       const neighbors = t.neighbors.map(nid => triangles[idToIndex.get(nid)])
         .filter(n => n && !n.deleted && n.color !== 'transparent')
       
       if (neighbors.length === 0) continue
 
-      const counts = new Map()
-      for (const n of neighbors) {
-        counts.set(n.color, (counts.get(n.color) || 0) + 1)
-      }
-
-      let bestColor = null
+      const selfColor = t.color
+      const counts = {}
       let maxCount = 0
-      for (const [c, count] of counts.entries()) {
-        if (count > maxCount) {
-          maxCount = count
-          bestColor = c
+      let maxColor = null
+      let hasSelf = false
+
+      for (const n of neighbors) {
+        const c = n.color
+        if (c === selfColor) hasSelf = true
+        counts[c] = (counts[c] || 0) + 1
+        if (counts[c] > maxCount) {
+          maxCount = counts[c]
+          maxColor = c
         }
       }
 
-      // 规则：如果众数颜色占比超过 50%（绝对多数），且色差较小，则同化
-      if (maxCount > neighbors.length * 0.5 && bestColor !== t.color) {
-        const labCurrent = getLab(t.color)
-        const labBest = getLab(bestColor)
-        const dist = distLab(labCurrent, labBest)
-        // 阈值 20：足够容忍同色系的微小差异，但保留明显的边界
-        if (dist < 20) {
-          updates.push({ index: idToIndex.get(t.id), color: bestColor })
+      // 核心原则：只要邻居里有“自己人”，就绝不同化，保留细节
+      if (hasSelf) continue
+
+      // 此时 t 已经被异色完全包围 (neighbors 都不等于 selfColor)
+      
+      if (neighbors.length === 3) {
+        // 内部三角形
+        // 规则：2B+1C -> B; 3B -> B
+        // 即：优势颜色的数量 >= 2
+        if (maxCount >= 2) {
+          updates.push({ index: idToIndex.get(t.id), color: maxColor })
+          hasChange = true
+        }
+      } else if (neighbors.length <= 2) {
+        // 边界三角形 (2个或1个邻居)
+        // 规则：只要被异色包围（hasSelf=false），就同化
+        if (maxColor) {
+          updates.push({ index: idToIndex.get(t.id), color: maxColor })
+          hasChange = true
         }
       }
     }
 
-    if (updates.length === 0) break
+    if (!hasChange) break
+    
+    // 应用更新
     for (const u of updates) {
       triangles[u.index].color = u.color
     }
   }
+
   return triangles
 }
 
-export async function mapImageToGrid(bitmap, grid, palette) {
+// 移除小连通区域（岛屿去除）
+// 针对用户需求：把被异色包围的区域同化。
+// 用户强调：必须是严格包围。即外部所有邻居必须是同一种颜色。
+export function removeSmallComponents(triangles, minSize = 4) {
+  const n = triangles.length
+  const idToIndex = new Map(triangles.map((t, i) => [t.id, i]))
+  let hasChange = false
+
+  // 反复迭代直到稳定，防止一次合并产生新的小岛屿
+  for (let iter = 0; iter < 10; iter++) {
+    let iterChange = false
+    
+    // 1. 构建连通分量
+    const uf = new UnionFind(n)
+    for (let i = 0; i < n; i++) {
+      const t = triangles[i]
+      if (t.deleted || t.color === 'transparent') continue
+      for (const nid of t.neighbors) {
+        const j = idToIndex.get(nid)
+        if (j !== undefined) {
+          const nt = triangles[j]
+          if (!nt.deleted && nt.color !== 'transparent' && nt.color === t.color) {
+            uf.union(i, j)
+          }
+        }
+      }
+    }
+
+    // 2. 统计每个分量的大小和成员
+    const compMembers = new Map() // root -> [indices]
+    for (let i = 0; i < n; i++) {
+      const t = triangles[i]
+      if (t.deleted || t.color === 'transparent') continue
+      const root = uf.find(i)
+      if (!compMembers.has(root)) compMembers.set(root, [])
+      compMembers.get(root).push(i)
+    }
+
+    // 3. 处理小分量
+    const updates = []
+    for (const [root, members] of compMembers) {
+      if (members.length < minSize) {
+        // 这是一个小岛屿，需要同化
+        // 收集所有成员的外部邻居颜色
+        const neighborColors = new Set()
+        for (const idx of members) {
+          const t = triangles[idx]
+          for (const nid of t.neighbors) {
+            const j = idToIndex.get(nid)
+            if (j !== undefined) {
+              const nt = triangles[j]
+              // 邻居必须不在当前分量内
+              if (uf.find(j) !== root && !nt.deleted && nt.color !== 'transparent') {
+                neighborColors.add(nt.color)
+              }
+            }
+          }
+        }
+
+        // 严格规则：只有当外部邻居仅有 1 种颜色时才同化
+        // 如果外部有两种或以上颜色（例如夹在色块A和B之间），则不动，避免错误同化
+        if (neighborColors.size === 1) {
+          const bestColor = neighborColors.values().next().value
+          for (const idx of members) {
+            updates.push({ index: idx, color: bestColor })
+          }
+          iterChange = true
+        }
+      }
+    }
+
+    // 应用更新
+    for (const u of updates) {
+      triangles[u.index].color = u.color
+    }
+
+    if (iterChange) hasChange = true
+    else break // 稳定了
+  }
+
+  return hasChange
+}
+
+// 拓扑修复：强制执行“顶点最多3色交汇”的约束
+// 因为三角形网格中，任意内部顶点有6个三角形交汇。如果交汇的颜色超过3种，说明拓扑过于破碎，不符合物理/游戏规则。
+function rectifyGridTopology(triangles) {
+  const idToIndex = new Map(triangles.map((t, i) => [t.id, i]))
+  
+  // 1. 构建 顶点 -> 三角形列表 的映射
+  // 坐标取整以避免浮点误差
+  const vKey = (v) => `${Math.round(v.x)},${Math.round(v.y)}`
+  const vertMap = new Map() // key -> [triId, triId, ...]
+  
+  for (const t of triangles) {
+    if (t.deleted || t.color === 'transparent') continue
+    for (const v of t.vertices) {
+      const k = vKey(v)
+      if (!vertMap.has(k)) vertMap.set(k, [])
+      vertMap.get(k).push(t.id)
+    }
+  }
+
+  const updates = new Map() // index -> newColor
+
+  // 2. 遍历所有顶点，检查颜色数量
+  for (const [key, triIds] of vertMap) {
+    if (triIds.length < 4) continue // 边界顶点或少于4个邻居的不用管
+
+    const colors = new Map() // color -> count
+    for (const tid of triIds) {
+      const idx = idToIndex.get(tid)
+      const t = triangles[idx]
+      const c = t.color
+      colors.set(c, (colors.get(c) || 0) + 1)
+    }
+
+    // 用户需求变更：顶点处最多允许6种颜色交汇
+    // 在三角网格中，内部顶点最多有6个邻居，因此 > 6 实际上永远不会触发（除非有重叠等异常）
+    // 这实际上取消了对顶点颜色数量的强制简化约束，允许更丰富的细节。
+    if (colors.size > 6) {
+      // 违反约束：超过6种颜色
+      const sortedColors = [...colors.entries()].sort((a, b) => b[1] - a[1]) // count desc
+      const keepColors = new Set(sortedColors.slice(0, 6).map(x => x[0]))
+      const targetColor = sortedColors[0][0] // 默认同化为最优势颜色
+
+      for (const tid of triIds) {
+        const idx = idToIndex.get(tid)
+        const t = triangles[idx]
+        if (!keepColors.has(t.color)) {
+          updates.set(idx, targetColor)
+        }
+      }
+    }
+  }
+
+  // 应用修改
+  if (updates.size > 0) {
+    for (const [idx, color] of updates) {
+      triangles[idx].color = color
+    }
+    return true // 发生了变化
+  }
+  return false
+}
+
+// 边界平滑：消除锯齿（Straighten Edges）
+// 针对“锯齿”现象（例如 1-pixel 宽度的突出），进行平滑
+function smoothBoundaries(triangles) {
+  // 用户反馈：只有当三角形被 3 个同色邻居完全包围时才同化
+  // smoothBoundaries 原有的 "2个邻居同色就同化" 规则过于激进，导致错误同化
+  // 因此这里直接返回 false，不做任何操作。
+  // 严格的去噪逻辑已完全由 denoiseGrid 和 removeSmallComponents 接管。
+  return false
+}
+
+export async function mapImageToGrid(bitmap, grid, palette, options = {}) {
+  const { aiSegmentation, aiScale, rectifyMode, applyDenoise = true } = options
   const canvas = document.createElement('canvas')
   canvas.width = bitmap.width; canvas.height = bitmap.height
   const ctx = canvas.getContext('2d')
@@ -285,6 +462,48 @@ export async function mapImageToGrid(bitmap, grid, palette) {
     return [L/wsum, a/wsum, b/wsum]
   }
 
+  // 辅助：获取 AI 掩码颜色
+  // 如果提供了 aiSegmentation，则尝试查询某个点所在的分割区域的平均色
+  // 目前我们只从原图采样，但利用 mask 聚合
+  // 由于 mask 结构复杂，这里简化逻辑：
+  // 我们直接让每个三角形去“投票”它覆盖的 mask 区域
+  // 如果一个三角形主要落在 Mask A，则它应该使用 Mask A 的代表色
+  
+  // 预处理 AI Mask (SAM Raw Output)
+  // aiSegmentation 结构: { type: 'sam_raw', results: [ { point, maskRaw, scores }, ... ], maskSize: 256, originalSize }
+  let maskColors = new Map() // maskIndex (in results array) -> averageLab
+  let samResults = null
+  let maskW = 256, maskH = 256 // SAM default output size
+  let origW = bitmap.width, origH = bitmap.height
+  
+  if (aiSegmentation && aiSegmentation.type === 'sam_raw' && aiSegmentation.results) {
+    try {
+      samResults = aiSegmentation.results
+      maskW = aiSegmentation.maskSize || 256
+      maskH = aiSegmentation.maskSize || 256
+      origW = aiSegmentation.originalSize?.width || bitmap.width
+      origH = aiSegmentation.originalSize?.height || bitmap.height
+      
+      // 为每个 Mask 计算其代表颜色（通过采样原图）
+      // 由于 SAM Mask 是 256x256 的 logits，我们需要先解码
+      // 为了性能，我们不在这里做昂贵的全图解码
+      // 而是：只对每个 Mask 的正样本区域进行稀疏采样
+      
+      samResults.forEach((res, idx) => {
+        // res.point 是 prompt 点，包含 color (Hex)
+        // 我们直接信任这个 prompt 点的颜色作为该 mask 的代表色
+        // 因为这些点是基于当前网格的最大连通区域计算出来的，颜色是可靠的
+        if (res.point && res.point.color) {
+          maskColors.set(idx, hex2lab(res.point.color))
+        }
+      })
+      
+    } catch (e) {
+      console.warn('AI mask processing failed:', e)
+      samResults = null
+    }
+  }
+
   const insidePoint = (p, c, alpha=0.15) => ({ x: p.x*(1-alpha)+c.x*alpha, y: p.y*(1-alpha)+c.y*alpha })
   const midPoint = (a, b) => ({ x: (a.x+b.x)/2, y: (a.y+b.y)/2 })
 
@@ -292,7 +511,95 @@ export async function mapImageToGrid(bitmap, grid, palette) {
     const c = t.drawCentroid || t.centroid
     const verts = t.drawVertices || t.vertices
     const v0=verts[0], v1=verts[1], v2=verts[2]
-    // 采样点分布：质心 + 顶点内缩 + 边中点内缩
+    
+    // AI 路径：SAM (如果处于校准模式或已就绪)
+    if (samResults && maskColors.size > 0) {
+      // 采样三角形中心点
+      // 坐标映射：Tri (orig size) -> Mask (256x256)
+      // 注意：App.jsx 传入的 aiScale 已经作用于 prompts，但这里我们需要将三角形坐标映射到 mask 空间
+      // SAM 的 mask 是相对于原图（输入给 SAM 的图）的。
+      // App.jsx 中：offCanvas 尺寸为 w, h (缩放后的)。aiSegmentation.originalSize 记录的是这个尺寸。
+      // 而 grid 是基于原图 bitmap 的。
+      // 所以我们需要两步缩放： Grid -> OffCanvas (aiScale) -> Mask (256x256)
+      
+      const scaleX = maskW / origW
+      const scaleY = maskH / origH
+      
+      // 采样点：中心点 + 3个顶点 + 中点 (增强采样密度，避免小三角形漏网)
+      const pts = [
+          c, v0, v1, v2,
+          midPoint(v0, v1), midPoint(v1, v2), midPoint(v2, v0)
+      ]
+      
+      // 投票：看哪个 Mask 在这些点上的 logit 值最大
+      // 注意：SAM 返回的是 logits，> 0 表示前景
+      let bestMaskIdx = -1
+      let maxVote = -Infinity
+      let totalHit = 0
+      
+      // 遍历所有 masks (通常只有 4-10 个颜色种类)
+      for (let i = 0; i < samResults.length; i++) {
+        const maskObj = samResults[i].maskRaw
+        const maskData = maskObj?.data 
+        if (!maskData) continue
+        
+        // 使用每个 Mask 自己的尺寸
+        const mW = maskObj.width || maskW
+        const mH = maskObj.height || maskH
+        
+        // 重新计算缩放比例：Grid -> OffCanvas (aiScale) -> Mask (mW, mH)
+        const sX = mW / origW
+        const sY = mH / origH
+
+        let score = 0
+        let hit = 0
+        for (const p of pts) {
+          // 坐标变换
+          const mx = Math.floor(p.x * aiScale * sX)
+          const my = Math.floor(p.y * aiScale * sY)
+          
+          if (mx >= 0 && mx < mW && my >= 0 && my < mH) {
+            const val = maskData[my * mW + mx]
+            if (val > 0) {
+              score += val // 累加 logit/binary 作为置信度
+              hit++
+            }
+          }
+        }
+        
+        // 记录最佳匹配
+        if (hit > 0 && score > maxVote) {
+          maxVote = score
+          bestMaskIdx = i
+          totalHit = hit
+        }
+      }
+      
+      // 决策：
+      // 如果处于 rectifyMode (强力纠正)，只要有命中就采纳
+      // 否则，需要较高的置信度（例如至少一半的采样点命中）
+      const threshold = rectifyMode ? 1 : Math.ceil(pts.length * 0.4)
+      
+      // 核心修正：当 AI 识别出有效 Mask 时，强制信任 AI 的边界。
+      // 即便只有部分点命中（例如边界上的三角形），只要命中了高置信度的 Mask，就应该被吸附过去。
+      // 这能解决“应该紧贴边界却被错误联通”的问题。
+      if (bestMaskIdx !== -1 && totalHit >= threshold && maskColors.has(bestMaskIdx)) {
+        // 如果是 rectifyMode，我们额外检查：
+        // 如果当前三角形位于两个 Mask 的交界处（即存在竞争），我们应该选择得分更高的那个。
+        // 上面的逻辑已经选择了 maxVote，但为了防止“粘连”，我们需要确保这个 vote 足够显著。
+        
+        // 针对用户反馈的“错误联通”问题：
+        // 往往是因为某些边缘像素被错误归类到了相邻的大色块。
+        // 这里我们引入一个“排他性”检查：如果一个三角形同时命中了多个 Mask，
+        // 我们只在它们分数差异明显时才切换，否则保持原样或更谨慎处理？
+        // 不，AI 的 Mask 应该是权威的。如果 AI 说它是红色，它就该是红色。
+        // 问题可能出在 Mask 本身的精度（缩放损失）或者采样点不足。
+        
+        return { ...t, meanLab: maskColors.get(bestMaskIdx) }
+      }
+    }
+
+    // 传统路径：采样点分布 + 密度聚类
     const pts = [
       c,
       insidePoint(v0, c, 0.20),
@@ -355,7 +662,35 @@ export async function mapImageToGrid(bitmap, grid, palette) {
   })
   
   // 3. 后处理：去噪（孤立点消除）
-  return denoiseGrid(finalTriangles)
+  // 如果使用了 AI 校准，则跳过传统去噪（applyDenoise=false），因为 AI 已经保证了语义一致性，且避免“同化”逻辑破坏 AI 的涂色
+  if (applyDenoise) {
+    denoiseGrid(finalTriangles)
+    
+    // 新增：强力去除小岛屿（Assimilation）
+    // 按照用户要求：把被异色包围的单独三角形（或极小区域）同化
+    // 阈值设为 4，意味着大小为 1, 2, 3 的孤立区域都会被同化
+    removeSmallComponents(finalTriangles, 4)
+  }
+
+  // 4. 新增：拓扑修复与边界平滑（针对 AI 校准后的进一步几何优化）
+  // 反复迭代直到稳定，优先平滑，再修复拓扑
+  for(let i=0; i<10; i++) {
+     let changed = false
+     // 修复拓扑（顶点最多6色，防止极端破碎）
+     if (rectifyGridTopology(finalTriangles)) changed = true
+     
+     // 仅在允许去噪（非 AI 强力校准）模式下执行同化逻辑
+     if (applyDenoise) {
+       // 再次去除可能产生的小岛屿（坚持严格的同化规则）
+       if (removeSmallComponents(finalTriangles, 3)) changed = true
+       // 局部去噪（坚持严格的 3B->B, 2B+1C->B 规则）
+       if (denoiseGrid(finalTriangles)) changed = true
+     }
+     
+     if (!changed) break
+  }
+
+  return finalTriangles
 }
 
 function lab2rgb(L, a, b) {
@@ -473,4 +808,124 @@ export function colorFrequency(triangles) {
     freq.set(t.color, (freq.get(t.color) || 0) + 1)
   }
   return freq
+}
+
+// 生成 AI 调试图像（可视化 Masks 和 Prompts）
+export async function generateAiDebugImage(bitmap, aiSegmentation) {
+  if (!aiSegmentation || !aiSegmentation.results) return null
+
+  const w = bitmap.width
+  const h = bitmap.height
+  const canvas = document.createElement('canvas')
+  canvas.width = w
+  canvas.height = h
+  const ctx = canvas.getContext('2d')
+
+  // 1. 背景处理：保持透明
+  // 用户要求：不需要纯黑背景，也不需要原图，只保留 AI 识别的色块拼凑
+  ctx.clearRect(0, 0, w, h)
+  
+  // 2. 绘制 Masks
+  
+  if (aiSegmentation.results.length === 0) {
+    ctx.fillStyle = 'red'
+    ctx.font = '24px sans-serif'
+    ctx.fillText('NO AI RESULTS', 20, 50)
+    
+    // 尝试绘制错误信息
+    if (aiSegmentation.errors && aiSegmentation.errors.length > 0) {
+        ctx.fillStyle = 'orange'
+        ctx.font = '14px monospace'
+        let y = 80
+        aiSegmentation.errors.slice(0, 10).forEach(err => {
+            const msg = `${err.color}: ${err.error}`
+            ctx.fillText(msg.substring(0, 60), 20, y)
+            y += 20
+        })
+    }
+    
+    return canvas.toDataURL('image/png')
+  }
+
+  aiSegmentation.results.forEach((res, idx) => {
+    if (!res.maskRaw || !res.maskRaw.data) return
+
+    // 使用每个 Mask 自己的尺寸
+    const mW = res.maskRaw.width
+    const mH = res.maskRaw.height
+    
+    // 离屏 Canvas 用于处理当前 Mask
+    const maskCanvas = document.createElement('canvas')
+    maskCanvas.width = mW
+    maskCanvas.height = mH
+    const mCtx = maskCanvas.getContext('2d')
+    const mImgData = mCtx.createImageData(mW, mH)
+
+    // 使用 Prompt 的颜色（用户调色板颜色）
+    // 如果没有颜色，回退到红色
+    const hex = res.point?.color || '#ff0000'
+    const r = parseInt(hex.slice(1, 3), 16)
+    const g = parseInt(hex.slice(3, 5), 16)
+    const b = parseInt(hex.slice(5, 7), 16)
+
+    const data = res.maskRaw.data // Float32Array or Uint8Array
+    const pixels = mImgData.data
+
+    // 填充 Mask 像素
+    for (let i = 0; i < mW * mH; i++) {
+      const val = data[i]
+      const isForeground = (val > 0) 
+      
+      const pIdx = i * 4
+      if (isForeground) {
+        pixels[pIdx] = r
+        pixels[pIdx + 1] = g
+        pixels[pIdx + 2] = b
+        pixels[pIdx + 3] = 255 // 完全不透明，展示“色块化”效果
+      } else {
+        pixels[pIdx + 3] = 0 
+      }
+    }
+
+    mCtx.putImageData(mImgData, 0, 0)
+    
+    // 绘制放大后的 Mask 到主画布
+    // 这一步将产生“色块拼图”效果，即用户想要的“标准模板”
+    ctx.imageSmoothingEnabled = false 
+    ctx.drawImage(maskCanvas, 0, 0, w, h)
+  })
+
+  // 3. 绘制 Prompt Points
+  const scale = w / (aiSegmentation.originalSize?.width || w) // aiScale 已经用于 prompts 吗？
+  // 注意：aiSegmentation.results 中的 point 是原始 prompt 点
+  // 在 App.jsx 中生成 prompt 时，坐标是基于缩放后的 offCanvas (aiScale)
+  // aiSegmentationMap 中保存了 aiScale。
+  // 如果 bitmap 是原图，我们需要把 prompt 坐标 / aiScale 还原回原图坐标
+  
+  const aiScale = aiSegmentation.aiScale || 1
+  
+  aiSegmentation.results.forEach((res, idx) => {
+    if (!res.point) return
+    const p = res.point
+    
+    // 还原坐标
+    const cx = p.x / aiScale
+    const cy = p.y / aiScale
+    
+    // 绘制点
+    ctx.beginPath()
+    ctx.arc(cx, cy, 5, 0, Math.PI * 2)
+    ctx.fillStyle = 'white'
+    ctx.fill()
+    ctx.lineWidth = 2
+    ctx.strokeStyle = 'black'
+    ctx.stroke()
+    
+    // 绘制索引/颜色标记
+    ctx.fillStyle = 'white'
+    ctx.font = '12px sans-serif'
+    ctx.fillText(`#${idx}`, cx + 8, cy)
+  })
+
+  return canvas.toDataURL('image/png')
 }

@@ -14,6 +14,13 @@ export default defineConfig({
         // 路径重写到 v1/chat/completions
         rewrite: (path) => path.replace(/^\/api\/deepseek$/, '/v1/chat/completions'),
       },
+      // Cloudflare AI 代理
+      '/api/cloudflare': {
+        target: 'https://api.cloudflare.com',
+        changeOrigin: true,
+        secure: true,
+        rewrite: (path) => path.replace(/^\/api\/cloudflare/, ''),
+      },
     },
   },
 })
