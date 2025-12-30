@@ -15,7 +15,7 @@ function transformPoint(pt, grid, rotation){
   return { x: pt.x, y: pt.y }
 }
 
-function draw(ctx, grid, triangles, selectedIds, rotation, selectionRect, lassoPath, lassoClosed) {
+function draw(ctx, grid, triangles, selectedIds, rotation, selectionRect, lassoPath, lassoClosed, resolutionScale = 1) {
   if (!ctx) return
   ctx.clearRect(0, 0, ctx.canvas.width, ctx.canvas.height)
   const isSelected = (id)=> Array.isArray(selectedIds) && selectedIds.includes(id)
@@ -23,6 +23,11 @@ function draw(ctx, grid, triangles, selectedIds, rotation, selectionRect, lassoP
   ctx.lineJoin = 'round'
   ctx.lineCap = 'round'
   ctx.miterLimit = 2
+
+  // 计算动态线宽：随分辨率升高（scale增大）而变细，避免高密度下网格显得过黑
+  // 限制最小线宽为 0.2，避免在某些屏幕上消失
+  const baseLineWidth = Math.max(0.2, 1 / resolutionScale)
+  const selectedLineWidth = Math.max(0.5, 2 / resolutionScale)
 
   // 第一轮：仅填充颜色，不描边
   for (const t of triangles) {
@@ -41,7 +46,7 @@ function draw(ctx, grid, triangles, selectedIds, rotation, selectionRect, lassoP
   }
 
   // 第二轮：非选中三角形基础轮廓（黑色，细线）
-  ctx.lineWidth = 1
+  ctx.lineWidth = baseLineWidth
   ctx.strokeStyle = '#000000'
   for (const t of triangles) {
     if (t.deleted || t.color === 'transparent') continue
@@ -59,7 +64,7 @@ function draw(ctx, grid, triangles, selectedIds, rotation, selectionRect, lassoP
   }
 
   // 第三轮：选中三角形高亮轮廓（统一宽度与颜色，置于最上层）
-  ctx.lineWidth = 2
+  ctx.lineWidth = selectedLineWidth
   ctx.strokeStyle = '#4f8df7'
   for (const t of triangles) {
     if (t.deleted || t.color === 'transparent') continue
@@ -137,7 +142,7 @@ function pointInPolygon(p, verts) {
   return inside
 }
 
-export default forwardRef(function TriangleCanvas({ grid, triangles, onClickTriangle, selectedIds, rotation=0, selectionRect, lassoPath, lassoClosed, onDragStart, onDragMove, onDragEnd }, ref) {
+export default forwardRef(function TriangleCanvas({ grid, triangles, onClickTriangle, selectedIds, rotation=0, selectionRect, lassoPath, lassoClosed, onDragStart, onDragMove, onDragEnd, resolutionScale=1 }, ref) {
   useEffect(() => {
     if (!ref?.current || !grid) return
     const canvas = ref.current
@@ -150,8 +155,8 @@ export default forwardRef(function TriangleCanvas({ grid, triangles, onClickTria
       canvas.height = grid.height
     }
     const ctx = canvas.getContext('2d')
-    draw(ctx, grid, triangles, selectedIds, rotation, selectionRect, lassoPath, lassoClosed)
-  }, [grid, triangles, selectedIds, rotation, selectionRect, lassoPath, lassoClosed])
+    draw(ctx, grid, triangles, selectedIds, rotation, selectionRect, lassoPath, lassoClosed, resolutionScale)
+  }, [grid, triangles, selectedIds, rotation, selectionRect, lassoPath, lassoClosed, resolutionScale])
 
   useEffect(() => {
     if (!ref?.current) return

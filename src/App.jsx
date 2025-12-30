@@ -2272,6 +2272,7 @@ const contribRef = useRef({ branch_pruned: 0, enqueued: 0, expanded: 0, critical
                 onDragStart={onDragStart}
                 onDragMove={onDragMove}
                 onDragEnd={onDragEnd}
+                resolutionScale={resolutionScale}
               />
             </div>
           </div>
