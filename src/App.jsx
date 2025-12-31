@@ -1732,13 +1732,53 @@ const contribRef = useRef({ branch_pruned: 0, enqueued: 0, expanded: 0, critical
         try { if(__runId) await telemetryFinishRun(__runId, { status: result?.timedOut ? 'timeout' : 'no_solution', min_steps: 0, best_start_id: result?.bestStartId ?? null, time_ms: Date.now() - solveStartRef.current, graph_signature: graphSignature }) } catch {}
         return
       }
-      const stepImgs = []
       const SNAPSHOT_LIMIT = 40
+      const stepImgs = []
+      // 避免在主线程进行大量 Canvas 绘制，减少白屏风险
+      // 实际上 captureCanvasPNG 是同步的，如果 path 很长或分支多，会卡死 UI
+      // 优化：每生成一个分支的快照后，强制让出主线程
       for (const path of unifiedPaths) {
-        setStatus(`正在生成步骤快照… (${stepImgs.length+1}/${result.paths.length})`)
-        const snapshots = await captureCanvasPNG(canvasRef.current, triangles, result.bestStartId, path.slice(0, SNAPSHOT_LIMIT))
-        stepImgs.push({ path, images: snapshots })
-        await new Promise(r=>setTimeout(r,0))
+        // 分批生成快照，不要一次性生成全部 40 张
+        // 实际上 captureCanvasPNG 目前是一次性生成全部，我们可以让它只生成关键帧，或者分片
+        // 这里暂时保持逻辑，但增加更频繁的 yield
+        
+        setStatus(`正在生成步骤快照… (${stepImgs.length+1}/${unifiedPaths.length})`)
+        // 使用 await 确保状态更新有机会渲染
+        await new Promise(r => setTimeout(r, 10))
+        
+        // 注意：captureCanvasPNG 现在只返回最后一张图作为“结果预览”？
+        // 不，根据 solver.js 的逻辑，它只返回一张图。
+        // 如果需要每一步的快照，captureCanvasPNG 需要修改，或者在这里循环调用
+        // 之前的逻辑似乎是 captureCanvasPNG 返回一个数组？
+        // 让我们检查 solver.js 的实现...
+        // 刚刚修改的 captureCanvasPNG 接收 steps 参数，并在内部循环 apply，但只 draw 一次（最后状态）。
+        // 这意味着它只返回一张图片（DataURL string），而不是数组。
+        // 但 StepsPanel 期望 images 是一个数组 (branch.images.map)。
+        // 这就是 "branch.images.map is not a function" 的原因！
+        // captureCanvasPNG 返回的是 string，str.map 当然报错。
+        
+        // 修正方案：
+        // 1. 我们需要生成一系列图片。
+        // 2. 在这里循环调用 captureCanvasPNG，或者修改 captureCanvasPNG 让它返回数组。
+        // 为了性能，我们只生成关键帧（例如每步一张，或者首尾+中间）。
+        // 鉴于性能压力，我们改为：只生成【初始状态】、【每一步的状态】。
+        
+        const snapshots = []
+        // 初始状态
+        snapshots.push(await captureCanvasPNG(triangles, canvasRef.current.width, canvasRef.current.height, result.bestStartId, []))
+        
+        // 生成每一步的快照 (限制数量)
+        let currentPath = []
+        for(let k=0; k<Math.min(path.length, SNAPSHOT_LIMIT); k++){
+           currentPath.push(path[k])
+           // 每隔几步生成一张，或者每步都生成（如果不想卡死，建议每步生成）
+           // 但这非常慢。
+           // 暂时每步生成
+           snapshots.push(await captureCanvasPNG(triangles, canvasRef.current.width, canvasRef.current.height, result.bestStartId, currentPath))
+           if(k % 5 === 0) await new Promise(r=>setTimeout(r,0)) 
+        }
+        
+        stepImgs.push({ path: path, images: snapshots })
       }
       setSteps(stepImgs)
       setBestStartId(result.bestStartId ?? null)

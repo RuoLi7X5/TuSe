@@ -31,16 +31,63 @@ export function floodFillRegion(triangles, startId, targetColor) {
   return { newColors, changedIds: region }
 }
 
-export function captureCanvasPNG(triangles, width, height) {
+export function captureCanvasPNG(triangles, width, height, startId=null, steps=null) {
   const canvas = document.createElement('canvas')
   canvas.width = width
   canvas.height = height
   const ctx = canvas.getContext('2d')
   ctx.fillStyle = '#fff'
   ctx.fillRect(0, 0, width, height)
+  
+  // Clone current state if steps provided to simulate
+  let currentColors = null
+  if(steps && startId!=null){
+    currentColors = new Map(triangles.map(t=>[t.id, t.color]))
+    // Simple simulation (inefficient but works for snapshots)
+    const idToIndex = new Map(triangles.map((t,i)=>[t.id,i]))
+    const neighbors = triangles.map(t=>t.neighbors)
+    let region = new Set([startId])
+    // expand initial region
+    const startC = currentColors.get(startId)
+    const q=[startId]; const visited=new Set([startId])
+    while(q.length){
+      const u=q.shift(); const idx=idToIndex.get(u)
+      if(idx!=null){
+        for(const v of neighbors[idx]){
+          if(!visited.has(v)){
+            visited.add(v)
+            if(currentColors.get(v)===startC){
+              region.add(v); q.push(v)
+            }
+          }
+        }
+      }
+    }
+    
+    // apply steps
+    for(const color of steps){
+       for(const id of region) currentColors.set(id, color)
+       // expand
+       const q2=[...region]; const visited2=new Set([...region])
+       while(q2.length){
+         const u=q2.shift(); const idx=idToIndex.get(u)
+         if(idx!=null){
+           for(const v of neighbors[idx]){
+             if(!visited2.has(v)){
+                visited2.add(v)
+                if(currentColors.get(v)===color){
+                   region.add(v); q2.push(v)
+                }
+             }
+           }
+         }
+       }
+    }
+  }
+
   for(const t of triangles){
     if(t.deleted || t.color==='transparent') continue
-    ctx.fillStyle = t.color
+    ctx.fillStyle = currentColors ? (currentColors.get(t.id)||t.color) : t.color
     ctx.beginPath()
     const v = t.drawVertices || t.vertices
     ctx.moveTo(v[0].x, v[0].y)
