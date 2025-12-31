@@ -32,27 +32,15 @@ export function floodFillRegion(triangles, startId, targetColor) {
 }
 
 export function captureCanvasPNG(triangles, width, height, startId=null, steps=null) {
-  // Auto-expand canvas to fit triangles if they exceed provided dimensions
-  // This prevents clipping at the right/bottom edges due to floating point rounding or grid overflow
-  let effectiveWidth = width
-  let effectiveHeight = height
-  
-  for (const t of triangles) {
-    if (t.deleted || t.color === 'transparent') continue
-    const v = t.drawVertices || t.vertices
-    for (const p of v) {
-      if (p.x > effectiveWidth) effectiveWidth = p.x
-      if (p.y > effectiveHeight) effectiveHeight = p.y
-    }
-  }
-  
   const canvas = document.createElement('canvas')
-  canvas.width = Math.ceil(effectiveWidth)
-  canvas.height = Math.ceil(effectiveHeight)
+  // Use exact width/height to match the main canvas logic.
+  // The main canvas clips content naturally.
+  canvas.width = width
+  canvas.height = height
   const ctx = canvas.getContext('2d')
   
-  // Use transparent background instead of white to avoid "white triangle" confusion
-  ctx.clearRect(0, 0, canvas.width, canvas.height)
+  // Use transparent background
+  ctx.clearRect(0, 0, width, height)
   
   // Clone current state if steps provided to simulate
   let currentColors = null
@@ -103,13 +91,22 @@ export function captureCanvasPNG(triangles, width, height, startId=null, steps=n
   for(const t of triangles){
     if(t.deleted || t.color==='transparent') continue
     ctx.fillStyle = currentColors ? (currentColors.get(t.id)||t.color) : t.color
+    // Use stroke to fill anti-aliasing gaps between triangles
+    // Set stroke width to be minimal but enough to cover seams
+    ctx.strokeStyle = ctx.fillStyle
+    ctx.lineWidth = 1
+    ctx.lineJoin = 'round'
     ctx.beginPath()
-    const v = t.drawVertices || t.vertices
+    // Prefer drawing unclipped vertices to let the canvas handle clipping naturally.
+    // This avoids artifacts at the boundary where clipPolygonToRect might produce
+    // points slightly off the edge or where stroke clipping looks weird.
+    const v = t.vertices || t.drawVertices
     ctx.moveTo(v[0].x, v[0].y)
     ctx.lineTo(v[1].x, v[1].y)
     ctx.lineTo(v[2].x, v[2].y)
     ctx.closePath()
     ctx.fill()
+    ctx.stroke()
   }
   return canvas.toDataURL('image/png')
 }
