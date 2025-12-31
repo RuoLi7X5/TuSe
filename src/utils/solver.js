@@ -32,12 +32,27 @@ export function floodFillRegion(triangles, startId, targetColor) {
 }
 
 export function captureCanvasPNG(triangles, width, height, startId=null, steps=null) {
+  // Auto-expand canvas to fit triangles if they exceed provided dimensions
+  // This prevents clipping at the right/bottom edges due to floating point rounding or grid overflow
+  let effectiveWidth = width
+  let effectiveHeight = height
+  
+  for (const t of triangles) {
+    if (t.deleted || t.color === 'transparent') continue
+    const v = t.drawVertices || t.vertices
+    for (const p of v) {
+      if (p.x > effectiveWidth) effectiveWidth = p.x
+      if (p.y > effectiveHeight) effectiveHeight = p.y
+    }
+  }
+  
   const canvas = document.createElement('canvas')
-  canvas.width = width
-  canvas.height = height
+  canvas.width = Math.ceil(effectiveWidth)
+  canvas.height = Math.ceil(effectiveHeight)
   const ctx = canvas.getContext('2d')
-  ctx.fillStyle = '#fff'
-  ctx.fillRect(0, 0, width, height)
+  
+  // Use transparent background instead of white to avoid "white triangle" confusion
+  ctx.clearRect(0, 0, canvas.width, canvas.height)
   
   // Clone current state if steps provided to simulate
   let currentColors = null

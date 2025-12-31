@@ -758,7 +758,7 @@ const contribRef = useRef({ branch_pruned: 0, enqueued: 0, expanded: 0, critical
              offsetX: autoOffsetX,
              offsetY: autoOffsetY,
              arrangement: finalArrangement,
-             bounds: detectedGrid.bounds // 保存检测到的边界
+             bounds: gridSpec.bounds // 保存检测到的边界
            })
 
            setStatus(`已自动对齐网格 (精确边长: ${detectedSide.toFixed(2)})`)
@@ -1401,8 +1401,8 @@ const contribRef = useRef({ branch_pruned: 0, enqueued: 0, expanded: 0, critical
           const okUniform = checkUniformPathCached(cachedStart, cachedPath)
           const okFlags = (cache?.is_unified===true && cache?.quality==='final')
           if (okUniform && okFlags) {
-            const snapshots = await captureCanvasPNG(canvasRef.current, triangles, cachedStart, cachedPath.slice(0, Math.max(1, Math.min(40, cachedPath.length))))
-            setSteps([{ path: cachedPath, images: snapshots }])
+            const snapshots = await captureCanvasPNG(triangles, canvasRef.current.width, canvasRef.current.height, cachedStart, cachedPath.slice(0, Math.max(1, Math.min(40, cachedPath.length))))
+             setSteps([{ path: cachedPath, images: [snapshots] }])
             setBestStartId(cachedStart)
             setStatus(`缓存预览：起点 #${cachedStart}，步骤 ${cachedMin??cachedPath.length}（继续计算中）`)
             setSolveProgress(null)
@@ -1701,8 +1701,8 @@ const contribRef = useRef({ branch_pruned: 0, enqueued: 0, expanded: 0, critical
           const heurLimit = Number.isFinite(maxStepsLimit) ? Math.max(1, Math.min(40, maxStepsLimit)) : 40
           const heurPath = computeGreedyPath(triangles, palette, startIdLocal, heurLimit)
           if (heurPath && heurPath.length) {
-            const snapshots = await captureCanvasPNG(canvasRef.current, triangles, startIdLocal, heurPath)
-            setSteps([{ path: heurPath, images: snapshots }])
+            const snapshots = await captureCanvasPNG(triangles, canvasRef.current.width, canvasRef.current.height, startIdLocal, heurPath)
+             setSteps([{ path: heurPath, images: [snapshots] }])
             setStatus(`超时或未统一，已给出接近方案：起点 #${startIdLocal}，步骤 ${heurPath.length}`)
             setSolveProgress(null)
             // 近似方案也上传策略摘要，并结束遥测 Run，确保总站可见
@@ -1847,8 +1847,8 @@ const contribRef = useRef({ branch_pruned: 0, enqueued: 0, expanded: 0, critical
           const okFlags = (cache?.is_unified===true && cache?.quality==='final')
           if (okUniform && okFlags) {
             const SNAPSHOT_LIMIT = 40
-            const snapshots = await captureCanvasPNG(canvasRef.current, triangles, cachedStart, cachedPath.slice(0, SNAPSHOT_LIMIT))
-            setSteps([{ path: cachedPath, images: snapshots }])
+            const snapshots = await captureCanvasPNG(triangles, canvasRef.current.width, canvasRef.current.height, cachedStart, cachedPath.slice(0, SNAPSHOT_LIMIT))
+             setSteps([{ path: cachedPath, images: [snapshots] }])
             setBestStartId(cachedStart)
             setStatus(`缓存预览：步骤 ${cachedMin??cachedPath.length}（起点 #${cachedStart}，继续计算中）`)
             setSolveProgress(null)
@@ -2005,8 +2005,8 @@ const contribRef = useRef({ branch_pruned: 0, enqueued: 0, expanded: 0, critical
       const SNAPSHOT_LIMIT = 40
       for (const path of unifiedPaths) {
         setStatus(`正在生成步骤快照… (${stepImgs.length+1}/${result.paths.length})`)
-        const snapshots = await captureCanvasPNG(canvasRef.current, triangles, result.bestStartId, path.slice(0, SNAPSHOT_LIMIT))
-        stepImgs.push({ path, images: snapshots })
+        const snapshots = await captureCanvasPNG(triangles, canvasRef.current.width, canvasRef.current.height, result.bestStartId, path.slice(0, SNAPSHOT_LIMIT))
+         stepImgs.push({ path, images: [snapshots] })
         await new Promise(r=>setTimeout(r,0))
       }
       setSteps(stepImgs)
@@ -2123,8 +2123,8 @@ const contribRef = useRef({ branch_pruned: 0, enqueued: 0, expanded: 0, critical
       if (result.shortened && result.optimizedPath && result.optimizedLen < (originalPath?.length||Infinity) && isUniformOut){
         // 生成新的快照
         const SNAPSHOT_LIMIT = 40
-        const snapshots = await captureCanvasPNG(canvasRef.current, triangles, result.bestStartId ?? sid, result.optimizedPath.slice(0, SNAPSHOT_LIMIT))
-        setSteps([{ path: result.optimizedPath, images: snapshots }])
+        const snapshots = await captureCanvasPNG(triangles, canvasRef.current.width, canvasRef.current.height, result.bestStartId ?? sid, result.optimizedPath.slice(0, SNAPSHOT_LIMIT))
+         setSteps([{ path: result.optimizedPath, images: [snapshots] }])
         setBestStartId(result.bestStartId ?? sid)
         setStatus(`路径优化成功：由 ${originalPath.length} 步缩短为 ${result.optimizedLen} 步（起点 #${result.bestStartId ?? sid}）`)
         try { await putCachePath(graphSignature3, { path: result.optimizedPath, min_steps: result.optimizedLen, start_id: result.bestStartId ?? sid, flags: window.SOLVER_FLAGS, is_unified: true, quality: 'final' }) } catch {}

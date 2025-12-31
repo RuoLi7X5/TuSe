@@ -103,7 +103,7 @@ function triVertices(x, y, side, H, up) {
   }
 }
 
-export function buildTriangleGrid(width, height, side, offsetX = 0, offsetY = 0, customH = null, boundaryRect = null) {
+export function buildTriangleGrid(width, height, side, offsetX = 0, offsetY = 0, customH = null) {
   const H = customH || (side * Math.sqrt(3) / 2)
   // 为了让四边都成为直线，需要让网格在边界外延一圈，再裁剪回矩形
   // 横向步长为 side/2，纵向步长为 H
@@ -120,18 +120,6 @@ export function buildTriangleGrid(width, height, side, offsetX = 0, offsetY = 0,
       const up = ((r + c) % 2 === 0)
       const v = triVertices(x, y, side, H, up)
       
-      // 边界检查 (Strict Clipping to Detected Bounds)
-      if (boundaryRect) {
-         // 计算三角形中心点
-         const cx = (v[0].x + v[1].x + v[2].x) / 3
-         const cy = (v[0].y + v[1].y + v[2].y) / 3
-         // 严格判断：只有当中心点在边界内时才生成
-         if (cx < boundaryRect.x || cx > boundaryRect.x + boundaryRect.width ||
-             cy < boundaryRect.y || cy > boundaryRect.y + boundaryRect.height) {
-             continue
-         }
-      }
-
       // 对越界三角形进行裁剪，生成用于绘制/采样的多边形
       const clipped = clipPolygonToRect(v, width, height)
       if (clipped.length >= 3) {
