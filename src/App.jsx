@@ -9,7 +9,7 @@ import HelpPage from './components/HelpPage'
 import AdminDashboard from './components/AdminDashboard'
 
 import { quantizeImage, setColorTuning } from './utils/color-utils'
-import { buildTriangleGrid, buildTriangleGridVertical, mapImageToGrid, isUniform, colorFrequency, generateAiDebugImage, rectifyColorsByGrid } from './utils/grid-utils'
+import { buildTriangleGrid, buildTriangleGridVertical, mapImageToGrid, isUniform, colorFrequency, generateAiDebugImage, rectifyColorsByGrid, exportGridOverlay } from './utils/grid-utils'
 import { floodFillRegion, attachSolverToWindow, captureCanvasPNG } from './utils/solver'
 import { detectGrid } from './utils/grid-detector'
 import { hasPDB, loadPDBObject, loadPDBFromJSON, loadPDBFromURL, getPDBBaseURL } from './utils/pdb'
@@ -499,6 +499,25 @@ const [triangleSize, setTriangleSize] = useState(30)
     }
   }, [aiSegmentationMap, imgBitmap])
 
+  // 导出网格线调试图 (纯网格线条 PNG)
+  const onExportGridDebug = useCallback(() => {
+    if (!detectedGrid || !detectedGrid.gridLines || !imgBitmap) { setStatus('无可用网格线数据'); return }
+    
+    try {
+      const dataUrl = exportGridOverlay(imgBitmap.width, imgBitmap.height, detectedGrid.gridLines, detectedGrid.bounds)
+      if (dataUrl) {
+        const a = document.createElement('a')
+        a.href = dataUrl
+        a.download = `grid-debug-overlay-${Date.now()}.png`
+        a.click()
+        setStatus('已导出网格线调试图')
+      }
+    } catch (e) {
+      console.error('Export Grid Debug Failed:', e)
+      setStatus('导出网格调试图失败')
+    }
+  }, [detectedGrid, imgBitmap])
+
 
   // 自动求解进度（显示实时状态）
   const [solveProgress, setSolveProgress] = useState(null)
@@ -735,9 +754,11 @@ const contribRef = useRef({ branch_pruned: 0, enqueued: 0, expanded: 0, critical
            // 保存精确参数，供后续 rebuild 使用（绕过 UI 的整数限制）
            setPreciseGridParams({
              side: detectedSide, // 原始检测值
+             height: gridSpec.spacing, // 新增：精确高度 (H)
              offsetX: autoOffsetX,
              offsetY: autoOffsetY,
-             arrangement: finalArrangement
+             arrangement: finalArrangement,
+             bounds: detectedGrid.bounds // 保存检测到的边界
            })
 
            setStatus(`已自动对齐网格 (精确边长: ${detectedSide.toFixed(2)})`)
@@ -809,19 +830,40 @@ const contribRef = useRef({ branch_pruned: 0, enqueued: 0, expanded: 0, critical
           let offX = gridOffsetX
           let offY = gridOffsetY
           let arr = gridArrangement
+          let customH = null
           
           if (preciseGridParams && Math.abs(preciseGridParams.side - triangleSize) < 1.5) {
              sideToUse = preciseGridParams.side
              offX = preciseGridParams.offsetX
              offY = preciseGridParams.offsetY
              arr = preciseGridParams.arrangement
+             customH = preciseGridParams.height 
+             
+             // 应用检测到的边界 (Bounds)
+             // 如果 detectedGrid 中包含 bounds 信息，我们使用它来进一步校准 offX/offY
+             // 使得网格尽可能贴合边界
+             if (detectedGrid && detectedGrid.bounds) {
+                const b = detectedGrid.bounds
+                // 这里的策略是：让网格的某个原点 (0,0) 对应到 bounds 的左上角 (b.x, b.y)
+                // 但 buildTriangleGrid 的 offsetX 是相对于画布 (0,0) 的
+                // 所以我们将 offsetX 设置为 b.x, offsetY 设置为 b.y
+                // 注意：这可能会覆盖掉 detectGrid 中计算出的 anchor based offset
+                // 但理论上 anchor based offset 应该和 boundary 是自洽的
+                // 我们可以选择信任 boundary 作为“绝对位置”
+                
+                // 为了保险，我们只在自动检测刚完成时应用这个，或者如果用户没有手动拖动过
+                // 这里简单起见，直接应用
+                offX = b.x
+                offY = b.y
+             }
+             
              // 保持 UI 状态一致
              if (arr !== gridArrangement) setGridArrangement(arr)
           }
 
           const gridNew = (arr === 'horizontal')
-            ? buildTriangleGrid(w, h, sideToUse, offX, offY)
-            : buildTriangleGridVertical(w, h, sideToUse, offX, offY)
+            ? buildTriangleGrid(w, h, sideToUse, offX, offY, customH)
+            : buildTriangleGridVertical(w, h, sideToUse, offX, offY, customH)
           
           setGrid(gridNew)
           const mapped = await mapImageToGrid(imgBitmap, gridNew, palette)
@@ -2565,6 +2607,7 @@ const contribRef = useRef({ branch_pruned: 0, enqueued: 0, expanded: 0, critical
           onAiRectify={onAiRectify}
           onExportAiDebug={onExportAiDebug}
           canExportAiDebug={!!aiSegmentationMap}
+          onExportGridDebug={onExportGridDebug}
         />
         <div className="grid-controls">
           <div className="row">

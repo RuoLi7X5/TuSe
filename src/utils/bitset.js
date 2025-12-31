@@ -63,3 +63,17 @@ export function bitsetToIds(bs, triangles){
   for(let i=0;i<triangles.length;i++){ if(bitsetHas(bs, i)) out.push(triangles[i].id) }
   return out
 }
+
+export function bitsetForEach(bs, fn){
+  for(let i=0; i<bs.length; i++){
+    let w = bs[i]
+    if(w === 0) continue
+    const base = i << 5
+    // Process 32 bits
+    for(let b=0; b<32; b++){
+      if((w >>> b) & 1){
+        fn(base + b)
+      }
+    }
+  }
+}

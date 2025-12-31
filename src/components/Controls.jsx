@@ -1,7 +1,7 @@
 import { useState } from 'react'
 import PerformanceTuner from './PerformanceTuner.jsx'
 
-export default function Controls({ palette, selectedColor, onSelectColor, onStartAddColorPick, pickMode, onAddColorFromPicker, onCancelPick, onCleanPalette, onAiRectify, onExportAiDebug, canExportAiDebug }) {
+export default function Controls({ palette, selectedColor, onSelectColor, onStartAddColorPick, pickMode, onAddColorFromPicker, onCancelPick, onCleanPalette, onAiRectify, onExportAiDebug, canExportAiDebug, onExportGridDebug }) {
   const [showTuner, setShowTuner] = useState(false)
 
   return (
@@ -13,6 +13,11 @@ export default function Controls({ palette, selectedColor, onSelectColor, onStar
             <button onClick={onAiRectify} style={{ padding: '.25rem .5rem', borderRadius: '6px', border: '1px solid var(--border)', background: 'linear-gradient(135deg, #6366f1 0%, #a855f7 100%)', color: '#fff', fontWeight:'bold' }} title="使用本地几何算法优化边界">
               ✨ 几何校准
             </button>
+            {onExportGridDebug && (
+              <button onClick={onExportGridDebug} style={{ padding: '.25rem .5rem', borderRadius: '6px', border: '1px solid var(--border)', background: 'var(--bg)', color: 'var(--text)' }} title="导出网格线调试图">
+                🐞 网格
+              </button>
+            )}
           </div>
           <button onClick={onStartAddColorPick} disabled={pickMode} style={{ padding: '.25rem .5rem', borderRadius: '6px', border: '1px solid var(--border)', background: pickMode ? '#374151' : 'var(--bg)', color: pickMode ? '#9ca3af' : 'var(--text)' }} title="添加新颜色">
             {pickMode ? '正在取色...' : '+ 添加颜色'}

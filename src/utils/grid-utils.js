@@ -87,8 +87,7 @@ function clipPolygonToRect(poly, width, height) {
   return pts
 }
 
-function triVertices(x, y, side, up) {
-  const H = side * Math.sqrt(3) / 2
+function triVertices(x, y, side, H, up) {
   if (up) {
     return [
       { x, y: y + H },
@@ -104,8 +103,8 @@ function triVertices(x, y, side, up) {
   }
 }
 
-export function buildTriangleGrid(width, height, side, offsetX = 0, offsetY = 0) {
-  const H = side * Math.sqrt(3) / 2
+export function buildTriangleGrid(width, height, side, offsetX = 0, offsetY = 0, customH = null, boundaryRect = null) {
+  const H = customH || (side * Math.sqrt(3) / 2)
   // 为了让四边都成为直线，需要让网格在边界外延一圈，再裁剪回矩形
   // 横向步长为 side/2，纵向步长为 H
   // 扩大覆盖范围以适应较大的 offset (pMod 后 offset 可能接近 2H 或 S)
@@ -119,7 +118,20 @@ export function buildTriangleGrid(width, height, side, offsetX = 0, offsetY = 0)
       const x = c * (side / 2) + offsetX
       const y = r * H + offsetY
       const up = ((r + c) % 2 === 0)
-      const v = triVertices(x, y, side, up)
+      const v = triVertices(x, y, side, H, up)
+      
+      // 边界检查 (Strict Clipping to Detected Bounds)
+      if (boundaryRect) {
+         // 计算三角形中心点
+         const cx = (v[0].x + v[1].x + v[2].x) / 3
+         const cy = (v[0].y + v[1].y + v[2].y) / 3
+         // 严格判断：只有当中心点在边界内时才生成
+         if (cx < boundaryRect.x || cx > boundaryRect.x + boundaryRect.width ||
+             cy < boundaryRect.y || cy > boundaryRect.y + boundaryRect.height) {
+             continue
+         }
+      }
+
       // 对越界三角形进行裁剪，生成用于绘制/采样的多边形
       const clipped = clipPolygonToRect(v, width, height)
       if (clipped.length >= 3) {
@@ -160,8 +172,7 @@ export function buildTriangleGrid(width, height, side, offsetX = 0, offsetY = 0)
 }
 
 // 竖直底边（左右朝向）的等边三角形顶点
-function triVerticesVertical(x, y, side, left) {
-  const H = side * Math.sqrt(3) / 2
+function triVerticesVertical(x, y, side, H, left) {
   if (left) {
     // 朝左：顶点在左侧，底边为 x+H 的竖线段
     return [
@@ -180,8 +191,8 @@ function triVerticesVertical(x, y, side, left) {
 }
 
 // 构建“底边竖直”的网格（等价于原网格分布旋转90°）
-export function buildTriangleGridVertical(width, height, side, offsetX = 0, offsetY = 0) {
-  const H = side * Math.sqrt(3) / 2
+export function buildTriangleGridVertical(width, height, side, offsetX = 0, offsetY = 0, customH = null) {
+  const H = customH || (side * Math.sqrt(3) / 2)
   // 垂直底边模式同样在边界外延一圈再裁剪
   // 扩大覆盖范围
   const cols = Math.floor((width + H) / H) + 4
@@ -194,7 +205,7 @@ export function buildTriangleGridVertical(width, height, side, offsetX = 0, offs
       const x = c * H + offsetX
       const y = r * (side / 2) + offsetY
       const left = ((r + c) % 2 === 0)
-      const v = triVerticesVertical(x, y, side, left)
+      const v = triVerticesVertical(x, y, side, H, left)
       const clipped = clipPolygonToRect(v, width, height)
       if (clipped.length >= 3) {
         const cx = (v[0].x + v[1].x + v[2].x) / 3
@@ -986,6 +997,45 @@ export async function generateAiDebugImage(bitmap, aiSegmentation) {
     ctx.font = '12px sans-serif'
     ctx.fillText(`#${idx}`, cx + 8, cy)
   })
+
+  return canvas.toDataURL('image/png')
+}
+
+export function exportGridOverlay(width, height, gridLines, bounds) {
+  const canvas = document.createElement('canvas')
+  canvas.width = width
+  canvas.height = height
+  const ctx = canvas.getContext('2d')
+
+  // 1. 绘制所有检测到的网格线
+  if (gridLines) {
+    ctx.lineWidth = 2
+    gridLines.forEach(line => {
+      // 根据类型区分颜色
+      // primary (horizontal) -> Red
+      // diagonal -> Blue
+      ctx.strokeStyle = line.type === 'primary' ? 'rgba(255, 0, 0, 0.8)' : 'rgba(0, 0, 255, 0.6)'
+      
+      ctx.beginPath()
+      ctx.moveTo(line.start.x, line.start.y)
+      ctx.lineTo(line.end.x, line.end.y)
+      ctx.stroke()
+    })
+  }
+
+  // 2. 绘制推断的边界框 (Green)
+  if (bounds) {
+    ctx.strokeStyle = 'rgba(0, 255, 0, 1.0)'
+    ctx.lineWidth = 3
+    ctx.setLineDash([10, 5])
+    ctx.strokeRect(bounds.x, bounds.y, bounds.width, bounds.height)
+    ctx.setLineDash([])
+  }
+
+  // 3. 添加文字说明
+  ctx.fillStyle = 'white'
+  ctx.font = '20px sans-serif'
+  ctx.fillText('Red: Horizontal lines, Blue: Diagonal lines, Green: Bounding Box', 20, 30)
 
   return canvas.toDataURL('image/png')
 }

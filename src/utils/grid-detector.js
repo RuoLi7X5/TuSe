@@ -137,81 +137,84 @@ export function detectGrid(imageData, config = {}) {
     anglePeaks.push(currentPeaks)
   }
 
-  // 5. 全局间距分析
-  const allDiffs = []
-  anglePeaks.forEach(peaks => {
+  // 5. 分角度计算间距 (Spacing)
+  // 改进：优先信任主轴（Index 0），因为它是决定行高的关键，且通常最清晰。
+  // 如果混用对角线的间距，在非等边网格下会导致行高计算错误（Drift）。
+  const getMedian = (arr) => {
+    if (!arr.length) return 0
+    const s = arr.slice().sort((a,b)=>a-b)
+    const mid = Math.floor(s.length/2)
+    if (s.length % 2 === 0) return (s[mid-1] + s[mid]) / 2
+    return s[mid]
+  }
+
+  const spacingPerAngle = []
+  anglePeaks.forEach((peaks, angleIdx) => {
+    const diffs = []
     for (let i = 1; i < peaks.length; i++) {
-      const d = peaks[i].rho - peaks[i - 1].rho
-      if (d > 5 && d < Math.min(width, height) / 2) {
-        allDiffs.push(d)
-      }
+       const d = peaks[i].rho - peaks[i - 1].rho
+       if (d > 5 && d < Math.min(width, height) / 2) {
+          diffs.push(d)
+       }
+    }
+    if (diffs.length > 0) {
+       // 过滤离群值（Outlier Filtering）
+       const med = getMedian(diffs)
+       // 允许 20% 的偏差，或者至少 2px
+       const validDiffs = diffs.filter(d => Math.abs(d - med) < Math.max(2, med * 0.2))
+       if (validDiffs.length > 0) {
+          const avg = validDiffs.reduce((a,b)=>a+b,0) / validDiffs.length
+          spacingPerAngle.push({ angleIdx, spacing: avg, count: validDiffs.length })
+       }
     }
   })
-
-  if (allDiffs.length === 0) {
-    return { success: false, reason: 'No lines detected' }
-  }
-
-  // 直方图统计
-  const bins = {}
-  const binSize = 2
-  let maxBinCount = 0
-  let bestBinStart = 0
-  
-  allDiffs.forEach(d => {
-    const bin = Math.floor(d / binSize) * binSize
-    bins[bin] = (bins[bin] || 0) + 1
-    if (bins[bin] > maxBinCount) {
-      maxBinCount = bins[bin]
-      bestBinStart = bin
-    }
-  })
-
-  // 基础频率分析
-  const significantBins = []
-  const maxVal = Math.max(...Object.values(bins))
-  const histThreshold = Math.max(2, maxVal * 0.15)
-
-  for (const [binStr, count] of Object.entries(bins)) {
-    if (count >= histThreshold) {
-      significantBins.push(parseFloat(binStr))
-    }
-  }
-  significantBins.sort((a, b) => a - b)
 
   let bestSpacing = 0
-  let fundamental = 0
   
-  for (const base of significantBins) {
-    if (base < 10) continue
-    const ratio = bestBinStart / base
-    const remainder = Math.abs(ratio - Math.round(ratio))
-    if (remainder < 0.15) {
-      fundamental = base
-      break
-    }
-  }
-
-  if (fundamental > 0) {
-    let sum = 0, count = 0
-    allDiffs.forEach(d => {
-      if (Math.abs(d - (fundamental + binSize / 2)) < binSize * 2) {
-        sum += d
-        count++
-      }
-    })
-    bestSpacing = count > 0 ? sum / count : fundamental + binSize / 2
+  // 优先使用主轴（Index 0: Horizontal lines for horizontal mode）
+  // 同时也计算 Diagonal Spacing (Index 1/2) 来推导 Side Length
+  const primary = spacingPerAngle.find(s => s.angleIdx === 0)
+  const diagonals = spacingPerAngle.filter(s => s.angleIdx > 0)
+  
+  if (primary && primary.count >= 3) {
+     bestSpacing = primary.spacing
+  } else if (spacingPerAngle.length > 0) {
+     // 降级：加权平均
+     let sum = 0, total = 0
+     spacingPerAngle.forEach(s => { sum += s.spacing * s.count; total += s.count })
+     bestSpacing = sum / total
   } else {
-    let sum = 0, count = 0
-    allDiffs.forEach(d => {
-      if (Math.abs(d - (bestBinStart + binSize / 2)) < binSize * 1.5) {
-        sum += d
-        count++
-      }
-    })
-    bestSpacing = count > 0 ? sum / count : 0
+     return { success: false, reason: 'No valid line spacing detected' }
   }
-
+  
+  // 推导 Side Length from Diagonal Spacing
+  // Diagonal lines spacing D corresponds to altitude of the triangle if rotated?
+  // In horizontal mode:
+  // Horizontal lines (0 deg) spacing = H (Altitude)
+  // Diagonal lines (60/120 deg) spacing D.
+  // In equilateral triangle, D = H.
+  // But X-spacing (periodicity of intersections) is D / sin(60) = D / (sqrt(3)/2)? No.
+  // X-spacing of vertices is Side/2.
+  // Intersection geometry: Side/2 = D / sqrt(3) ? No.
+  // Let's rely on D directly.
+  // If the grid is equilateral, D_diag should equal H_horizontal.
+  // If D_diag != H_horizontal, we have non-equilateral.
+  // Side length relates to D_diag as: Side = 2 * D_diag / sqrt(3).
+  // Why? Height of equilateral triangle is Side * sqrt(3)/2.
+  // Distance between parallel lines at 60 deg is also Side * sqrt(3)/2.
+  // So D_diag = H.
+  // So Side = D_diag / (sqrt(3)/2) = 2 * D_diag / sqrt(3).
+  
+  let estimatedSideFromDiag = 0
+  if (diagonals.length > 0) {
+     const avgDiagSpacing = diagonals.reduce((s, d)=>s+d.spacing*d.count, 0) / diagonals.reduce((s,d)=>s+d.count, 0)
+     estimatedSideFromDiag = avgDiagSpacing / (Math.sqrt(3)/2)
+  }
+  
+  // 最终使用的 side 和 height
+  // 如果 detectedSideFromDiag 存在且与 inferredSide 差异较大 (>5%)，说明是非等边
+  // 此时我们应该分别返回 spacing (H) 和 derived side (S)
+  
   // 能量密度检查 (尝试 /2, /3)
   if (bestSpacing > 15) {
     const checkDivisorEnergy = (divisor) => {
@@ -250,7 +253,8 @@ export function detectGrid(imageData, config = {}) {
         const avgE = maxE / lineCountTest
         const parentAvgE = parentMaxE / lineCountParent
         
-        if (avgE > 0.6 * parentAvgE) validAngles++
+        // 提高阈值到 0.9，防止过度分割导致网格过密
+        if (avgE > 0.9 * parentAvgE) validAngles++
       }
       return validAngles >= 2
     }
@@ -328,18 +332,194 @@ export function detectGrid(imageData, config = {}) {
     anchors.push(anchorRho + bestOffset)
   }
 
+  // 计算每条网格线在画布内的线段（Start/End/Length）
+  // 这对于网格对齐和可视化非常重要
+  const getGridLineSegment = (angle, rho, w, h) => {
+    const rad = angle * Math.PI / 180
+    const c = Math.cos(rad), s = Math.sin(rad)
+    const pts = []
+    // Left x=0: y = rho/s
+    if (Math.abs(s)>1e-6) { const y=rho/s; if(y>=0 && y<=h) pts.push({x:0, y}) }
+    // Right x=w: y = (rho - w*c)/s
+    if (Math.abs(s)>1e-6) { const y=(rho-w*c)/s; if(y>=0 && y<=h) pts.push({x:w, y}) }
+    // Top y=0: x = rho/c
+    if (Math.abs(c)>1e-6) { const x=rho/c; if(x>=0 && x<=w) pts.push({x, y:0}) }
+    // Bottom y=h: x = (rho - h*s)/c
+    if (Math.abs(c)>1e-6) { const x=(rho-h*s)/c; if(x>=0 && x<=w) pts.push({x, y:h}) }
+    
+    // Dedup
+    const unique = []
+    pts.forEach(p => { if(!unique.some(u => Math.abs(u.x-p.x)<0.1 && Math.abs(u.y-p.y)<0.1)) unique.push(p) })
+    
+    if (unique.length === 2) {
+       const dx = unique[1].x - unique[0].x
+       const dy = unique[1].y - unique[0].y
+       return { start: unique[0], end: unique[1], length: Math.sqrt(dx*dx + dy*dy) }
+    }
+    return null
+  }
+
+  const gridLines = []
+  // Reconstruct lines from anchors and spacing
+  // For each angle set
+  const maxDim = Math.max(width, height)
+  
   // 7. 返回完整的网格规格
   // 对于等边三角形网格，Height (h) = side * sqrt(3) / 2
   // 我们检测到的 bestSpacing 就是这个 h (垂直于网格线的距离)
   // 因此推导出的 side = bestSpacing / (sqrt(3)/2)
-  const estimatedSide = bestSpacing / (Math.sqrt(3) / 2)
+  const inferredSide = bestSpacing / (Math.sqrt(3) / 2)
+  
+  // 最终决策：
+  // 如果 estimatedSideFromDiag 存在且有效，我们使用它作为 side，而 bestSpacing 作为 height
+  // 这样可以支持非等边三角形（Aspect Ratio Stretch）
+  let finalSide = inferredSide
+  if (estimatedSideFromDiag > 0 && Math.abs(estimatedSideFromDiag - inferredSide) / inferredSide > 0.02) {
+     // 差异大于 2%，认为是显著的非等边
+     finalSide = estimatedSideFromDiag
+  }
 
+  targetAngles.forEach((angle, i) => {
+     const anchor = anchors[i]
+     // Spacing calculation must be consistent with finalSide/bestSpacing decision
+     // i=0 is horizontal lines (spacing = bestSpacing)
+     // i=1,2 are diagonal lines
+     
+     let lineSpacing = bestSpacing
+     if (i > 0) {
+        // Diagonal spacing for non-equilateral
+        const S = finalSide
+        const H = bestSpacing
+        const diagLen = Math.sqrt(S*S/4 + H*H)
+        lineSpacing = (S * H) / diagLen
+     }
+     
+     // Generate lines range
+     // anchor is one line. We expand k in both directions.
+     const kRange = Math.ceil(maxDim / lineSpacing) + 2
+     for(let k = -kRange; k <= kRange; k++){
+        const rho = anchor + k * lineSpacing
+        const seg = getGridLineSegment(angle, rho, width, height)
+        if (seg) {
+           gridLines.push({ ...seg, angle, index: k, type: i===0 ? 'primary' : 'diagonal' })
+        }
+     }
+  })
+
+  // 8. 检测网格线的实际存在区域（Segments）并推断边界
+  const activeSegments = []
+  
+  // 辅助：检查点是否在画布内
+  const inBounds = (x, y) => x >= 0 && x < width && y >= 0 && y < height
+  
+  // 遍历每一条生成的候选网格线
+  gridLines.forEach(line => {
+     // 沿着线段进行扫描，寻找有边缘强度的起始和结束点
+     // line.start, line.end
+     const dx = line.end.x - line.start.x
+     const dy = line.end.y - line.start.y
+     const len = Math.sqrt(dx*dx + dy*dy)
+     if(len < 10) return
+     
+     const ux = dx / len
+     const uy = dy / len
+     
+     let firstActive = -1
+     let lastActive = -1
+     
+     // 扫描步长
+     for(let t=0; t<len; t+=2){
+        const x = Math.round(line.start.x + ux * t)
+        const y = Math.round(line.start.y + uy * t)
+        if(inBounds(x,y)){
+           const idx = y * width + x
+           // 检查该点附近是否有强边缘 (gradients[idx] > threshold)
+           // 放宽一点范围，检查 3x3 邻域
+           let hasEdge = false
+           for(let dy=-1; dy<=1; dy++){
+              for(let dx=-1; dx<=1; dx++){
+                 const ni = (y+dy)*width + (x+dx)
+                 if(ni>=0 && ni<gradients.length && gradients[ni] > threshold * 0.5){
+                    hasEdge = true; break
+                 }
+              }
+              if(hasEdge) break
+           }
+           
+           if(hasEdge){
+              if(firstActive === -1) firstActive = t
+              lastActive = t
+           }
+        }
+     }
+     
+     if(firstActive !== -1 && (lastActive - firstActive) > 20){
+        // 找到有效线段
+        activeSegments.push({
+           start: { x: line.start.x + ux * firstActive, y: line.start.y + uy * firstActive },
+           end: { x: line.start.x + ux * lastActive, y: line.start.y + uy * lastActive },
+           angle: line.angle,
+           type: line.type
+        })
+     }
+  })
+  
+  // 9. 基于有效线段的端点推断边界 (Bounding Box)
+  // 收集所有端点
+  const endPoints = []
+  activeSegments.forEach(s => {
+     endPoints.push(s.start)
+     endPoints.push(s.end)
+  })
+  
+  let bounds = null
+  if(endPoints.length > 4){
+     // 简单的直方图/统计法找边界
+     // 也可以用 percentile
+     const xs = endPoints.map(p => p.x).sort((a,b)=>a-b)
+     const ys = endPoints.map(p => p.y).sort((a,b)=>a-b)
+     
+     // 假设网格是相对完整的，取 5% 和 95% 分位点作为边界估计
+     // 避免个别噪点影响
+     const p5 = Math.floor(endPoints.length * 0.05)
+     const p95 = Math.floor(endPoints.length * 0.95)
+     
+     // 更智能的方法：寻找最密集的边缘
+     // 但简单的 percentile 在大多数“整齐”的网格图中通常有效
+     // 用户提到的“连线”逻辑：实际上就是寻找这些端点的外包矩形
+     
+     const xMin = xs[p5]
+     const xMax = xs[p95]
+     const yMin = ys[p5]
+     const yMax = ys[p95]
+     
+     if(xMax > xMin && yMax > yMin){
+        bounds = { x: xMin, y: yMin, width: xMax - xMin, height: yMax - yMin }
+     }
+  }
+
+  // 10. 修正 anchors / offset 以对齐到检测到的边界
+  // 我们希望网格的某个节点正好落在 (bounds.x, bounds.y)
+  // 但实际上，网格的左上角 (bounds.x, bounds.y) 并不一定是顶点，可能是边的中点
+  // 更好的策略是：保持原本的 anchors（因为它们是对齐到线条中心的），
+  // 但是告诉上层应用，网格的绘制范围应该是 bounds。
+  // 同时，我们可以微调 offset，使得网格在 bounds.x, bounds.y 处看起来是“切齐”的。
+  
+  // 计算相对于边界的 offset
+  // 水平线的 Phase 应该让第一条线出现在 bounds.y 附近
+  // 垂直/斜线的 Phase 应该让第一条线出现在 bounds.x 附近
+  // 这里的 anchors 已经是 rho (原点到直线的距离)。
+  // 我们不需要改变 anchors，只需要返回 bounds 供裁剪使用。
+  
   return {
     success: true,
     mode,
-    spacing: bestSpacing, // This is 'h' (height of triangle row), not side length
-    side: estimatedSide,
-    anchors, // [rho for angle0, rho for angle1, rho for angle2]
-    angles: targetAngles
+    spacing: bestSpacing, 
+    side: finalSide,      
+    anchors, 
+    angles: targetAngles,
+    gridLines,
+    activeSegments, // 调试用：实际检测到的线段
+    bounds          // 新增：推断出的网格边界 {x, y, width, height}
   }
 }

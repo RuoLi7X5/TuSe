@@ -1,5 +1,5 @@
-// Pattern Database (PDB) skeleton: store and query precomputed costs for small subgraphs.
-// This is a placeholder; production PDB needs graph canonicalization and coverage mapping.
+// Pattern Database (PDB) skeleton and RAG-based dynamic heuristic
+import { buildRAG } from './grid-utils'
 
 const STORE = new Map()
 
@@ -18,20 +18,20 @@ function canonicalizeColors(colors){
 }
 
 export function loadPDB(key, data){
-  // key can identify graph template; data is user-provided cost table
   STORE.set(key, data)
 }
 
 export function hasPDB(key){
+  if(key === 'dynamic_rag') return true
   return STORE.has(key)
 }
 
-// List currently loaded PDB keys for UI/heuristics integration
 export function listPDBKeys(){
-  try { return Array.from(STORE.keys()) } catch { return [] }
+  const keys = Array.from(STORE.keys())
+  keys.push('dynamic_rag')
+  return keys
 }
 
-// Convenience: load PDB from plain object { signature: cost }
 export function loadPDBObject(key, obj){
   try {
     if (obj && typeof obj === 'object' && !Array.isArray(obj)) {
@@ -43,7 +43,6 @@ export function loadPDBObject(key, obj){
   return false
 }
 
-// Convenience: load PDB from JSON string
 export function loadPDBFromJSON(key, jsonStr){
   try {
     const obj = JSON.parse(jsonStr)
@@ -51,7 +50,6 @@ export function loadPDBFromJSON(key, jsonStr){
   } catch { return false }
 }
 
-// Resolve PDB base URL from flags, window or env; fallback to '/pdb/'
 export function getPDBBaseURL(){
   try {
     const fromFlags = (typeof window !== 'undefined' && window.SOLVER_FLAGS && window.SOLVER_FLAGS.pdbBaseUrl) ? window.SOLVER_FLAGS.pdbBaseUrl : null
@@ -67,7 +65,6 @@ export function getPDBBaseURL(){
   } catch { return '/pdb/' }
 }
 
-// Load PDB JSON from a URL
 export async function loadPDBFromURL(key, url){
   try {
     const res = await fetch(url, { cache: 'force-cache' })
@@ -77,7 +74,6 @@ export async function loadPDBFromURL(key, url){
   } catch { return false }
 }
 
-// Optional: list remote PDB keys from index.json
 export async function listRemotePDBKeys(indexUrl){
   try {
     const res = await fetch(indexUrl, { cache: 'force-cache' })
@@ -87,7 +83,6 @@ export async function listRemotePDBKeys(indexUrl){
   } catch { return [] }
 }
 
-// Expose helpers on window for DevTools usage
 try {
   if (typeof window !== 'undefined'){
     window.loadPDB = loadPDB
@@ -101,23 +96,84 @@ try {
   }
 } catch {}
 
+function estimateDynamicRAG(env, colors, regionSet){
+  const { triangles, idToIndex, startId, boundaryNeighbors } = env
+  if(!triangles || !idToIndex || startId==null) return 0
+  
+  // Cache RAG and Distances on the triangles object (or a dedicated cache if passed)
+  if(!triangles._ragCache){
+    const rag = buildRAG(triangles)
+    const startIdx = idToIndex.get(startId)
+    const startComp = rag.triToComp[startIdx]
+    if(startComp === undefined) { triangles._ragCache = { maxDist:0, dists:[] }; return 0 }
+    
+    const dists = new Int32Array(rag.components.length).fill(-1)
+    const q = [startComp]
+    dists[startComp] = 0
+    let maxDist = 0
+    
+    let head = 0
+    while(head < q.length){
+      const u = q[head++]
+      const d = dists[u]
+      if(d > maxDist) maxDist = d
+      const adjs = rag.compAdj[u]
+      for(const v of adjs){
+        if(dists[v] === -1){
+          dists[v] = d + 1
+          q.push(v)
+        }
+      }
+    }
+    triangles._ragCache = { rag, dists, maxDist }
+  }
+  
+  const { rag, dists, maxDist } = triangles._ragCache
+  if(maxDist === 0) return 0
+  
+  // If boundaryNeighbors (indices) provided, use them for O(Boundary) check
+  if(boundaryNeighbors && Array.isArray(boundaryNeighbors)){
+    let minD = maxDist + 1
+    for(const idx of boundaryNeighbors){
+      const cId = rag.triToComp[idx]
+      if(cId !== undefined){
+        const d = dists[cId]
+        if(d !== -1 && d < minD) minD = d
+      }
+    }
+    // If we have valid boundary neighbors, the "cleared radius" is roughly minD.
+    // Remaining steps >= maxDist - minD.
+    if(minD > maxDist) return 0 // Boundary empty or all unreachable?
+    return Math.max(0, maxDist - minD)
+  }
+  
+  return 0
+}
+
 export function estimatePDB(key, env, colors, regionSet){
-  // Placeholder: return 0 if not available
+  if(key === 'dynamic_rag') {
+    return estimateDynamicRAG(env, colors, regionSet)
+  }
+
   if(!STORE.has(key)) return 0
   const pdb = STORE.get(key)
-  // Simple boundary-based signature: color indices around current region boundary
   const { triangles, idToIndex, neighbors, startId } = env || {}
   if(!triangles || !idToIndex || !neighbors || startId==null) return 0
   const rc = colors[idToIndex.get(startId)]
-  const boundary = []
+  
+  // Reconstruct boundary if not provided
+  let boundary = []
+  // This part is slow if regionSet is large. 
+  // Ideally use env.boundaryNeighbors if available and convert to IDs?
+  // PDB stored keys might rely on IDs or specific ordering.
+  // For now, keep original logic for static PDBs.
   for(const tid of regionSet){ const idx=idToIndex.get(tid); for(const nb of neighbors[idx]){ const nidx=idToIndex.get(nb); const tri=triangles[nidx]; const cc=colors[nidx]; if(cc!==rc && cc && cc!=='transparent' && !tri.deleted){ boundary.push(nb) } } }
-  // Take up to K boundary nodes to form a micro pattern
+  
   const K = 24
   const sampleIds = boundary.slice(0, K)
   const sampleColors = sampleIds.map(id=> colors[idToIndex.get(id)])
   const { out: canonColors } = canonicalizeColors(sampleColors)
   const sig = canonColors.join(',')
   const val = pdb.get(sig)
-  // If present, use it; otherwise fallback to 0 (admissible via max-composition with strict LB)
   return Number.isFinite(val) ? val : 0
 }
