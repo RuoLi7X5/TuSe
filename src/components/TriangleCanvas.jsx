@@ -15,7 +15,7 @@ function transformPoint(pt, grid, rotation){
   return { x: pt.x, y: pt.y }
 }
 
-function draw(ctx, grid, triangles, selectedIds, rotation, selectionRect, lassoPath, lassoClosed, resolutionScale = 1) {
+function draw(ctx, grid, triangles, selectedIds, rotation, selectionRect, lassoPath, lassoClosed) {
   if (!ctx) return
   ctx.clearRect(0, 0, ctx.canvas.width, ctx.canvas.height)
   const isSelected = (id)=> Array.isArray(selectedIds) && selectedIds.includes(id)
@@ -24,10 +24,10 @@ function draw(ctx, grid, triangles, selectedIds, rotation, selectionRect, lassoP
   ctx.lineCap = 'round'
   ctx.miterLimit = 2
 
-  // 计算动态线宽：随分辨率升高（scale增大）而变细，避免高密度下网格显得过黑
-  // 限制最小线宽为 0.2，避免在某些屏幕上消失
-  const baseLineWidth = Math.max(0.2, 1 / resolutionScale)
-  const selectedLineWidth = Math.max(0.5, 2 / resolutionScale)
+  // 固定线宽，避免因分辨率调整导致视觉误差
+  // 保持与提取的网格线粗细一致（约 0.5px - 1px）
+  const baseLineWidth = 0.5
+  const selectedLineWidth = 2.0
 
   // 第一轮：仅填充颜色，不描边
   for (const t of triangles) {
@@ -142,7 +142,7 @@ function pointInPolygon(p, verts) {
   return inside
 }
 
-export default forwardRef(function TriangleCanvas({ grid, triangles, onClickTriangle, selectedIds, rotation=0, selectionRect, lassoPath, lassoClosed, onDragStart, onDragMove, onDragEnd, resolutionScale=1 }, ref) {
+export default forwardRef(function TriangleCanvas({ grid, triangles, onClickTriangle, selectedIds, rotation=0, selectionRect, lassoPath, lassoClosed, onDragStart, onDragMove, onDragEnd }, ref) {
   useEffect(() => {
     if (!ref?.current || !grid) return
     const canvas = ref.current
@@ -155,8 +155,8 @@ export default forwardRef(function TriangleCanvas({ grid, triangles, onClickTria
       canvas.height = grid.height
     }
     const ctx = canvas.getContext('2d')
-    draw(ctx, grid, triangles, selectedIds, rotation, selectionRect, lassoPath, lassoClosed, resolutionScale)
-  }, [grid, triangles, selectedIds, rotation, selectionRect, lassoPath, lassoClosed, resolutionScale])
+    draw(ctx, grid, triangles, selectedIds, rotation, selectionRect, lassoPath, lassoClosed)
+  }, [grid, triangles, selectedIds, rotation, selectionRect, lassoPath, lassoClosed])
 
   useEffect(() => {
     if (!ref?.current) return

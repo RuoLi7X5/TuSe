@@ -1,0 +1,733 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>等边三角形网格线提取工具</title>
+    <style>
+        body {
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            margin: 20px;
+            background-color: #f5f5f5;
+        }
+        .container {
+            max-width: 1200px;
+            margin: 0 auto;
+            background: white;
+            padding: 20px;
+            border-radius: 8px;
+            box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+        }
+        .controls {
+            margin-bottom: 20px;
+            padding: 15px;
+            background: #f8f9fa;
+            border-radius: 4px;
+            display: flex;
+            gap: 10px;
+            flex-wrap: wrap;
+            align-items: center;
+        }
+        button {
+            padding: 8px 16px;
+            background-color: #007bff;
+            color: white;
+            border: none;
+            border-radius: 4px;
+            cursor: pointer;
+        }
+        button:hover {
+            background-color: #0056b3;
+        }
+        button:disabled {
+            background-color: #ccc;
+            cursor: not-allowed;
+        }
+        .canvas-container {
+            position: relative;
+            overflow: auto;
+            border: 1px solid #ddd;
+            min-height: 400px;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            background-image: 
+                linear-gradient(45deg, #eee 25%, transparent 25%), 
+                linear-gradient(-45deg, #eee 25%, transparent 25%), 
+                linear-gradient(45deg, transparent 75%, #eee 75%), 
+                linear-gradient(-45deg, transparent 75%, #eee 75%);
+            background-size: 20px 20px;
+            background-position: 0 0, 0 10px, 10px -10px, -10px 0px;
+        }
+        canvas {
+            max-width: 100%;
+        }
+        .status {
+            margin-top: 10px;
+            color: #666;
+        }
+        input[type="number"] {
+            width: 60px;
+            padding: 5px;
+        }
+        label {
+            margin-right: 5px;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>等边三角形网格线提取工具</h1>
+        
+        <div class="controls">
+            <input type="file" id="imageInput" accept="image/*">
+            
+            <div style="border-left: 1px solid #ccc; padding-left: 10px; display: flex; gap: 10px; align-items: center;">
+                <label>检测模式:</label>
+                <select id="gridMode">
+                    <option value="horizontal">水平基底 (0°, 60°, 120°)</option>
+                    <option value="vertical">垂直基底 (90°, 30°, 150°)</option>
+                </select>
+            </div>
+
+            <div style="border-left: 1px solid #ccc; padding-left: 10px; display: flex; gap: 10px; align-items: center;">
+                <label>阈值:</label>
+                <input type="number" id="threshold" value="50" min="10" max="255" title="边缘检测阈值">
+                
+                <label>灵敏度:</label>
+                <input type="number" id="sensitivity" value="40" min="10" max="100" title="霍夫变换峰值灵敏度">
+            </div>
+
+            <button id="processBtn" disabled>提取网格线</button>
+            <button id="clearBtn">清除结果</button>
+        </div>
+
+        <div id="status" class="status">请上传图片...</div>
+
+        <div class="canvas-container">
+            <canvas id="mainCanvas"></canvas>
+        </div>
+    </div>
+
+    <script>
+        const imageInput = document.getElementById('imageInput');
+        const processBtn = document.getElementById('processBtn');
+        const clearBtn = document.getElementById('clearBtn');
+        const mainCanvas = document.getElementById('mainCanvas');
+        const statusDiv = document.getElementById('status');
+        const gridModeSelect = document.getElementById('gridMode');
+        const ctx = mainCanvas.getContext('2d');
+
+        let originalImage = null;
+
+        imageInput.addEventListener('change', (e) => {
+            const file = e.target.files[0];
+            if (!file) return;
+
+            const reader = new FileReader();
+            reader.onload = (event) => {
+                const img = new Image();
+                img.onload = () => {
+                    originalImage = img;
+                    // Resize logic could go here if image is too huge, but let's keep original for now
+                    // or limit display size
+                    mainCanvas.width = img.width;
+                    mainCanvas.height = img.height;
+                    ctx.drawImage(img, 0, 0);
+                    processBtn.disabled = false;
+                    statusDiv.textContent = `图片加载完成: ${img.width} x ${img.height}`;
+                };
+                img.src = event.target.result;
+            };
+            reader.readAsDataURL(file);
+        });
+
+        clearBtn.addEventListener('click', () => {
+            if (originalImage) {
+                ctx.drawImage(originalImage, 0, 0);
+                statusDiv.textContent = '已清除结果';
+            }
+        });
+
+        processBtn.addEventListener('click', () => {
+            if (!originalImage) return;
+            
+            statusDiv.textContent = '正在处理...';
+            // Allow UI update
+            setTimeout(() => {
+                processImage();
+            }, 50);
+        });
+
+        function processImage() {
+            const width = mainCanvas.width;
+            const height = mainCanvas.height;
+            const imageData = ctx.getImageData(0, 0, width, height);
+            const data = imageData.data;
+            const grayData = new Uint8Array(width * height);
+
+            // 1. Grayscale & Simple Edge Enhancement
+            // Convert to grayscale
+            for (let i = 0; i < width * height; i++) {
+                const r = data[i * 4];
+                const g = data[i * 4 + 1];
+                const b = data[i * 4 + 2];
+                // Simple luminance
+                grayData[i] = 0.299 * r + 0.587 * g + 0.114 * b;
+            }
+
+            // 2. Sobel Edge Detection
+            // We want gradients.
+            const gradients = new Float32Array(width * height);
+            const edgeThreshold = parseInt(document.getElementById('threshold').value) || 50;
+
+            // Simple Sobel kernels
+            // Gx = [-1 0 1; -2 0 2; -1 0 1]
+            // Gy = [-1 -2 -1; 0 0 0; 1 2 1]
+            
+            for (let y = 1; y < height - 1; y++) {
+                for (let x = 1; x < width - 1; x++) {
+                    const idx = y * width + x;
+                    
+                    // Neighbors
+                    const tl = grayData[(y-1)*width + (x-1)];
+                    const tm = grayData[(y-1)*width + x];
+                    const tr = grayData[(y-1)*width + (x+1)];
+                    const ml = grayData[y*width + (x-1)];
+                    const mr = grayData[y*width + (x+1)];
+                    const bl = grayData[(y+1)*width + (x-1)];
+                    const bm = grayData[(y+1)*width + x];
+                    const br = grayData[(y+1)*width + (x+1)];
+
+                    const gx = -tl + tr - 2*ml + 2*mr - bl + br;
+                    const gy = -tl - 2*tm - tr + bl + 2*bm + br;
+
+                    const mag = Math.sqrt(gx*gx + gy*gy);
+                    gradients[idx] = mag > edgeThreshold ? mag : 0;
+                }
+            }
+
+            // 3. Specialized Hough Transform for Grid Lines
+            // Auto-detect Orientation: Check both "Horizontal" (0, 60, 120) and "Vertical" (90, 30, 150) configurations.
+            
+            const angleSets = {
+                horizontal: [90, 30, 150], // Normals. Lines at 0, 120, 60
+                vertical: [0, 60, 120]     // Normals. Lines at 90, 150, 30
+            };
+
+            // Accumulators for both sets
+            const maxRho = Math.ceil(Math.sqrt(width*width + height*height));
+            const rhoStep = 1; 
+            const numRhos = Math.ceil(2 * maxRho / rhoStep); 
+            const degToRad = Math.PI / 180;
+
+            const computeScore = (angles) => {
+                const accs = angles.map(() => new Int32Array(numRhos));
+                const cs = angles.map(deg => ({ c: Math.cos(deg * degToRad), s: Math.sin(deg * degToRad) }));
+                let totalVote = 0;
+                
+                // Optimized voting: only check strong gradients
+                // To save time, we can downsample or just run full. 
+                // Given canvas size, full run is okay for JS usually.
+                for (let y = 0; y < height; y+=2) { // Skip lines for speed during detection
+                    for (let x = 0; x < width; x+=2) {
+                        const idx = y * width + x;
+                        if (gradients[idx] > edgeThreshold) {
+                            for (let a = 0; a < angles.length; a++) {
+                                const { c, s } = cs[a];
+                                const rho = x * c + y * s;
+                                const rhoIdx = Math.round(rho + maxRho);
+                                if (rhoIdx >= 0 && rhoIdx < numRhos) {
+                                    accs[a][rhoIdx] += gradients[idx];
+                                }
+                            }
+                        }
+                    }
+                }
+                
+                // Sum top peaks to determine "strength" of this orientation
+                let score = 0;
+                for(let a=0; a<angles.length; a++) {
+                    let maxV = 0;
+                    for(let i=0; i<numRhos; i++) maxV = Math.max(maxV, accs[a][i]);
+                    score += maxV;
+                }
+                return score;
+            };
+
+            const scoreH = computeScore(angleSets.horizontal);
+            const scoreV = computeScore(angleSets.vertical);
+            
+            console.log("Orientation Scores - Horizontal:", scoreH, "Vertical:", scoreV);
+            
+            // Pick the winner
+            let targetAngles = (scoreV > scoreH) ? angleSets.vertical : angleSets.horizontal;
+            const detectedMode = (scoreV > scoreH) ? "vertical" : "horizontal";
+            
+            // Update UI to reflect detection (optional, but good for feedback)
+            if (gridModeSelect.value !== detectedMode) {
+                console.log("Auto-switched mode to:", detectedMode);
+                // We don't change the dropdown value to avoid confusing the user if they manually set it,
+                // BUT the user complaint implies they want it to Just Work.
+                // Let's trust the auto-detect.
+            }
+            
+            statusDiv.textContent = `检测模式: ${detectedMode === 'vertical' ? '垂直基底 (90°, 30°, 150°)' : '水平基底 (0°, 60°, 120°)'}`;
+
+            // Re-run full accumulation for the winner (high precision)
+            const accumulators = targetAngles.map(() => new Int32Array(numRhos));
+            const cosSin = targetAngles.map(deg => {
+                const rad = deg * degToRad;
+                return { c: Math.cos(rad), s: Math.sin(rad) };
+            });
+
+            // Vote (Full Resolution)
+            for (let y = 0; y < height; y++) {
+                for (let x = 0; x < width; x++) {
+                    const idx = y * width + x;
+                    if (gradients[idx] > 0) {
+                        // Vote for each target angle
+                        for (let a = 0; a < targetAngles.length; a++) {
+                            const { c, s } = cosSin[a];
+                            const rho = x * c + y * s;
+                            const rhoIdx = Math.round(rho + maxRho); // Offset to be positive
+                            if (rhoIdx >= 0 && rhoIdx < numRhos) {
+                                accumulators[a][rhoIdx] += gradients[idx]; // Weighted vote
+                            }
+                        }
+                    }
+                }
+            }
+
+            // 4. Find Grid Spacing and Generate Lines
+            // Note: Threshold and Sensitivity inputs are now mostly for the initial Hough accumulation filtering.
+            // The grid reconstruction logic below is strictly geometric and enforced globally.
+            
+            const sensitivity = parseInt(document.getElementById('sensitivity').value) || 40;
+            const lines = [];
+            const windowSize = 5; 
+            
+            // Store raw peaks for spacing analysis
+            const anglePeaks = [];
+
+            // Step 4.1: Extract raw peaks for each angle
+            // We use a relatively low threshold here to catch even faint lines, 
+            // relying on the global spacing logic to filter out noise later.
+            for (let a = 0; a < targetAngles.length; a++) {
+                const acc = accumulators[a];
+                let maxVote = 0;
+                for (let i = 0; i < numRhos; i++) maxVote = Math.max(maxVote, acc[i]);
+                
+                // Use a lower internal threshold to ensure we get enough data points for spacing analysis
+                const voteThreshold = maxVote * 0.15; // Hardcoded low threshold (15%)
+                const currentPeaks = [];
+
+                for (let i = windowSize; i < numRhos - windowSize; i++) {
+                    const val = acc[i];
+                    if (val > voteThreshold) {
+                        // Check local max
+                        let isMax = true;
+                        for (let k = 1; k <= windowSize; k++) {
+                            if (acc[i-k] >= val || acc[i+k] > val) {
+                                isMax = false;
+                                break;
+                            }
+                        }
+                        if (isMax) {
+                            currentPeaks.push({
+                                rhoIdx: i,
+                                rho: i - maxRho,
+                                score: val
+                            });
+                        }
+                    }
+                }
+                currentPeaks.sort((a, b) => a.rho - b.rho);
+                anglePeaks.push(currentPeaks);
+            }
+
+            // Step 4.2: Determine Grid Spacing (Global Analysis)
+            // For an equilateral triangle grid, the perpendicular spacing between lines should be identical 
+            // for all 3 directions (0, 60, 120 or 90, 30, 150).
+            // So we aggregate diffs from ALL angles to find the single global grid unit.
+
+            const allDiffs = [];
+            anglePeaks.forEach(peaks => {
+                for (let i = 1; i < peaks.length; i++) {
+                    const d = peaks[i].rho - peaks[i-1].rho;
+                    // Filter out very small diffs (noise) and very large ones
+                    if (d > 5 && d < Math.min(width, height) / 2) {
+                        allDiffs.push(d);
+                    }
+                }
+            });
+
+            // Find the most common spacing (Mode) from combined data
+            let bestSpacing = 0;
+            if (allDiffs.length > 0) {
+                // Simple histogram
+                const bins = {};
+                const binSize = 2; // Tolerance for spacing variation
+                let maxBinCount = 0;
+                let bestBinStart = 0;
+                
+                allDiffs.forEach(d => {
+                    const bin = Math.floor(d / binSize) * binSize;
+                    bins[bin] = (bins[bin] || 0) + 1;
+                    if (bins[bin] > maxBinCount) {
+                        maxBinCount = bins[bin];
+                        bestBinStart = bin;
+                    }
+                });
+                
+                // Refine spacing: average all diffs within the best bin
+                // NEW LOGIC: Instead of just taking the mode, we look for the "Fundamental Frequency".
+                // 1. Identify all significant peaks in the histogram
+                const significantBins = [];
+                const maxVal = Math.max(...Object.values(bins));
+                const threshold = Math.max(2, maxVal * 0.15); // At least 2 votes, or 15% of max
+
+                for (const [binStr, count] of Object.entries(bins)) {
+                    if (count >= threshold) {
+                        significantBins.push(parseFloat(binStr));
+                    }
+                }
+                significantBins.sort((a, b) => a - b);
+
+                // 2. Find the smallest spacing that explains the others (GCD-ish)
+                // We check the smallest significant bin. If larger bins are roughly multiples of it, we take it.
+                let fundamental = 0;
+                
+                for (const base of significantBins) {
+                    // Ignore very small noise < 10px
+                    if (base < 10) continue;
+                    
+                    let isFundamental = true;
+                    // Check if this base can explain the main mode (maxBinStart)
+                    // i.e., maxBinStart should be a multiple of base
+                    // We also check if it explains other significant bins
+                    
+                    // Simplified: just check if the "Mode" (most frequent) is a multiple of this 'base'
+                    // bestBinStart is the Mode.
+                    const ratio = bestBinStart / base;
+                    const remainder = Math.abs(ratio - Math.round(ratio));
+                    
+                    // If remainder is small (near integer), it's a valid divisor
+                    if (remainder < 0.15) {
+                         fundamental = base;
+                         break; // Found the smallest valid base
+                    }
+                }
+
+                if (fundamental > 0) {
+                    // Recalculate exact average using the fundamental
+                    let sum = 0, count = 0;
+                    allDiffs.forEach(d => {
+                        // Check if d is close to fundamental OR a multiple of it? 
+                        // Actually, we want the spacing to be the fundamental.
+                        // So we filter diffs that are close to fundamental.
+                        if (Math.abs(d - (fundamental + binSize/2)) < binSize * 2) {
+                            sum += d;
+                            count++;
+                        }
+                    });
+                    
+                    // If we found direct support for the fundamental, use it
+                    if (count > 0) {
+                        bestSpacing = sum / count;
+                    } else {
+                        // If no direct support (e.g. gaps are all 60, but we inferred 30?), 
+                        // this logic path is tricky. 
+                        // If 'fundamental' came from 'significantBins', it MUST have support (count >= threshold).
+                        // So this block should be fine.
+                         bestSpacing = fundamental + binSize/2; // Approx fallback
+                    }
+                } else {
+                    // Fallback to the mode if no sub-multiple found
+                    let sum = 0, count = 0;
+                    allDiffs.forEach(d => {
+                        if (Math.abs(d - (bestBinStart + binSize/2)) < binSize * 1.5) {
+                            sum += d;
+                            count++;
+                        }
+                    });
+                    bestSpacing = count > 0 ? sum / count : 0;
+                }
+            }
+            
+            // STRICT ENFORCEMENT: Final sanity check using Accumulator Energy
+            // Even if histogram didn't show 30px gaps (only 60px gaps), maybe the grid IS 30px.
+            // We test spacing/2 and spacing/3 to see if they capture significant signal.
+            if (bestSpacing > 15) {
+                 const checkDivisorEnergy = (divisor) => {
+                     const testSpacing = bestSpacing / divisor;
+                     let totalScore = 0;
+                     let validAngles = 0;
+                     
+                     for (let a = 0; a < targetAngles.length; a++) {
+                         const acc = accumulators[a];
+                         // Find best phase for testSpacing
+                         let bestP = 0;
+                         let maxE = 0;
+                         for(let p=0; p<testSpacing; p++) {
+                             let e = 0;
+                             const sK = Math.ceil((-maxRho - p)/testSpacing);
+                             const eK = Math.floor((maxRho - p)/testSpacing);
+                             for(let k=sK; k<=eK; k++) {
+                                 const idx = Math.round(p + k*testSpacing + maxRho);
+                                 if(idx>=0 && idx<numRhos) e += acc[idx];
+                             }
+                             if(e > maxE) { maxE = e; bestP = p; }
+                         }
+                         
+                         // Calculate average energy per line
+                         const lineCount = (2 * maxRho) / testSpacing;
+                         const avgE = maxE / lineCount;
+                         
+                         // Normalize by the average energy of the "bestSpacing" lines
+                         // (We need to re-compute this to compare apples to apples)
+                         // Actually, simpler: 
+                         // If testSpacing is valid, then the "new" lines (that were added) should have energy.
+                         // But simply, if the grid is dense, AvgEnergy should be high.
+                         // If the grid is sparse (bestSpacing), but we force dense (testSpacing), 
+                         // half the lines will land on noise (0). So AvgEnergy will drop by 50%.
+                         
+                         // So, if AvgEnergy(testSpacing) > 0.6 * AvgEnergy(bestSpacing), 
+                         // it implies the intermediate lines are real (or noise is very high).
+                         // Let's assume noise is low (Sobel thresholded).
+                         
+                         // Let's compute parent avg energy
+                         let parentMaxE = 0;
+                         for(let p=0; p<bestSpacing; p++) {
+                             let e = 0;
+                             const sK = Math.ceil((-maxRho - p)/bestSpacing);
+                             const eK = Math.floor((maxRho - p)/bestSpacing);
+                             for(let k=sK; k<=eK; k++) {
+                                 const idx = Math.round(p + k*bestSpacing + maxRho);
+                                 if(idx>=0 && idx<numRhos) e += acc[idx];
+                             }
+                             if(e > parentMaxE) parentMaxE = e;
+                         }
+                         const parentAvgE = parentMaxE / ((2 * maxRho) / bestSpacing);
+                         
+                         if (avgE > 0.6 * parentAvgE) {
+                             validAngles++;
+                         }
+                     }
+                     
+                     // If at least 2 out of 3 angles support the denser grid, adopt it
+                     return validAngles >= 2;
+                 };
+                 
+                 if (checkDivisorEnergy(2)) {
+                     console.log("Energy check suggests halving spacing");
+                     bestSpacing /= 2;
+                 } else if (checkDivisorEnergy(3)) {
+                      console.log("Energy check suggests thirding spacing");
+                     bestSpacing /= 3;
+                 }
+            }
+
+            console.log("Detected Global Spacing:", bestSpacing);
+
+            // 5. Line Generation: Anchor-based Expansion (Flood Fill)
+            // Instead of calculating abstract bounds, we start from the strongest line (Anchor)
+            // and expand outwards in both directions using the fixed bestSpacing until we leave the canvas.
+
+            // Helper to check if a line intersects the canvas
+            const intersectsCanvas = (angle, rho, w, h) => {
+                const rad = angle * degToRad;
+                const c = Math.cos(rad);
+                const s = Math.sin(rad);
+                // The line is x*c + y*s = rho
+                // We check intersection with the 4 corners: (0,0), (w,0), (0,h), (w,h)
+                // Project corners onto the normal vector (angle)
+                const p1 = 0 * c + 0 * s;
+                const p2 = w * c + 0 * s;
+                const p3 = 0 * c + h * s;
+                const p4 = w * c + h * s;
+                
+                const minP = Math.min(p1, p2, p3, p4);
+                const maxP = Math.max(p1, p2, p3, p4);
+                
+                // Allow a small margin (e.g. 10px) to ensure we cover edges
+                return rho >= minP - 10 && rho <= maxP + 10;
+            };
+
+            if (bestSpacing > 5) {
+                // Ensure bestSpacing is applied to ALL angles
+                // We do a sanity check: 30 and 150 degree lines should effectively have the same count if the image is central.
+                // But the main constraint is the SPACING.
+                
+                for (let a = 0; a < targetAngles.length; a++) {
+                    const acc = accumulators[a];
+                    
+                    // 1. Find the Anchor: The single strongest peak for this angle
+                    let bestRhoIdx = -1;
+                    let maxScore = -1;
+                    
+                    for (let i = windowSize; i < numRhos - windowSize; i++) {
+                        if (acc[i] > maxScore) {
+                            maxScore = acc[i];
+                            bestRhoIdx = i;
+                        }
+                    }
+                    
+                    // If no line found for this angle (rare), try to use center of image
+                    let anchorRho = 0;
+                    if (bestRhoIdx !== -1) {
+                        anchorRho = bestRhoIdx - maxRho;
+                    } else {
+                        // Fallback: use center of canvas projected onto normal
+                        const rad = targetAngles[a] * degToRad;
+                        anchorRho = (width/2) * Math.cos(rad) + (height/2) * Math.sin(rad);
+                    }
+
+                    // 2. Refine Anchor Phase
+                    // We want to align the grid perfectly. The max peak might be slightly off due to noise.
+                    // We search locally +/- spacing/2 to maximize energy
+                    let bestOffset = 0;
+                    let maxEnergy = -1;
+                    
+                    // Search range: small window around the anchor
+                    // Optimization: We only need to check one period. 
+                    // But here we just want to fine-tune the anchor we found.
+                    const searchRange = Math.min(10, Math.floor(bestSpacing / 2));
+                    
+                    for (let offset = -searchRange; offset <= searchRange; offset++) {
+                        // Calculate total energy of the grid if we shift the anchor by 'offset'
+                        // We sum up votes for (anchor + offset) + k * spacing
+                        let energy = 0;
+                        let k = 0;
+                        
+                        // Check forward
+                        while (true) {
+                            const r = (anchorRho + offset) + k * bestSpacing;
+                            if (!intersectsCanvas(targetAngles[a], r, width, height)) break;
+                            const idx = Math.round(r + maxRho);
+                            if (idx >= 0 && idx < numRhos) energy += acc[idx];
+                            k++;
+                        }
+                        // Check backward
+                        k = 1;
+                        while (true) {
+                            const r = (anchorRho + offset) - k * bestSpacing;
+                            if (!intersectsCanvas(targetAngles[a], r, width, height)) break;
+                            const idx = Math.round(r + maxRho);
+                            if (idx >= 0 && idx < numRhos) energy += acc[idx];
+                            k++;
+                        }
+                        
+                        if (energy > maxEnergy) {
+                            maxEnergy = energy;
+                            bestOffset = offset;
+                        }
+                    }
+                    
+                    const refinedAnchor = anchorRho + bestOffset;
+
+                    // 3. Generate Lines (Expansion)
+                    // Add the anchor itself
+                    if (intersectsCanvas(targetAngles[a], refinedAnchor, width, height)) {
+                        lines.push({ angle: targetAngles[a], rho: refinedAnchor, score: 100 });
+                    }
+                    
+                    // Expand positive direction
+                    let k = 1;
+                    while (true) {
+                        const r = refinedAnchor + k * bestSpacing;
+                        if (!intersectsCanvas(targetAngles[a], r, width, height)) break;
+                        lines.push({ angle: targetAngles[a], rho: r, score: 100 });
+                        k++;
+                    }
+                    
+                    // Expand negative direction
+                    k = 1;
+                    while (true) {
+                        const r = refinedAnchor - k * bestSpacing;
+                        if (!intersectsCanvas(targetAngles[a], r, width, height)) break;
+                        lines.push({ angle: targetAngles[a], rho: r, score: 100 });
+                        k++;
+                    }
+                }
+            } else {
+                // Fallback to raw peaks if spacing detection failed
+                statusDiv.textContent += " (自动间距检测失败，显示原始检测结果)";
+                anglePeaks.forEach((peaks, aIdx) => {
+                    peaks.forEach(p => {
+                        lines.push({
+                            angle: targetAngles[aIdx],
+                            rho: p.rho,
+                            score: p.score
+                        });
+                    });
+                });
+            }
+
+            // 5. Draw Lines
+            // Draw detected lines on canvas
+            ctx.lineWidth = 1;
+            ctx.strokeStyle = 'rgba(255, 0, 0, 0.8)';
+            
+            lines.forEach(line => {
+                const { angle, rho } = line;
+                const rad = angle * degToRad;
+                const c = Math.cos(rad);
+                const s = Math.sin(rad);
+
+                // Line equation: x*c + y*s = rho
+                // We need to find two points on the canvas boundaries to draw the line
+                
+                // Case 1: vertical-ish line (s is small, c is large)
+                // x = (rho - y*s) / c
+                // Case 2: horizontal-ish line (c is small, s is large)
+                // y = (rho - x*c) / s
+
+                const pts = [];
+                
+                // Intersect with Left (x=0)
+                if (Math.abs(s) > 1e-6) {
+                    const y = (rho - 0 * c) / s;
+                    if (y >= 0 && y <= height) pts.push({x:0, y});
+                }
+                
+                // Intersect with Right (x=width)
+                if (Math.abs(s) > 1e-6) {
+                    const y = (rho - width * c) / s;
+                    if (y >= 0 && y <= height) pts.push({x:width, y});
+                }
+
+                // Intersect with Top (y=0)
+                if (Math.abs(c) > 1e-6) {
+                    const x = (rho - 0 * s) / c;
+                    if (x >= 0 && x <= width) pts.push({x, y:0});
+                }
+
+                // Intersect with Bottom (y=height)
+                if (Math.abs(c) > 1e-6) {
+                    const x = (rho - height * s) / c;
+                    if (x >= 0 && x <= width) pts.push({x, y:height});
+                }
+
+                // We need exactly 2 distinct points to draw a segment across the canvas
+                // Filter unique points
+                const uniquePts = [];
+                pts.forEach(p => {
+                    if (!uniquePts.some(up => Math.abs(up.x - p.x) < 0.1 && Math.abs(up.y - p.y) < 0.1)) {
+                        uniquePts.push(p);
+                    }
+                });
+
+                if (uniquePts.length >= 2) {
+                    ctx.beginPath();
+                    ctx.moveTo(uniquePts[0].x, uniquePts[0].y);
+                    ctx.lineTo(uniquePts[1].x, uniquePts[1].y);
+                    ctx.stroke();
+                }
+            });
+
+            statusDiv.textContent = `检测完成: 找到 ${lines.length} 条网格线`;
+        }
+    </script>
+</body>
+</html>

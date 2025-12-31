@@ -9,8 +9,9 @@ import HelpPage from './components/HelpPage'
 import AdminDashboard from './components/AdminDashboard'
 
 import { quantizeImage, setColorTuning } from './utils/color-utils'
-import { buildTriangleGrid, buildTriangleGridVertical, mapImageToGrid, isUniform, colorFrequency, generateAiDebugImage } from './utils/grid-utils'
+import { buildTriangleGrid, buildTriangleGridVertical, mapImageToGrid, isUniform, colorFrequency, generateAiDebugImage, rectifyColorsByGrid } from './utils/grid-utils'
 import { floodFillRegion, attachSolverToWindow, captureCanvasPNG } from './utils/solver'
+import { detectGrid } from './utils/grid-detector'
 import { hasPDB, loadPDBObject, loadPDBFromJSON, loadPDBFromURL, getPDBBaseURL } from './utils/pdb'
 import { startRun as telemetryStartRun, logEvent as telemetryLogEvent, finishRun as telemetryFinishRun, makeGraphSignature, getRecommendation, getCachePath, putCachePath, uploadStrategyAuto, recordRunScore, postLearnScore } from './utils/telemetry'
 import AIService from './utils/ai-service'
@@ -134,7 +135,11 @@ if (typeof window !== 'undefined') {
 }
 attachSolverToWindow()
 
+// 辅助：正数取模
+const pMod = (a, n) => (a % n + n) % n
+
 function App() {
+  console.log('App component mounting...')
   // 简易哈希路由：用于“说明”子页
   const [route, setRoute] = useState(() => (typeof window!=='undefined' ? window.location.hash : ''))
   useEffect(() => {
@@ -175,8 +180,11 @@ const [triangleSize, setTriangleSize] = useState(30)
   const [rotation, setRotation] = useState(0)
   // 网格排列方向：horizontal（底边水平）/ vertical（底边竖直）
   const [gridArrangement, setGridArrangement] = useState('vertical')
-  // 网格分辨率因子：实际用于构建网格的边长 = 基础尺寸 / 分辨率因子
-  const [resolutionScale, setResolutionScale] = useState(1)
+  // 网格偏移量 (自动对齐用)
+  const [gridOffsetX, setGridOffsetX] = useState(0)
+  const [gridOffsetY, setGridOffsetY] = useState(0)
+  // 检测到的网格规格
+  const [detectedGrid, setDetectedGrid] = useState(null)
   // 画布显示缩放（仅影响展示尺寸）
   const [canvasScale, setCanvasScale] = useState(1)
   const canvasWrapRef = useRef(null)
@@ -418,7 +426,7 @@ const [triangleSize, setTriangleSize] = useState(30)
       console.error('Rectify Apply Error:', err)
       setStatus(`应用校准失败: ${err.message}`)
     }
-  }, [imgBitmap, grid, palette, triangles, aiSegmentationMap, isAiProcessing, runBackgroundAiAnalysis])
+  }, [imgBitmap, grid, palette, triangles, aiSegmentationMap, isAiProcessing, runBackgroundAiAnalysis, detectedGrid])
 
   // 辅助函数：计算 Mask 的边界框
   const getMaskBBox = (data, w, h) => {
@@ -543,18 +551,45 @@ const contribRef = useRef({ branch_pruned: 0, enqueued: 0, expanded: 0, critical
     const wrap = canvasWrapRef.current
     const w = wrap?.clientWidth || 1600
     const h = wrap?.clientHeight || 1200
-    const sideInit = triangleSize / (resolutionScale || 1)
+    const sideInit = triangleSize
     const g = (gridArrangement === 'horizontal')
-      ? buildTriangleGrid(w, h, sideInit)
-      : buildTriangleGridVertical(w, h, sideInit)
+      ? buildTriangleGrid(w, h, sideInit, gridOffsetX, gridOffsetY)
+      : buildTriangleGridVertical(w, h, sideInit, gridOffsetX, gridOffsetY)
     setGrid(g)
     const tris = g.triangles.map(t => ({ ...t, color: (t.up ?? t.left) ? '#1b2333' : '#121826' }))
     setTriangles(tris)
-  }, [imgBitmap, gridArrangement, triangleSize, resolutionScale])
+  }, [imgBitmap, gridArrangement, triangleSize])
 
-  const handleImage = useCallback(async (blob) => {
+  // 用于存储检测到的精确网格参数（绕过 UI 整数限制）
+  const [preciseGridParams, setPreciseGridParams] = useState(null)
+
+  const handleImage = useCallback(async (e) => {
+    // 兼容 input event 和直接传入 blob
+    const file = e.target?.files ? e.target.files[0] : e
+    if (!file) return
+
+    // 重置所有状态
+    setStatus('正在分析图片...')
+    setSteps([])
+    setStartId(null)
+    setBestStartId(null)
+    setGrid(null)
+    setTriangles([])
+    setUndoStack([])
+    setRedoStack([])
+    setHistoryStack([])
+    setHistoryRedoStack([])
+    setLassoPath([])
+    setLassoClosed(false)
+    setAiSegmentationMap(null)
+    setDetectedGrid(null)
+    setPreciseGridParams(null)
+    // 重置对齐参数
+    setGridOffsetX(0)
+    setGridOffsetY(0)
+    
     // 尊重 EXIF 方向，确保宽高与物理图像一致，避免比例失真
-    const bitmap = await createImageBitmap(blob, { imageOrientation: 'from-image' })
+    const bitmap = await createImageBitmap(file, { imageOrientation: 'from-image' })
     setImgBitmap(bitmap)
     
     // 重置状态，确保每次上传新图片都使用自动模式
@@ -580,19 +615,163 @@ const contribRef = useRef({ branch_pruned: 0, enqueued: 0, expanded: 0, critical
       // 放宽自适应范围：6~60
       sideBase = Math.max(6, Math.min(60, Math.round((2 * short) / targetAcrossShort)))
     }
-    const side = sideBase / (resolutionScale || 1)
-    const grid = (gridArrangement === 'horizontal')
-      ? buildTriangleGrid(w, h, side)
-      : buildTriangleGridVertical(w, h, side)
-    if (sideBase !== triangleSize) {
-      // 同步 UI 滑块显示，但保留用户后续手动可再调整
+    const side = sideBase
+    
+    // 1. 尝试检测网格
+    let autoGrid = null
+    let autoOffsetX = 0
+    let autoOffsetY = 0
+    let finalSide = side
+    let finalArrangement = gridArrangement
+
+    try {
+      // 提取 ImageData 用于检测
+      const canvas = document.createElement('canvas')
+      canvas.width = w
+      canvas.height = h
+      const ctx = canvas.getContext('2d')
+      ctx.drawImage(bitmap, 0, 0)
+      const imageData = ctx.getImageData(0, 0, w, h)
+      
+      const gridSpec = detectGrid(imageData)
+      setDetectedGrid(gridSpec) // 保存检测结果供后续校准使用
+
+      if (gridSpec.success) {
+        // 检查是否与当前/默认尺寸接近
+        const detectedSide = gridSpec.side
+        // 用户要求强制对齐，因此移除 <0.25 的差异检查，只要尺寸在合理范围内（例如 >5px 且 <短边的1/3）就采纳
+        const reasonable = detectedSide > 5 && detectedSide < Math.min(w, h) / 3
+        
+        if (reasonable) {
+           console.log('Grid detected and aligned:', gridSpec)
+           autoGrid = gridSpec
+           // 关键修改：直接使用高精度的检测值，不进行任何取整
+           finalSide = detectedSide
+           
+           // 设置排列方向
+           finalArrangement = gridSpec.mode // 'horizontal' or 'vertical'
+           setGridArrangement(finalArrangement)
+           
+           // 计算偏移量
+           const spacing = gridSpec.spacing // H
+           const anchors = gridSpec.anchors // [rho0, rho1, rho2]
+           const H = spacing
+           const S = detectedSide
+           
+           if (finalArrangement === 'horizontal') {
+             // Horizontal Mode:
+             // anchors[0] is for 90° normal (Horizontal lines y = rho)
+             // anchors[1] is for 30° normal (120° lines)
+             
+             // 1. Determine the base OffsetY relative to origin (0,0)
+             autoOffsetY = pMod(anchors[0], H)
+             
+             // 2. Determine which row index the detected line corresponds to
+             // Detected line is at y = anchors[0].
+             // Our grid lines are at y = autoOffsetY + k*H.
+             // So k = round((anchors[0] - autoOffsetY) / H).
+             const k = Math.round((anchors[0] - autoOffsetY) / H)
+             
+             // 3. Calculate intersection vertex X using BOTH diagonal sets for robustness
+             // Line 30° (Normal): x*sqrt(3)/2 + y*0.5 = anchors[1]
+             // => x1 = (anchors[1] - 0.5 * anchors[0]) / (Math.sqrt(3)/2)
+             const vx1 = (anchors[1] - 0.5 * anchors[0]) / (Math.sqrt(3)/2)
+             
+             // Line 150° (Normal): x*(-sqrt(3)/2) + y*0.5 = anchors[2]
+             // => -x*sqrt(3)/2 = anchors[2] - 0.5 * anchors[0]
+             // => x2 = (0.5 * anchors[0] - anchors[2]) / (Math.sqrt(3)/2)
+             const vx2 = (0.5 * anchors[0] - anchors[2]) / (Math.sqrt(3)/2)
+             
+             // Average for better precision
+             const vx = (vx1 + vx2) / 2
+             
+             // 4. Determine OffsetX based on row parity
+             // Even rows (k is even): Vertices at autoOffsetX + S/2 + m*S
+             // Odd rows (k is odd): Vertices at autoOffsetX + m*S
+             if (k % 2 === 0) {
+                 // vx ~= autoOffsetX + S/2
+                 autoOffsetX = pMod(vx - S / 2, S)
+             } else {
+                 // vx ~= autoOffsetX
+                 autoOffsetX = pMod(vx, S)
+             }
+             
+           } else {
+             // Vertical Mode:
+             // anchors[0] is for 0° normal (Vertical lines x = rho)
+             // anchors[1] is for 60° normal
+             
+             // 1. Determine base OffsetX
+             autoOffsetX = pMod(anchors[0], H)
+             
+             // 2. Determine col index
+             const k = Math.round((anchors[0] - autoOffsetX) / H)
+             
+             // 3. Calculate intersection vertex Y using BOTH diagonal sets
+             // Line 60° (Normal): x*0.5 + y*sqrt(3)/2 = anchors[1]
+             // => y1 = (anchors[1] - 0.5 * anchors[0]) / (Math.sqrt(3)/2)
+             const vy1 = (anchors[1] - 0.5 * anchors[0]) / (Math.sqrt(3)/2)
+             
+             // Line 120° (Normal): x*(-0.5) + y*sqrt(3)/2 = anchors[2]
+             // => y2 = (anchors[2] + 0.5 * anchors[0]) / (Math.sqrt(3)/2)
+             const vy2 = (anchors[2] + 0.5 * anchors[0]) / (Math.sqrt(3)/2)
+             
+             // Average
+             const vy = (vy1 + vy2) / 2
+             
+             // 4. Determine OffsetY based on col parity
+             // Even cols (k even): Vertices at autoOffsetY + S/2 + m*S
+             // Odd cols (k odd): Vertices at autoOffsetY + m*S
+             if (k % 2 === 0) {
+                 autoOffsetY = pMod(vy - S / 2, S)
+             } else {
+                 autoOffsetY = pMod(vy, S)
+             }
+           }
+           
+           setGridOffsetX(autoOffsetX)
+           setGridOffsetY(autoOffsetY)
+
+           // 保存精确参数，供后续 rebuild 使用（绕过 UI 的整数限制）
+           setPreciseGridParams({
+             side: detectedSide, // 原始检测值
+             offsetX: autoOffsetX,
+             offsetY: autoOffsetY,
+             arrangement: finalArrangement
+           })
+
+           setStatus(`已自动对齐网格 (精确边长: ${detectedSide.toFixed(2)})`)
+        } else {
+           console.log('Grid detected but size unreasonable:', detectedSide)
+           // 即使尺寸不匹配，也保存 gridSpec 供几何校准使用，但不重置参数
+        }
+      }
+    } catch (e) {
+      console.warn('Grid detection failed:', e)
+    }
+
+    const grid = (finalArrangement === 'horizontal')
+      ? buildTriangleGrid(w, h, finalSide, autoOffsetX, autoOffsetY)
+      : buildTriangleGridVertical(w, h, finalSide, autoOffsetX, autoOffsetY)
+    if (autoGrid && Math.round(autoGrid.side) !== triangleSize) {
+      // 同步 UI 滑块显示
+      setTriangleSize(Math.round(autoGrid.side))
+    } else if (!autoGrid && sideBase !== triangleSize) {
       setTriangleSize(sideBase)
     }
     setGrid(grid)
 
     const mapped = await mapImageToGrid(bitmap, grid, palette)
+    
+    // 如果自动检测成功，立即执行一次“少数服从多数”的强力校准
+    if (autoGrid) {
+        rectifyColorsByGrid(mapped, autoGrid)
+        setStatus(`已自动对齐并校准颜色 (边长: ${autoGrid.side.toFixed(2)})`)
+    }
+
     setTriangles(mapped)
-    setStatus('已识别颜色并生成网格')
+    if (!autoGrid) setStatus('已识别颜色并生成网格')
+    
     setUndoStack([mapped.map(t => t.color)])
     setRedoStack([])
     setStartId(null)
@@ -605,7 +784,7 @@ const contribRef = useRef({ branch_pruned: 0, enqueued: 0, expanded: 0, critical
     setTimeout(() => {
         runBackgroundAiAnalysis(bitmap, grid, palette, mapped)
     }, 500)
-  }, [triangleSize, gridArrangement, resolutionScale, runBackgroundAiAnalysis]) // 移除 targetColorCount 依赖，避免闭包陈旧
+  }, [triangleSize, gridArrangement, runBackgroundAiAnalysis]) // 移除 targetColorCount 依赖，避免闭包陈旧
 
   useEffect(() => {
     // 根据分离强度调节颜色匹配参数
@@ -622,11 +801,36 @@ const contribRef = useRef({ branch_pruned: 0, enqueued: 0, expanded: 0, critical
         if (imgBitmap && palette.length && editMode) {
           const w = imgBitmap.width
           const h = imgBitmap.height
-          const gridNew = (gridArrangement === 'horizontal')
-            ? buildTriangleGrid(w, h, triangleSize / (resolutionScale || 1))
-            : buildTriangleGridVertical(w, h, triangleSize / (resolutionScale || 1))
+          
+          // 决定使用哪个参数构建网格
+          // 如果存在 preciseGridParams 且 triangleSize（UI值）与其接近（说明用户没有大幅拖动滑块破坏对齐）
+          // 则优先使用精确参数
+          let sideToUse = triangleSize
+          let offX = gridOffsetX
+          let offY = gridOffsetY
+          let arr = gridArrangement
+          
+          if (preciseGridParams && Math.abs(preciseGridParams.side - triangleSize) < 1.5) {
+             sideToUse = preciseGridParams.side
+             offX = preciseGridParams.offsetX
+             offY = preciseGridParams.offsetY
+             arr = preciseGridParams.arrangement
+             // 保持 UI 状态一致
+             if (arr !== gridArrangement) setGridArrangement(arr)
+          }
+
+          const gridNew = (arr === 'horizontal')
+            ? buildTriangleGrid(w, h, sideToUse, offX, offY)
+            : buildTriangleGridVertical(w, h, sideToUse, offX, offY)
+          
           setGrid(gridNew)
           const mapped = await mapImageToGrid(imgBitmap, gridNew, palette)
+          
+          // 如果仍处于精确对齐模式，再次应用校准
+          if (preciseGridParams && detectedGrid && Math.abs(preciseGridParams.side - triangleSize) < 1.5) {
+             rectifyColorsByGrid(mapped, detectedGrid)
+          }
+
           setTriangles(mapped)
           setUndoStack([mapped.map(t => t.color)])
           setRedoStack([])
@@ -637,8 +841,8 @@ const contribRef = useRef({ branch_pruned: 0, enqueued: 0, expanded: 0, critical
           const w = grid?.width || 800
           const h = grid?.height || 600
           const g = (gridArrangement === 'horizontal')
-            ? buildTriangleGrid(w, h, triangleSize / (resolutionScale || 1))
-            : buildTriangleGridVertical(w, h, triangleSize / (resolutionScale || 1))
+            ? buildTriangleGrid(w, h, triangleSize, gridOffsetX, gridOffsetY)
+            : buildTriangleGridVertical(w, h, triangleSize, gridOffsetX, gridOffsetY)
           setGrid(g)
           const base = g.triangles.map(t => ((t.up ?? t.left) ? '#1b2333' : '#121826'))
           setTriangles(g.triangles.map((t, i) => ({ ...t, color: base[i] })))
@@ -652,7 +856,7 @@ const contribRef = useRef({ branch_pruned: 0, enqueued: 0, expanded: 0, critical
         rebuildTimerRef.current = null
       }
     }, 150)
-  }, [triangleSize, gridArrangement, resolutionScale, loadedProject, colorSeparation, imgBitmap, editMode])
+  }, [triangleSize, gridArrangement, loadedProject, colorSeparation, imgBitmap, editMode, preciseGridParams, detectedGrid, gridOffsetX, gridOffsetY])
 
   // 将缩放系数写入 CSS 变量，供画布样式使用
   useEffect(() => {
@@ -2272,7 +2476,6 @@ const contribRef = useRef({ branch_pruned: 0, enqueued: 0, expanded: 0, critical
                 onDragStart={onDragStart}
                 onDragMove={onDragMove}
                 onDragEnd={onDragEnd}
-                resolutionScale={resolutionScale}
               />
             </div>
           </div>
@@ -2395,14 +2598,6 @@ const contribRef = useRef({ branch_pruned: 0, enqueued: 0, expanded: 0, critical
               onChange={e=>{ const v=+e.target.value; setCanvasScale(Number.isFinite(v)? v : 1) }}
             />
             <span>{Math.round(canvasScale*100)}%</span>
-          </div>
-          <div className="row">
-            <label>分辨率</label>
-            <span style={{ display:'inline-flex', gap:'.35rem' }}>
-              <button onClick={()=>setResolutionScale(1)} disabled={loadedProject || resolutionScale===1} title={loadedProject ? '导入工程状态下分辨率不可改' : '将网格分辨率设为 1x'}>1x</button>
-              <button onClick={()=>setResolutionScale(2)} disabled={loadedProject || resolutionScale===2} title={loadedProject ? '导入工程状态下分辨率不可改' : '将网格分辨率设为 2x（约四倍三角数量）'}>2x</button>
-              <button onClick={()=>setResolutionScale(4)} disabled={loadedProject || resolutionScale===4} title={loadedProject ? '导入工程状态下分辨率不可改' : '将网格分辨率设为 4x（更细）'}>4x</button>
-            </span>
           </div>
           <div className="row">
             <label>视图</label>

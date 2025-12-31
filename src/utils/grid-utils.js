@@ -1,5 +1,30 @@
 import { nearestPaletteFromLab, rgb2lab, distLab } from './color-utils'
 
+// 并查集（Union-Find）用于同色连通分量压缩
+// 放在顶部以防止 ReferenceError (Hoisting Issue)
+export class UnionFind {
+  constructor(n) {
+    this.parent = new Uint32Array(n)
+    this.rank = new Uint8Array(n)
+    for (let i = 0; i < n; i++) this.parent[i] = i
+  }
+  find(x) {
+    while (this.parent[x] !== x) {
+      this.parent[x] = this.parent[this.parent[x]]
+      x = this.parent[x]
+    }
+    return x
+  }
+  union(a, b) {
+    let x = this.find(a), y = this.find(b)
+    if (x === y) return false
+    if (this.rank[x] < this.rank[y]) { const t = x; x = y; y = t }
+    this.parent[y] = x
+    if (this.rank[x] === this.rank[y]) this.rank[x]++
+    return true
+  }
+}
+
 // 简单的 hex 转 lab 辅助函数
 function hex2lab(hex) {
   const r = parseInt(hex.slice(1, 3), 16)
@@ -79,18 +104,20 @@ function triVertices(x, y, side, up) {
   }
 }
 
-export function buildTriangleGrid(width, height, side) {
+export function buildTriangleGrid(width, height, side, offsetX = 0, offsetY = 0) {
   const H = side * Math.sqrt(3) / 2
   // 为了让四边都成为直线，需要让网格在边界外延一圈，再裁剪回矩形
   // 横向步长为 side/2，纵向步长为 H
-  const cols = Math.floor((width + side) / (side / 2)) + 2
-  const rows = Math.floor((height + H) / H) + 2
+  // 扩大覆盖范围以适应较大的 offset (pMod 后 offset 可能接近 2H 或 S)
+  const cols = Math.floor((width + side) / (side / 2)) + 4
+  const rows = Math.floor((height + H) / H) + 4
   const triangles = []
   let id = 0
-  for (let r = -1; r < rows; r++) {
-    for (let c = -2; c < cols; c++) {
-      const x = c * (side / 2)
-      const y = r * H
+  // 起始索引向前扩展，确保 offset 较大时也能覆盖 0 坐标附近的区域
+  for (let r = -3; r < rows; r++) {
+    for (let c = -4; c < cols; c++) {
+      const x = c * (side / 2) + offsetX
+      const y = r * H + offsetY
       const up = ((r + c) % 2 === 0)
       const v = triVertices(x, y, side, up)
       // 对越界三角形进行裁剪，生成用于绘制/采样的多边形
@@ -153,17 +180,19 @@ function triVerticesVertical(x, y, side, left) {
 }
 
 // 构建“底边竖直”的网格（等价于原网格分布旋转90°）
-export function buildTriangleGridVertical(width, height, side) {
+export function buildTriangleGridVertical(width, height, side, offsetX = 0, offsetY = 0) {
   const H = side * Math.sqrt(3) / 2
   // 垂直底边模式同样在边界外延一圈再裁剪
-  const cols = Math.floor((width + H) / H) + 2
-  const rows = Math.floor((height + side / 2) / (side / 2)) + 2
+  // 扩大覆盖范围
+  const cols = Math.floor((width + H) / H) + 4
+  const rows = Math.floor((height + side / 2) / (side / 2)) + 4
   const triangles = []
   let id = 0
-  for (let r = -2; r < rows; r++) {
-    for (let c = -1; c < cols; c++) {
-      const x = c * H
-      const y = r * (side / 2)
+  // 起始索引向前扩展
+  for (let r = -4; r < rows; r++) {
+    for (let c = -3; c < cols; c++) {
+      const x = c * H + offsetX
+      const y = r * (side / 2) + offsetY
       const left = ((r + c) % 2 === 0)
       const v = triVerticesVertical(x, y, side, left)
       const clipped = clipPolygonToRect(v, width, height)
@@ -202,6 +231,72 @@ export function buildTriangleGridVertical(width, height, side) {
   }
   for (const t of triangles) t.neighbors = Array.from(neighbors.get(t.id))
   return { width, height, side, H, triangles }
+}
+
+export function rectifyColorsByGrid(triangles, gridSpec) {
+  if (!gridSpec || !gridSpec.success) return false;
+
+  const { spacing, anchors, angles } = gridSpec;
+  const degToRad = Math.PI / 180;
+  const cs = angles.map(deg => ({ c: Math.cos(deg * degToRad), s: Math.sin(deg * degToRad) }));
+
+  // Map to store groups: "k1,k2,k3" -> [triangleIndices]
+  const groups = new Map();
+  const idToIndex = new Map(triangles.map((t, i) => [t.id, i]));
+
+  triangles.forEach((t, idx) => {
+    if (t.deleted || t.color === 'transparent') return;
+    const { x, y } = t.centroid;
+    
+    // Calculate 3 indices
+    // k = floor((rho - anchor) / spacing)
+    const keys = [];
+    for (let i = 0; i < 3; i++) {
+      const rho = x * cs[i].c + y * cs[i].s;
+      keys.push(Math.floor((rho - anchors[i]) / spacing));
+    }
+    
+    const key = keys.join(',');
+    if (!groups.has(key)) groups.set(key, []);
+    groups.get(key).push(idx);
+  });
+
+  let hasChange = false;
+  const updates = [];
+  
+  // Vote and assimilate
+  for (const [key, indices] of groups) {
+    if (indices.length === 0) continue;
+    
+    // Count colors
+    const counts = {};
+    let maxCount = 0;
+    let maxColor = null;
+    
+    for (const idx of indices) {
+      const c = triangles[idx].color;
+      counts[c] = (counts[c] || 0) + 1;
+      if (counts[c] > maxCount) {
+        maxCount = counts[c];
+        maxColor = c;
+      }
+    }
+    
+    // Assimilate all to maxColor
+    for (const idx of indices) {
+      if (triangles[idx].color !== maxColor) {
+        updates.push({ index: idx, color: maxColor });
+        hasChange = true;
+      }
+    }
+  }
+  
+  // Apply updates
+  for (const u of updates) {
+    triangles[u.index].color = u.color;
+  }
+  
+  return hasChange;
 }
 
 export function denoiseGrid(triangles) {
@@ -599,7 +694,10 @@ export async function mapImageToGrid(bitmap, grid, palette, options = {}) {
       }
     }
 
-    // 传统路径：采样点分布 + 密度聚类
+    // 传统路径：采样点分布 + 投票策略 (Majority Vote)
+    // 之前使用加权平均 Lab (weightedMeanLab)，但这会导致边界处的颜色混合（如红+白=粉），
+    // 如果粉色不在调色板中，最近邻可能映射错误（如映射回红色而不是白色）。
+    // 现在改为：对每个采样点分别寻找最近邻颜色，然后进行投票。
     const pts = [
       c,
       insidePoint(v0, c, 0.20),
@@ -608,57 +706,43 @@ export async function mapImageToGrid(bitmap, grid, palette, options = {}) {
       insidePoint(midPoint(v0, v1), c, 0.15),
       insidePoint(midPoint(v1, v2), c, 0.15),
       insidePoint(midPoint(v2, v0), c, 0.15),
+      // 增加中心区域权重
+      insidePoint(c, v0, 0.05),
+      insidePoint(c, v1, 0.05),
+      insidePoint(c, v2, 0.05)
     ]
-    const labs = pts.map(p=>labAt(p.x, p.y))
-    const weights = [2,1,1,1,1.2,1.2,1.2]
-
-    // 2. 改进的颜色决策：密度聚类（Mode Seeking）
-    // 目的：如果采样点横跨两种颜色（边界处），选择权重密度最大的一簇，而不是简单的平均
     
-    // 计算每个点在阈值（例如 Lab 距离 12）内的邻居权重之和（密度）
-    const DENSITY_RADIUS = 12
-    const densities = labs.map((l1, i) => {
-      let d = 0
-      for(let j=0; j<labs.length; j++) {
-        if (distLab(l1, labs[j]) < DENSITY_RADIUS) {
-          d += weights[j]
-        }
-      }
-      return { index: i, density: d }
-    })
+    const votes = new Map() // hex -> weight
+    for (const p of pts) {
+      const lab = labAt(p.x, p.y)
+      // 为每个点单独找最近邻调色板颜色
+      const hex = nearestPaletteFromLab(lab, palette)
+      // 中心点权重略高
+      const weight = (p === c) ? 2 : 1
+      votes.set(hex, (votes.get(hex) || 0) + weight)
+    }
     
-    // 找到密度最大的点作为“核心点”
-    densities.sort((a, b) => b.density - a.density)
-    const coreIndex = densities[0].index
-    const coreLab = labs[coreIndex]
-
-    // 只聚合与核心点接近的点
-    const clusterIndices = []
-    for(let i=0; i<labs.length; i++) {
-      if (distLab(labs[i], coreLab) < DENSITY_RADIUS) {
-        clusterIndices.push(i)
+    // 找出票数最高的颜色
+    let bestHex = null
+    let maxVote = -1
+    for (const [hex, count] of votes.entries()) {
+      if (count > maxVote) {
+        maxVote = count
+        bestHex = hex
       }
     }
-
-    const labsCluster = clusterIndices.map(i => labs[i])
-    const weightsCluster = clusterIndices.map(i => weights[i])
-    const meanLab = weightedMeanLab(labsCluster, weightsCluster)
-
-    // 禁用调色板映射：直接使用像素的平均 Lab 转回 RGB
-    // 强制使用“真实”颜色，避免被旧调色板或相近色“吸附”
-    // const color = nearestPaletteFromLab(meanLab, palette) 
     
-    // Lab -> RGB -> Hex (不依赖调色板)
-    // 需要引入 lab2rgb 转换
-    return { ...t, meanLab }
+    return { ...t, color: bestHex, meanLab: hex2lab(bestHex) }
   })
   
-  // 第二阶段：统一映射到当前调色板
-  // 此时 palette 已经是基于 targetCount 重新计算过的精确调色板
-  // 这一步确保所有三角形最终都只使用 palette 中的颜色
+  // 第二阶段：统一映射到当前调色板 (此时 t.color 已经是调色板颜色，只需透传)
   const finalTriangles = mappedTriangles.map(t => {
-    const color = nearestPaletteFromLab(t.meanLab, palette)
-    return { ...t, color }
+    // 如果上一步某种原因没拿到 color，这里兜底
+    if (!t.color) {
+        const color = nearestPaletteFromLab(t.meanLab, palette)
+        return { ...t, color }
+    }
+    return t
   })
   
   // 3. 后处理：去噪（孤立点消除）
@@ -705,7 +789,7 @@ function lab2rgb(L, a, b) {
   r = Math.round(Math.max(0, Math.min(255, (r > 0.0031308 ? (1.055 * Math.pow(r, 1 / 2.4) - 0.055) : 12.92 * r) * 255)))
   g = Math.round(Math.max(0, Math.min(255, (g > 0.0031308 ? (1.055 * Math.pow(g, 1 / 2.4) - 0.055) : 12.92 * g) * 255)))
   b_val = Math.round(Math.max(0, Math.min(255, (b_val > 0.0031308 ? (1.055 * Math.pow(b_val, 1 / 2.4) - 0.055) : 12.92 * b_val) * 255)))
-  return `#{r.toString(16).padStart(2,'0')}{g.toString(16).padStart(2,'0')}{b_val.toString(16).padStart(2,'0')}`
+  return `#${r.toString(16).padStart(2,'0')}${g.toString(16).padStart(2,'0')}${b_val.toString(16).padStart(2,'0')}`
 }
 
 export function isUniform(triangles) {
@@ -714,30 +798,6 @@ export function isUniform(triangles) {
   if (active.length === 0) return false
   const c = active[0].color
   return active.every(t => t.color === c)
-}
-
-// 并查集（Union-Find）用于同色连通分量压缩
-export class UnionFind {
-  constructor(n) {
-    this.parent = new Uint32Array(n)
-    this.rank = new Uint8Array(n)
-    for (let i = 0; i < n; i++) this.parent[i] = i
-  }
-  find(x) {
-    while (this.parent[x] !== x) {
-      this.parent[x] = this.parent[this.parent[x]]
-      x = this.parent[x]
-    }
-    return x
-  }
-  union(a, b) {
-    let x = this.find(a), y = this.find(b)
-    if (x === y) return false
-    if (this.rank[x] < this.rank[y]) { const t = x; x = y; y = t }
-    this.parent[y] = x
-    if (this.rank[x] === this.rank[y]) this.rank[x]++
-    return true
-  }
 }
 
 // 根据当前三角形颜色，将同色连通分量压缩为组件，并构建组件邻接关系（RAG）

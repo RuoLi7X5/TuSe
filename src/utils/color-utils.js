@@ -267,13 +267,16 @@ export async function quantizeImage(bitmap, targetCount){
     return { palette: distinctColors.map(c => hex(c.rgb[0], c.rgb[1], c.rgb[2])) }
   }
 
-  // 默认 K-Means 流程
-  const K = Math.min(10, Math.max(3, Math.round(Math.sqrt(samples.length/800))))
+  // 默认 K-Means 流程，自动推断 K
+  // 增加初始 K 值，以便后续通过 mergeCenters 合并相似色
+  const K = Math.min(16, Math.max(5, Math.round(Math.sqrt(samples.length/500))))
   let centers=kmeans(samples, K, 6)
   
   // 仅在未指定 targetCount 时进行合并
+  // 自动合并相似色：提高阈值以更积极地合并相近色
+  // 对于卡通风格图片，这有助于自动找到主要色块
   if (!Number.isFinite(tc) || tc < 2) {
-    centers=mergeCenters(centers, 10)
+    centers=mergeCenters(centers, 12) // 提高阈值 10 -> 12
   }
 
   const palette=centers.map(c=>{
