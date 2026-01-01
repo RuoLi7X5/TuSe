@@ -30,24 +30,25 @@ export default function HelpPage() {
       </div>
 
       <div className="panel" style={{ background:'var(--panel)' }}>
-        <Section title="使用说明（快速上手）">
+        <Section title="使用流程">
           <div>
-            1. 截图信息尽量只保留相关内容，避免多余元素；否则识别后需要手动框选并删除无关区域。
+            1.上传图片(截图尽量只保留题目区域)。否则需要手动框选并删除多余色块区域。
           </div>
           <div>
-            2. 在画布上点击 A 区域的任意三角形，在右侧颜色集合选择要泼涂的颜色，点击“泼涂”，即可将 A 的联通区域统一为该颜色。
-          </div>
-          <div style={{ color:'var(--muted)' }}>
-            （识别阶段可能因图片的细微色差将同一种颜色分为多种。可先用泼涂保留想要的颜色，再点击“选择同色”快速选中所有同色区域，随后继续泼涂统一。）
+            2.输入颜色种类
           </div>
           <div>
-            3. 输入步数限制（保证在该步数内有解），性能参数可按需要自行调节。
+            3.点击几何校准
           </div>
           <div>
-            4. 点击“自动求解”开始计算。
+            4.输入求解步骤上限，保存编辑
           </div>
           <div>
-            5. 若参数设置有疑问，请查看下方详细说明与建议。
+            5.点击自动求解即可开始进行求解
+          </div>
+          <br/>
+          <div>
+            性能参数一般不需要更改设置
           </div>
         </Section>
         <Section title="快捷键与操作（Shortcut）">
@@ -70,9 +71,7 @@ export default function HelpPage() {
           </div>
         </Section>
 
-        <Section title="发布与后端遥测配置">
-          <div>本应用为纯前端工具，无后端部署。</div>
-        </Section>
+
 
         <Section title="参数总览（与性能调节窗口一致）">
           <div style={{ fontWeight:'bold' }}>进度与时间预算</div>

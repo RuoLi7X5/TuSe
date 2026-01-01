@@ -373,6 +373,10 @@ canvas {
     order: 2; /* 确保控制面板在画布下方 */
   }
 
+  .panel.steps {
+    order: 3; /* 确保方案步骤在控制面板下方 */
+  }
+
   /* 调整按钮大小以适应触摸 */
   button, .panel button, .controls button {
     padding: 0.75rem 1rem; 
