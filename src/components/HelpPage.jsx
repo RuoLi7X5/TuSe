@@ -50,10 +50,19 @@ export default function HelpPage() {
             5. 若参数设置有疑问，请查看下方详细说明与建议。
           </div>
         </Section>
-        <Section title="操作补充（Tips）">
-          <div>1. 按住 Shift 可多选三角形</div>
-          <div>2. 按住 Ctrl 并鼠标左键，可选中同色联通区域</div>
-          <div>3. 鼠标左键拖拽绘制，点击右键，可选中封闭图形内三角形</div>
+        <Section title="快捷键与操作（Shortcut）">
+          <div style={{ fontWeight:'bold', marginBottom:'4px' }}>选择与编辑</div>
+          <div>Shift + 点击：多选/取消多选三角形</div>
+          <div>Ctrl + 点击：选中与该三角形颜色相同且相连的所有区域（连通域选择）</div>
+          <div>鼠标右键：在框选/套索绘制完成后，选中范围内的所有三角形</div>
+          <div style={{ fontWeight:'bold', marginTop:'8px', marginBottom:'4px' }}>画布视图</div>
+          <div>WASD / 方向键：平移画布视角</div>
+          <div>鼠标中键 / 按住空格+左键拖拽：平移画布</div>
+          <div>Ctrl + 鼠标滚轮：缩放画布（以鼠标为中心）</div>
+          <div>双指捏合（触屏）：缩放画布</div>
+          <div style={{ fontWeight:'bold', marginTop:'8px', marginBottom:'4px' }}>通用</div>
+          <div>Ctrl + Z：撤销上一步操作</div>
+          <div>Ctrl + Y / Ctrl + Shift + Z：重做</div>
         </Section>
         <Section title="页面导航">
           <div>
@@ -62,10 +71,7 @@ export default function HelpPage() {
         </Section>
 
         <Section title="发布与后端遥测配置">
-          <div>同域部署：推荐将前端打包后的 `dist` 由后端静态托管，与 API 共域名，避免跨域与混合内容。</div>
-          <div>后端地址与开关：遥测默认开启且不在性能调节窗口展示；地址同域自动推断，开发环境默认 `http://localhost:3001`。</div>
-          <div>健康检查：后端提供 `/api/health` 接口用于部署联调；前端不再提供面板按钮。</div>
-          <div>跨域部署：如前端为 Cloudflare Pages，需在后端放通 CORS 源并确保 HTTPS，否则浏览器会拦截。</div>
+          <div>本应用为纯前端工具，无后端部署。</div>
         </Section>
 
         <Section title="参数总览（与性能调节窗口一致）">
@@ -105,72 +111,6 @@ export default function HelpPage() {
           <div style={{ color:'var(--muted)' }}>
             说明：如遇参数含义疑惑或效果异常，请以本节与性能调节窗口的中文提示为准；可先减小束宽、提高节流并放宽稀有色限制后再观察。
           </div>
-        </Section>
-
-        <Section title="详细参数解释与关系（补充）">
-          <div>严格 A* 与分层启发式：`strictMode=true` 且启用 `layered_*_max` 时仍可采纳（最优性可证）；`sum/weighted` 变体一般非可采纳，慎用于严格模式。</div>
-          <div>Best-First 排序：`useAStarInBestFirst` 用 f=g+h 排序更稳；`useStrongLBInBestFirst` 更保守，适合大图降噪。</div>
-          <div>束搜索收敛：`beamWidth` 配合 `beamDecay` 与 `beamMin` 控制深层复杂度；过小可能错过好解，过大耗时显著。</div>
-          <div>桥接与稀有：`enableBridgeFirst` 与稀有阈值共同影响是否优先跨分量；提高 `rareAllowBridgeMin`/`GateMin` 能抑制质量差的稀有桥接。</div>
-          <div>扩张过滤：`minDeltaRatio` 与 `lbImproveMin` 联合作用——要求“扩张比例”与“下界减少量”至少满足其一，否则过滤。</div>
-          <div>前瞻与时间预算：两步前瞻提升决策稳健性但更耗时；与 `workerTimeBudgetMs`、进度节流参数共同决定交互流畅度。</div>
-          <div>路径优化：窗口重排与交换回合在长路径时收益递减；过大窗口可能与严格阶段冲突，建议在非严格阶段使用。</div>
-          <div>学习优先器（UCB）：仅影响颜色排序，不改变严格下界；与束搜索结合能显著提速，不影响最终最短性证明。</div>
-          <div>PDB 插件：加载到对应 `pdb_*` 后，`*_max` 与严格下界取 max 保持可采纳；未加载时估计为 0，等效仅严格下界。</div>
-        </Section>
-
-        <Section title="相互影响与典型触发">
-          <div>
-            - 当 `stepLimit` 有限时，主搜索未统一会触发 DFS 限深回退；日志显示阶段 `dfs`，`queue=0` 代表使用栈而非队列。
-          </div>
-          <div>
-            - 预处理很快结束时仍会输出 `components_done`，便于确认阶段完成与分量数量。
-          </div>
-          <div>
-            - 启用 Beam 与 Incremental 可在有限 `stepLimit` 下提升最优更新频率，降低“空转”。
-          </div>
-        </Section>
-
-        <Section title="日志字段解释">
-          <div>
-            - `phase`：当前阶段（如 `components_build`、`components_done`、`dfs`、`best_update`、`solution`）。
-          </div>
-          <div>
-            - `nodes`：累计探索节点数；`solutions`：当前候选分支数；`queue`：队列大小（DFS 为 0）。
-          </div>
-          <div>
-            - `perf.enqueued` / `perf.expanded` / `perf.filteredZero`：性能计数（入队、扩张、零扩张过滤）。
-          </div>
-          <div>
-            - `components` / `count`：连通分量数量与大小摘要；在 `components_done` 汇总输出。
-          </div>
-        </Section>
-
-        <Section title="推荐组合（两种工作模式）">
-          <div>
-            - 约束最短模式：`stepLimit=Infinity`、`enableBeam=true`、`beamWidth=32`、`lbImproveMin≈0.5`、`enableIncremental=true`；
-            `preprocessTimeBudgetMs=120000`、`workerTimeBudgetMs=180000–300000`。
-          </div>
-          <div>
-            - 探索/快速可行模式：`useDFSFirst=true`、`returnFirstFeasible=true`、`stepLimit≈12–48`，并保留 `enableZeroExpandFilter`；
-            如需更稳，增加 `beamWidth` 与 `enableIncremental`。
-          </div>
-        </Section>
-
-        <Section title="数据互通与关键传递">
-          <div>全栈数据流：前端基于 `window.SOLVER_FLAGS` 控制求解与遥测；`telemetry.js` 使用 `serverBaseUrl` 与开关与后端交互。</div>
-          <div>遥测开关：默认开启且不在性能调节窗口展示；如需查看状态，可检查 `window.SOLVER_FLAGS.enableTelemetry`。</div>
-          <div>地址策略：同域优先推断；开发默认为 `http://localhost:3001`。如需覆盖可在代码层设置 `serverBaseUrl`。</div>
-          <div>学习模型数据汇总仅在管理员后台展示（#/admin）；如需访问请联系管理员。</div>
-          <div>后端检查：`/api/health` 返回后端健康状态；策略摘要与统计分别在 `/api/graphs/strategy` 与 `/api/learn/ucb` 路由。</div>
-        </Section>
-
-        <Section title="发布前检查清单">
-          <div>1) 前端：生产环境 `serverBaseUrl` 留空以同域；遥测默认开启，无需在面板设置；打开帮助页确认提示完整。</div>
-          <div>2) 后端：静态托管 `dist`；确认 `/api/health` 正常；如跨域部署，放通 CORS 并启用 HTTPS。</div>
-          <div>3) 数据库：设置 `MONGODB_URI` 环境变量；检查运行日志无连接错误；在总站页查看统计是否能刷新。</div>
-          <div>4) 全栈互通：执行一次自动求解，观察事件日志与策略上传；在总站页看到摘要更新。</div>
-          <div>5) 性能参数：根据画布规模校准束宽与时间预算；确保交互流畅无明显卡顿。</div>
         </Section>
 
         <Section title="常见问题">
