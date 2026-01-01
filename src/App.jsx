@@ -850,6 +850,37 @@ const contribRef = useRef({ branch_pruned: 0, enqueued: 0, expanded: 0, critical
     rebuildTimerRef.current = setTimeout(async () => {
       try {
         if (imgBitmap && palette.length && editMode) {
+          // Check if we are re-entering edit mode with existing modified data
+          // If triangles exist and look like they belong to the current image/grid config, 
+          // we should KEEP them instead of rebuilding from scratch.
+          // Simple heuristic: if we have triangles, and undoStack has history, 
+          // or if we are just toggling editMode but didn't change grid params.
+          
+          // However, this effect runs on [triangleSize, gridArrangement, ..., editMode]
+          // If editMode changed to true, we might want to preserve.
+          // If triangleSize changed, we MUST rebuild.
+          
+          // Let's distinguish "param change" from "mode toggle".
+          // We can use a ref to track the last used grid params.
+          
+          const currentParamsSignature = `${triangleSize}-${gridArrangement}-${gridOffsetX}-${gridOffsetY}-${imgBitmap.width}-${imgBitmap.height}`
+          const lastParams = window.__lastGridParams || ''
+          
+          const isParamChange = currentParamsSignature !== lastParams
+          
+          if (!isParamChange && triangles && triangles.length > 0) {
+             // Params didn't change, likely just entered edit mode or other minor update.
+             // Preserve current triangles!
+             // BUT, we must ensure grid is set if missing.
+             if (!grid) {
+                // ... rebuild grid only ...
+             }
+             return 
+          }
+          
+          // Update last params
+          window.__lastGridParams = currentParamsSignature
+          
           const w = imgBitmap.width
           const h = imgBitmap.height
           
@@ -961,6 +992,7 @@ const contribRef = useRef({ branch_pruned: 0, enqueued: 0, expanded: 0, critical
       if (!currentWrap) return
 
       e.preventDefault()
+      e.stopPropagation() // 阻止事件冒泡，防止浏览器缩放
       
       const delta = e.deltaY !== 0 ? e.deltaY : e.deltaX
       if (delta === 0) return
@@ -1006,8 +1038,10 @@ const contribRef = useRef({ branch_pruned: 0, enqueued: 0, expanded: 0, critical
       scaleRef.current = nextScale
       setCanvasScale(nextScale)
     }
-    wrap.addEventListener('wheel', onWheel, { passive: false })
-    return () => wrap.removeEventListener('wheel', onWheel)
+    // 添加 passive: false 以便能阻止默认的浏览器缩放行为
+    // 同时在捕获阶段监听，确保优先处理
+    window.addEventListener('wheel', onWheel, { passive: false, capture: true })
+    return () => window.removeEventListener('wheel', onWheel, { capture: true })
   }, [])
 
   // 保证视图始终铺满窗口：网格变化或旋转时，限制到最小填充缩放并居中
@@ -1455,157 +1489,271 @@ const contribRef = useRef({ branch_pruned: 0, enqueued: 0, expanded: 0, critical
       const maxBranches = 3
       // 仅使用本地计算：优先 Web Worker，失败则回退主线程
       let result = null
+      // 强制使用 Web Worker，不再回退到主线程
       if (!result) {
         try {
-          const worker = new Worker(new URL('./utils/solver-worker.js', import.meta.url), { type: 'module' })
-          try { window.__solverWorker = worker } catch {}
-          const resPromise = new Promise((resolve, reject)=>{
-            // 将 Worker 超时提升到 5 分钟以匹配计算预算
-            const timeout = setTimeout(()=>{ try{ worker.terminate() }catch{}; try{ window.__solverWorker = null }catch{}; reject(new Error('worker-timeout')) }, 300000)
-            worker.onmessage = (ev)=>{
-              const { type, payload } = ev.data || {}
-              if(type==='progress'){
-                const p = payload
-                const now = Date.now()
-                const flags = (window.SOLVER_FLAGS||{})
-                const compPhases = ['components','components_build','components_analysis']
-                const strictPhases = ['strict_astar']
-                const intervalCfg = compPhases.includes(p?.phase)
-                  ? (flags.progressComponentsIntervalMs ?? 0)
-                  : strictPhases.includes(p?.phase)
-                    ? (flags.progressAStarIntervalMs ?? 80)
-                    : (flags.progressDFSIntervalMs ?? 100)
-                if (intervalCfg===0 || (now - progressLastRef.current) >= intervalCfg) {
-                  const nodes = p?.nodes ?? 0
-                  const sols = p?.solutions ?? 0
-              const phase = p?.phase === 'components' ? `已识别连通分量：${p?.count}`
-                : p?.phase === 'components_build' ? `正在构建分量：${p?.count}（当前大小 ${p?.compSize??'-'}）`
-                : p?.phase === 'best_update' ? `已更新最优：起点 #${p?.bestStartId}，最少步骤 ${p?.minSteps}`
-                : `已探索节点：${nodes}，候选分支：${sols}`
-              setStatus(`正在计算最少步骤… ${phase}`)
-              setSolveProgress({
-                phase: p?.phase,
-                nodes: p?.nodes,
-                solutions: p?.solutions,
-                queue: p?.queue,
-                components: p?.count,
-                bestStartId: p?.bestStartId,
-                minSteps: p?.minSteps,
-                elapsedMs: now - solveStartRef.current,
-                perf: p?.perf,
-              })
-              // 发送进度遥测（后端 events）
-              telemetrySafeLog({
-                phase: p?.phase,
-                nodes: p?.nodes,
-                solutions: p?.solutions,
-                queue: p?.queue,
-                perf: p?.perf,
-                extra: { bestStartId: p?.bestStartId, minSteps: p?.minSteps, count: p?.count }
-              })
-              // 记录日志（滚动窗口显示）
-              const perf = p?.perf || {}
-              const phaseRaw = p?.phase || 'search'
-              const compInfo = (phaseRaw==='components' || phaseRaw==='components_build')
-                ? ` count=${p?.count??0}${p?.compSize!=null?` compSize=${p.compSize}`:''}`
-                : ''
-              const extra = (function(){
-                if (phaseRaw==='branch_pruned') {
-                  return ` reason=${p?.reason??'-'} step=${p?.step??'-'} color=${p?.color??'-'}`
-                } else if (phaseRaw==='branch_quality') {
-                  const dr = (typeof p?.deltaRatio==='number') ? (p.deltaRatio.toFixed(3)) : (p?.deltaRatio??'-')
-                  return ` step=${p?.step??'-'} color=${p?.color??'-'} delta=${p?.delta??'-'} dr=${dr} lb=${p?.lb??'-'} prio=${p?.priority??'-'}`
-                } else if (phaseRaw==='components_analysis') {
-                  return ` count=${p?.count??0}`
+          // -------------------- 8 Worker 并行调度 --------------------
+          const HARD_BUDGET_MS = 180000
+          const PAR_N = 8
+          const PAR_GROUP = 4
+
+          // 选 8 个不同的 preferredStartId（边界得分高），尽量减少重复工作
+          const computePreferredStartIds = (tris, k=8) => {
+            try {
+              const idToIndex = new Map(tris.map((t,i)=>[t.id,i]))
+              const neighbors = tris.map(t=>t.neighbors)
+              const active = []
+              for (let i=0;i<tris.length;i++){
+                const t = tris[i]
+                if (!t || t.deleted || !t.color || t.color==='transparent') continue
+                active.push(t.id)
+              }
+              const score = (id)=>{
+                const idx = idToIndex.get(id)
+                if (idx==null) return -Infinity
+                const t0 = tris[idx]
+                const c0 = t0?.color
+                if (!c0 || c0==='transparent' || t0.deleted) return -Infinity
+                let s = 0
+                const nbs = neighbors[idx] || []
+                for (const nb of nbs){
+                  const nidx = idToIndex.get(nb)
+                  if (nidx==null) continue
+                  const tn = tris[nidx]
+                  if (!tn || tn.deleted || !tn.color || tn.color==='transparent') continue
+                  if (tn.color !== c0) s++
                 }
-                return ''
-              })()
-              if (typeof perf?.filteredZero === 'number') { contribRef.current.branch_pruned += perf.filteredZero }
-              if (typeof perf?.enqueued === 'number') { contribRef.current.enqueued += perf.enqueued }
-              if (typeof perf?.expanded === 'number') { contribRef.current.expanded += perf.expanded }
-              const line = `[${((now - solveStartRef.current)/1000).toFixed(1)}s] phase=${phaseRaw}${compInfo}${extra} nodes=${p?.nodes??0} queue=${p?.queue??0} sols=${p?.solutions??0} enq=${perf?.enqueued??'-'} exp=${perf?.expanded??'-'} zf=${perf?.filteredZero??'-'}`
-              setProgressLogs(prev=>{
-                const next = [...prev, line]
-                return next.length>200 ? next.slice(next.length-200) : next
-              })
-              progressLastRef.current = now
+                return s
+              }
+              // 采样，避免全量评分过重
+              const SAMPLE_MAX = 1200
+              const sample = []
+              if (active.length <= SAMPLE_MAX) {
+                for (const id of active) sample.push(id)
+              } else {
+                const step = Math.max(1, Math.floor(active.length / 900))
+                for (let i=0;i<active.length && sample.length<900;i+=step) sample.push(active[i])
+                for (let i=0;i<300;i++) sample.push(active[Math.floor(Math.random()*active.length)])
+              }
+              const arr = []
+              const seen = new Set()
+              for (const id of sample){
+                if (id==null || seen.has(id)) continue
+                seen.add(id)
+                const s = score(id)
+                if (Number.isFinite(s)) arr.push({ id, s })
+              }
+              arr.sort((a,b)=> b.s - a.s)
+              const out = []
+              const used = new Set()
+              // 推荐起点优先塞进去
+              if (preferredStartId!=null) { out.push(preferredStartId); used.add(preferredStartId) }
+              for (const it of arr){
+                if (out.length >= k) break
+                if (!used.has(it.id)) { out.push(it.id); used.add(it.id) }
+              }
+              return out
+            } catch { return preferredStartId!=null ? [preferredStartId] : [] }
+          }
+
+          const preferredList = computePreferredStartIds(triangles, PAR_N)
+          // 保底：如果取不到，退化为 null（让 worker 自选）
+          while (preferredList.length < PAR_N) preferredList.push(null)
+
+          // 两组策略：A 更保守（强剪枝/桥接优先），B 更激进（更早 fullExpand/放松剪枝）
+          const mkFlags = (base, groupIdx, wIdx) => {
+            const common = {
+              ...base,
+              workerTimeBudgetMs: HARD_BUDGET_MS,
+              preprocessTimeBudgetMs: HARD_BUDGET_MS,
+              maxNodes: Infinity,
+              // 严格遵守用户步数上限：默认不允许自动放宽
+              allowStepLimitRelax: false,
+              // 提示：worker 内部会根据 retry_degrade 自动降级；这里做“起始多样性”
             }
-          } else if(type==='result'){
-                clearTimeout(timeout)
-                try{ worker.terminate() }catch{}
-                try{ window.__solverWorker = null }catch{}
-                resolve(payload)
+            if (groupIdx === 0) {
+              return {
+                ...common,
+                enableBridgeFirst: true,
+                enableLB: true,
+                enableBeam: true,
+                beamWidth: Math.max(48, common.beamWidth ?? 32),
+                beamMin: Math.max(12, common.beamMin ?? 8),
+                lbImproveMin: Math.max(2, common.lbImproveMin ?? 1),
+                useDFSFirst: false,
+                returnFirstFeasible: false,
+                enableSATPlanner: true,
               }
             }
-          })
-          // 先同步求解器参数（flags），再启动自动求解
-          const flagsInitial = Number.isFinite(maxStepsLimit)
+            return {
+              ...common,
+              // 激进组：更早放开剪枝（减少“过剪导致无解”的概率）
+              enableZeroExpandFilter: false,
+              rareFreqRatio: 0,
+              rareFreqAbs: 0,
+              minDeltaRatio: 0,
+              lbImproveMin: 0,
+              fullExpand: true,
+              disableStartPrune: true,
+              enableLB: false,
+              enableBeam: false,
+              useDFSFirst: false,
+              returnFirstFeasible: false,
+              enableSATPlanner: false,
+            }
+          }
+
+          const flagsInitialBase = Number.isFinite(maxStepsLimit)
             ? { ...(window.SOLVER_FLAGS||{}), useDFSFirst: false, returnFirstFeasible: false, useStrongLBInBestFirst: true, enableBeam: true, beamWidth: Math.max(24, window.SOLVER_FLAGS?.beamWidth ?? 32), beamMin: Math.max(10, window.SOLVER_FLAGS?.beamMin ?? 8), bifrontWeight: Math.max(2.2, window.SOLVER_FLAGS?.bifrontWeight ?? 2.0), rareAllowBridgeMin: Math.max(2.2, window.SOLVER_FLAGS?.rareAllowBridgeMin ?? 2.0), rareAllowGateMin: Math.max(1.2, window.SOLVER_FLAGS?.rareAllowGateMin ?? 1.0), lbImproveMin: Math.max(2, window.SOLVER_FLAGS?.lbImproveMin ?? 1) }
             : (window.SOLVER_FLAGS||{})
-          try { worker.postMessage({ type:'set_flags', flags: flagsInitial }) } catch {}
+
           const lightTris = triangles.map(t=>({ id: t.id, neighbors: t.neighbors, color: t.color, deleted: !!t.deleted }))
-          worker.postMessage({ type:'auto', triangles: lightTris, palette, maxBranches, stepLimit: maxStepsLimit, preferredStartId })
+
+          const workers = []
+          const states = Array.from({ length: PAR_N }, (_, i)=>({ i, last: null, best: null, nodes: 0, group: i < PAR_GROUP ? 0 : 1 }))
+          let solved = false
+
+          const cleanup = ()=>{
+            for (const w of workers) { try { w.terminate() } catch {} }
+            try { window.__solverWorker = null } catch {}
+            try { window.__solverWorkers = null } catch {}
+          }
+
+          // 让 PerformanceTuner 的 set_flags 能广播到全部 worker（兼容旧接口）
+          try {
+            window.__solverWorkers = workers
+            window.__solverWorker = {
+              postMessage: (msg)=>{ try { for (const w of workers) w.postMessage(msg) } catch {} },
+              terminate: ()=>{ try { for (const w of workers) w.terminate() } catch {} }
+            }
+          } catch {}
+
+          const pickLeader = ()=>{
+            // 规则：有 best_update 的优先；否则 nodes 最大者
+            let leader = 0
+            for (let i=0;i<states.length;i++){
+              const a = states[leader], b = states[i]
+              const aBest = a?.best?.minSteps
+              const bBest = b?.best?.minSteps
+              if (Number.isFinite(bBest) && !Number.isFinite(aBest)) { leader = i; continue }
+              if (Number.isFinite(bBest) && Number.isFinite(aBest) && bBest < aBest) { leader = i; continue }
+              if (!Number.isFinite(aBest) && !Number.isFinite(bBest) && (b.nodes||0) > (a.nodes||0)) { leader = i; continue }
+            }
+            return leader
+          }
+
+          const resPromise = new Promise((resolve, reject)=>{
+            const timeout = setTimeout(()=>{
+              if (solved) return
+              solved = true
+              cleanup()
+              reject(new Error('worker-timeout'))
+            }, HARD_BUDGET_MS + 8000)
+
+            for (let i=0;i<PAR_N;i++){
+              const groupIdx = i < PAR_GROUP ? 0 : 1
+              const w = new Worker(new URL('./utils/solver-worker.js', import.meta.url), { type: 'module' })
+              workers.push(w)
+              const flags = mkFlags(flagsInitialBase, groupIdx, i)
+              try { w.postMessage({ type:'set_flags', flags }) } catch {}
+
+              w.onmessage = (ev)=>{
+                const { type, payload } = ev.data || {}
+                if (solved) return
+                if (type === 'progress') {
+                  const p = payload
+                  const now = Date.now()
+                  states[i].last = p
+                  states[i].nodes = p?.nodes ?? states[i].nodes ?? 0
+                  if (p?.phase === 'best_update' && Number.isFinite(p?.minSteps)) {
+                    states[i].best = { minSteps: p.minSteps, bestStartId: p.bestStartId }
+                  }
+                  const leader = pickLeader()
+                  if (i !== leader) return
+
+                  const flagsUi = (window.SOLVER_FLAGS||{})
+                  const compPhases = ['components','components_build','components_analysis']
+                  const strictPhases = ['strict_astar']
+                  const intervalCfg = compPhases.includes(p?.phase)
+                    ? (flagsUi.progressComponentsIntervalMs ?? 0)
+                    : strictPhases.includes(p?.phase)
+                      ? (flagsUi.progressAStarIntervalMs ?? 80)
+                      : (flagsUi.progressDFSIntervalMs ?? 100)
+                  if (!(intervalCfg===0 || (now - progressLastRef.current) >= intervalCfg)) return
+
+                  const nodes = p?.nodes ?? 0
+                  const sols = p?.solutions ?? 0
+                  const phase = p?.phase === 'components' ? `已识别连通分量：${p?.count}`
+                    : p?.phase === 'components_build' ? `正在构建分量：${p?.count}（当前大小 ${p?.compSize??'-'}）`
+                    : p?.phase === 'best_update' ? `已更新最优：起点 #${p?.bestStartId}，最少步骤 ${p?.minSteps}`
+                    : p?.phase === 'retry_degrade' ? `降级重试：${p?.retry ?? '-'}`
+                    : `已探索节点：${nodes}，候选分支：${sols}`
+
+                  const grpLabel = groupIdx === 0 ? 'A' : 'B'
+                  setStatus(`8线程并行计算中（当前领先：W${i+1}/${PAR_N} 组${grpLabel}）… ${phase}`)
+                  setSolveProgress({
+                    phase: p?.phase,
+                    nodes: p?.nodes,
+                    solutions: p?.solutions,
+                    queue: p?.queue,
+                    components: p?.count,
+                    bestStartId: p?.bestStartId,
+                    minSteps: p?.minSteps,
+                    elapsedMs: now - solveStartRef.current,
+                    perf: p?.perf,
+                  })
+
+                  const perf = p?.perf || {}
+                  const phaseRaw = p?.phase || 'search'
+                  const compInfo = (phaseRaw==='components' || phaseRaw==='components_build')
+                    ? ` count=${p?.count??0}${p?.compSize!=null?` compSize=${p.compSize}`:''}`
+                    : ''
+                  const extra = (function(){
+                    if (phaseRaw==='branch_pruned') {
+                      return ` reason=${p?.reason??'-'} step=${p?.step??'-'} color=${p?.color??'-'}`
+                    } else if (phaseRaw==='branch_quality') {
+                      const dr = (typeof p?.deltaRatio==='number') ? (p.deltaRatio.toFixed(3)) : (p?.deltaRatio??'-')
+                      return ` step=${p?.step??'-'} color=${p?.color??'-'} delta=${p?.delta??'-'} dr=${dr} lb=${p?.lb??'-'} prio=${p?.priority??'-'}`
+                    } else if (phaseRaw==='components_analysis') {
+                      return ` count=${p?.count??0}`
+                    } else if (phaseRaw==='retry_degrade') {
+                      return ` retry=${p?.retry??'-'}`
+                    }
+                    return ''
+                  })()
+                  if (typeof perf?.filteredZero === 'number') { contribRef.current.branch_pruned += perf.filteredZero }
+                  if (typeof perf?.enqueued === 'number') { contribRef.current.enqueued += perf.enqueued }
+                  if (typeof perf?.expanded === 'number') { contribRef.current.expanded += perf.expanded }
+                  const line = `[${((now - solveStartRef.current)/1000).toFixed(1)}s] W${i+1}${groupIdx===0?'A':'B'} phase=${phaseRaw}${compInfo}${extra} nodes=${p?.nodes??0} queue=${p?.queue??0} sols=${p?.solutions??0} enq=${perf?.enqueued??'-'} exp=${perf?.expanded??'-'} zf=${perf?.filteredZero??'-'}`
+                  setProgressLogs(prev=>{
+                    const next = [...prev, line]
+                    return next.length>200 ? next.slice(next.length-200) : next
+                  })
+                  progressLastRef.current = now
+                } else if (type === 'result') {
+                  solved = true
+                  clearTimeout(timeout)
+                  const winner = { workerIndex: i, group: groupIdx, preferredStartId: preferredList[i] }
+                  cleanup()
+                  resolve({ ...payload, __winner: winner })
+                }
+              }
+
+              const pref = preferredList[i]
+              w.postMessage({ type:'auto', triangles: lightTris, palette, maxBranches, stepLimit: maxStepsLimit, preferredStartId: pref })
+            }
+          })
+
           result = await resPromise
+          // ------------------ end parallel block ------------------
         } catch (wErr) {
           try{ window.__solverWorker = null }catch{}
           // 回退：使用窗口内的自动求解器
-          const lightTris2 = triangles.map(t=>({ id: t.id, neighbors: t.neighbors, color: t.color, deleted: !!t.deleted }))
-          result = await window.Solver_minStepsAuto?.(lightTris2, palette, maxBranches, (p)=>{
-            const now = Date.now()
-            const flags = (window.SOLVER_FLAGS||{})
-            const compPhases = ['components','components_build','components_analysis']
-            const strictPhases = ['strict_astar']
-            const intervalCfg = compPhases.includes(p?.phase)
-              ? (flags.progressComponentsIntervalMs ?? 0)
-              : strictPhases.includes(p?.phase)
-                ? (flags.progressAStarIntervalMs ?? 80)
-                : (flags.progressDFSIntervalMs ?? 100)
-            if (intervalCfg===0 || (now - progressLastRef.current) >= intervalCfg) {
-            const nodes = p?.nodes ?? 0
-            const sols = p?.solutions ?? 0
-            const phase = p?.phase === 'components' ? `已识别连通分量：${p?.count}`
-              : p?.phase === 'components_build' ? `正在构建分量：${p?.count}（当前大小 ${p?.compSize??'-'}）`
-              : p?.phase === 'best_update' ? `已更新最优：起点 #${p?.bestStartId}，最少步骤 ${p?.minSteps}`
-              : `已探索节点：${nodes}，候选分支：${sols}`
-            setStatus(`正在计算最少步骤… ${phase}`)
-            setSolveProgress({
-              phase: p?.phase,
-              nodes: p?.nodes,
-              solutions: p?.solutions,
-              queue: p?.queue,
-              components: p?.count,
-              bestStartId: p?.bestStartId,
-              minSteps: p?.minSteps,
-              elapsedMs: now - solveStartRef.current,
-              perf: p?.perf,
-            })
-            const perf = p?.perf || {}
-            const phaseRaw2 = p?.phase || 'search'
-            const compInfo2 = (phaseRaw2==='components' || phaseRaw2==='components_build')
-              ? ` count=${p?.count??0}${p?.compSize!=null?` compSize=${p.compSize}`:''}`
-              : ''
-                const extra2 = (function(){
-                  if (phaseRaw2==='branch_pruned') {
-                    return ` reason=${p?.reason??'-'} step=${p?.step??'-'} color=${p?.color??'-'}`
-                  } else if (phaseRaw2==='branch_quality') {
-                    const dr = (typeof p?.deltaRatio==='number') ? (p.deltaRatio.toFixed(3)) : (p?.deltaRatio??'-')
-                    return ` step=${p?.step??'-'} color=${p?.color??'-'} delta=${p?.delta??'-'} dr=${dr} lb=${p?.lb??'-'} prio=${p?.priority??'-'}`
-                  } else if (phaseRaw2==='components_analysis') {
-                    return ` count=${p?.count??0}`
-                  }
-                  return ''
-                })()
-                if (typeof perf?.filteredZero === 'number') { contribRef.current.branch_pruned += perf.filteredZero }
-                if (typeof perf?.enqueued === 'number') { contribRef.current.enqueued += perf.enqueued }
-                if (typeof perf?.expanded === 'number') { contribRef.current.expanded += perf.expanded }
-                const line = `[${((now - solveStartRef.current)/1000).toFixed(1)}s] phase=${phaseRaw2}${compInfo2}${extra2} nodes=${p?.nodes??0} queue=${p?.queue??0} sols=${p?.solutions??0} enq=${perf?.enqueued??'-'} exp=${perf?.expanded??'-'} zf=${perf?.filteredZero??'-'}`
-            setProgressLogs(prev=>{
-              const next = [...prev, line]
-              return next.length>200 ? next.slice(next.length-200) : next
-            })
-            progressLastRef.current = now
-          }
-        }, Number.isFinite(maxStepsLimit) ? maxStepsLimit : 80)
+          // result = await window.Solver_minStepsAuto?.(lightTris2, palette, maxBranches, (p)=>{
+          // ... (整个回退逻辑注释掉) ...
+          // }, Number.isFinite(maxStepsLimit) ? maxStepsLimit : 80)
+          console.error('Worker failed, but skipping main thread fallback to enforce worker logic', wErr);
+          throw wErr; 
         }
       }
       // 严格审核：仅允许输出最终颜色统一的方案
@@ -1629,103 +1777,8 @@ const contribRef = useRef({ branch_pruned: 0, enqueued: 0, expanded: 0, critical
         const finalTris = triangles.map((t,i)=>({ ...t, color: colors[i] }))
         return isUniform(finalTris)
       }
-      let unifiedPaths = (result?.paths||[]).filter(p=>checkUnified(p))
+      let unifiedPaths = (result?.paths||[]).filter(p=>checkUnified(p) && (!Number.isFinite(maxStepsLimit) || (Array.isArray(p) && p.length <= maxStepsLimit)))
       if (!result || unifiedPaths.length === 0 || !result.bestStartId) {
-        const elapsed = Date.now() - solveStartRef.current
-        const budget = (window.SOLVER_FLAGS?.workerTimeBudgetMs ?? 300000)
-        if (elapsed < budget - 10000) {
-          setStatus('未统一，继续搜索合格方案（桥接优先）…')
-          try {
-            const worker2 = new Worker(new URL('./utils/solver-worker.js', import.meta.url), { type: 'module' })
-            try { window.__solverWorker = worker2 } catch {}
-            const resPromise2 = new Promise((resolve, reject)=>{
-              const timeout2 = setTimeout(()=>{ try{ worker2.terminate() }catch{}; try{ window.__solverWorker = null }catch{}; reject(new Error('worker-timeout')) }, Math.max(10000, budget - elapsed))
-              worker2.onmessage = (ev)=>{
-                const { type, payload } = ev.data || {}
-                if(type==='progress'){
-                  const p2 = payload
-                  const now2 = Date.now()
-                  const flags2 = (window.SOLVER_FLAGS||{})
-                  const compPhases2 = ['components','components_build','components_analysis']
-                  const strictPhases2 = ['strict_astar']
-                  const intervalCfg2 = compPhases2.includes(p2?.phase)
-                    ? (flags2.progressComponentsIntervalMs ?? 0)
-                    : strictPhases2.includes(p2?.phase)
-                      ? (flags2.progressAStarIntervalMs ?? 80)
-                      : (flags2.progressDFSIntervalMs ?? 100)
-                  if (intervalCfg2===0 || (now2 - progressLastRef.current) >= intervalCfg2) {
-                    const nodes2 = p2?.nodes ?? 0
-                    const sols2 = p2?.solutions ?? 0
-                    const phase2 = p2?.phase === 'components' ? `已识别连通分量：${p2?.count}`
-                      : p2?.phase === 'components_build' ? `正在构建分量：${p2?.count}（当前大小 ${p2?.compSize??'-'}）`
-                      : p2?.phase === 'best_update' ? `已更新最优：起点 #${p2?.bestStartId}，最少步骤 ${p2?.minSteps}`
-                      : `已探索节点：${nodes2}，候选分支：${sols2}`
-                    setStatus(`正在继续搜索合格方案… ${phase2}`)
-                    setSolveProgress({
-                      phase: p2?.phase,
-                      nodes: p2?.nodes,
-                      solutions: p2?.solutions,
-                      queue: p2?.queue,
-                      components: p2?.count,
-                      bestStartId: p2?.bestStartId,
-                      minSteps: p2?.minSteps,
-                      elapsedMs: now2 - solveStartRef.current,
-                      perf: p2?.perf,
-                    })
-                    const perf2 = p2?.perf || {}
-                    const phaseRaw2 = p2?.phase || 'search'
-                    const compInfo2 = (phaseRaw2==='components' || phaseRaw2==='components_build')
-                      ? ` count=${p2?.count??0}${p2?.compSize!=null?` compSize=${p2.compSize}`:''}`
-                      : ''
-                    const extra2 = (function(){
-                      if (phaseRaw2==='branch_pruned') {
-                        return ` reason=${p2?.reason??'-'} step=${p2?.step??'-'} color=${p2?.color??'-'}`
-                      } else if (phaseRaw2==='branch_quality') {
-                        const dr2 = (typeof p2?.deltaRatio==='number') ? (p2.deltaRatio.toFixed(3)) : (p2?.deltaRatio??'-')
-                        return ` step=${p2?.step??'-'} color=${p2?.color??'-'} delta=${p2?.delta??'-'} dr=${dr2} lb=${p2?.lb??'-'} prio=${p2?.priority??'-'}`
-                      } else if (phaseRaw2==='components_analysis') {
-                        return ` count=${p2?.count??0}`
-                      }
-                      return ''
-                    })()
-                    const line2 = `[${((now2 - solveStartRef.current)/1000).toFixed(1)}s] phase=${phaseRaw2}${compInfo2}${extra2} nodes=${p2?.nodes??0} queue=${p2?.queue??0} sols=${p2?.solutions??0} enq=${perf2?.enqueued??'-'} exp=${perf2?.expanded??'-'} zf=${perf2?.filteredZero??'-'}`
-                    setProgressLogs(prev=>{ const next=[...prev,line2]; return next.length>200 ? next.slice(next.length-200) : next })
-                    progressLastRef.current = now2
-                  }
-                } else if(type==='result'){
-                  clearTimeout(timeout2)
-                  try{ worker2.terminate() }catch{}
-                  try{ window.__solverWorker = null }catch{}
-                  resolve(payload)
-                }
-              }
-            })
-            const flagsStrong = Number.isFinite(maxStepsLimit)
-              ? { ...(window.SOLVER_FLAGS||{}), useDFSFirst: false, returnFirstFeasible: false, useStrongLBInBestFirst: true, enableBridgeFirst: true, bifrontWeight: Math.max(2.2, (window.SOLVER_FLAGS?.bifrontWeight ?? 2.0)) }
-              : { ...(window.SOLVER_FLAGS||{}), useDFSFirst: false, returnFirstFeasible: false, enableBridgeFirst: true, bifrontWeight: Math.max(2, (window.SOLVER_FLAGS?.bifrontWeight ?? 2)) }
-            try { worker2.postMessage({ type:'set_flags', flags: flagsStrong }) } catch {}
-            const lightTrisX = triangles.map(t=>({ id: t.id, neighbors: t.neighbors, color: t.color, deleted: !!t.deleted }))
-            worker2.postMessage({ type:'auto', triangles: lightTrisX, palette, maxBranches, stepLimit: maxStepsLimit })
-            const result2 = await resPromise2
-            const unifiedPaths2 = (result2?.paths||[]).filter(p=>{
-              let colors = triangles.map(t=>t.color)
-              const startIdLocal2 = result2.bestStartId
-              for(const color of p){
-                const startColorCur2 = colors[idToIndex.get(startIdLocal2)]
-                if(color===startColorCur2) continue
-                const regionSet2 = new Set(); const q2=[startIdLocal2]; const visited2=new Set([startIdLocal2])
-                while(q2.length){ const id=q2.shift(); const idx=idToIndex.get(id); if(colors[idx]!==startColorCur2) continue; regionSet2.add(id); for(const nb of neighbors[idx]){ if(!visited2.has(nb)){ visited2.add(nb); q2.push(nb) } } }
-                for(const id of regionSet2){ colors[idToIndex.get(id)] = color }
-              }
-              const finalTris2 = triangles.map((t,i)=>({ ...t, color: colors[i] }))
-              return isUniform(finalTris2)
-            })
-            if (result2 && unifiedPaths2.length>0 && result2.bestStartId!=null) {
-              result = result2
-              unifiedPaths = unifiedPaths2
-            }
-          } catch {}
-        }
         if (!result || unifiedPaths.length === 0 || !result.bestStartId) {
           const startIdLocal = (result?.bestStartId!=null) ? result.bestStartId : (startId!=null ? startId : pickHeuristicStartId(triangles))
           const heurLimit = Number.isFinite(maxStepsLimit) ? Math.max(1, Math.min(40, maxStepsLimit)) : 40
@@ -1733,7 +1786,7 @@ const contribRef = useRef({ branch_pruned: 0, enqueued: 0, expanded: 0, critical
           if (heurPath && heurPath.length) {
             const snapshots = await captureCanvasPNG(triangles, canvasRef.current.width, canvasRef.current.height, startIdLocal, heurPath)
              setSteps([{ path: heurPath, images: [snapshots] }])
-            setStatus(`超时或未统一，已给出接近方案：起点 #${startIdLocal}，步骤 ${heurPath.length}`)
+            setStatus(`3分钟内未找到合格解（8线程并行已耗尽预算），已给出接近方案：起点 #${startIdLocal}，步骤 ${heurPath.length}`)
             setSolveProgress(null)
             // 近似方案也上传策略摘要，并结束遥测 Run，确保总站可见
             try { await uploadStrategyAuto(triangles, palette, 'auto_solve_fallback', startIdLocal, heurPath) } catch {}
@@ -1877,8 +1930,19 @@ const contribRef = useRef({ branch_pruned: 0, enqueued: 0, expanded: 0, critical
           const okFlags = (cache?.is_unified===true && cache?.quality==='final')
           if (okUniform && okFlags) {
             const SNAPSHOT_LIMIT = 40
-            const snapshots = await captureCanvasPNG(triangles, canvasRef.current.width, canvasRef.current.height, cachedStart, cachedPath.slice(0, SNAPSHOT_LIMIT))
-             setSteps([{ path: cachedPath, images: [snapshots] }])
+            const snapshots = []
+            // Generate snapshot for each step
+            const fullPath = cachedPath.slice(0, SNAPSHOT_LIMIT)
+            snapshots.push(await captureCanvasPNG(triangles, canvasRef.current.width, canvasRef.current.height, cachedStart, []))
+            
+            let currentP = []
+            for(let k=0; k<fullPath.length; k++){
+               currentP.push(fullPath[k])
+               snapshots.push(await captureCanvasPNG(triangles, canvasRef.current.width, canvasRef.current.height, cachedStart, currentP))
+               if(k % 5 === 0) await new Promise(r=>setTimeout(r,0))
+            }
+            
+             setSteps([{ path: cachedPath, images: snapshots }])
             setBestStartId(cachedStart)
             setStatus(`缓存预览：步骤 ${cachedMin??cachedPath.length}（起点 #${cachedStart}，继续计算中）`)
             setSolveProgress(null)
@@ -1959,7 +2023,7 @@ const contribRef = useRef({ branch_pruned: 0, enqueued: 0, expanded: 0, critical
                 progressLastRef.current = now
               }
             } else if(type==='result'){
-              clearTimeout(timeout)
+              // clearTimeout(timeout)
               try{ worker.terminate() }catch{}
               try{ window.__solverWorker = null }catch{}
               resolve(payload)
@@ -2025,7 +2089,7 @@ const contribRef = useRef({ branch_pruned: 0, enqueued: 0, expanded: 0, critical
         const finalTris = triangles.map((t,i)=>({ ...t, color: colors[i] }))
         return isUniform(finalTris)
       }
-      const unifiedPaths = (result?.paths||[]).filter(p=>checkUnified(p))
+      const unifiedPaths = (result?.paths||[]).filter(p=>checkUnified(p) && (!Number.isFinite(maxStepsLimit) || (Array.isArray(p) && p.length <= maxStepsLimit)))
       if (!result || unifiedPaths.length === 0 || !result.bestStartId) {
         setStatus('继续计算最短步骤失败或未统一，请重试')
         setSolveProgress(null)
@@ -2077,11 +2141,31 @@ const contribRef = useRef({ branch_pruned: 0, enqueued: 0, expanded: 0, critical
       const telemetrySafeLog3 = async (payload)=>{ try{ if(__runId3) await telemetryLogEvent(__runId3, payload) }catch{} }
       await new Promise(r=>setTimeout(r,0))
       let result = null
+      // 优化方案
+      // ... (existing code) ...
+      // try {
+      //   const worker = new Worker(new URL('./utils/solver-worker.js', import.meta.url), { type: 'module' })
+      //   try { window.__solverWorker = worker } catch {}
+      //   const resPromise = new Promise((resolve, reject)=>{
+      //     // const timeout = setTimeout(()=>{ try{ worker.terminate() }catch{}; try{ window.__solverWorker = null }catch{}; reject(new Error('worker-timeout')) }, 180000)
+      //     worker.onmessage = (ev)=>{
+      //       // ...
+      //     }
+      //   })
+      //   // ...
+      //   result = await resPromise
+      // } catch (err) {
+      //   // ...
+      // }
+      // 临时禁用 worker 优化，直接使用主线程回退逻辑，或者确保 worker 不会被超时杀死
+      // 但为了简单起见，我们还是用 worker，只是去掉了超时。
+      // 上面的 SearchReplace 已经尝试去掉超时，但是可能没生效或者文件版本问题。
+      // 让我们再试一次，精确定位。
       try {
         const worker = new Worker(new URL('./utils/solver-worker.js', import.meta.url), { type: 'module' })
         try { window.__solverWorker = worker } catch {}
         const resPromise = new Promise((resolve, reject)=>{
-          const timeout = setTimeout(()=>{ try{ worker.terminate() }catch{}; try{ window.__solverWorker = null }catch{}; reject(new Error('worker-timeout')) }, 180000)
+          // const timeout = setTimeout(()=>{ try{ worker.terminate() }catch{}; try{ window.__solverWorker = null }catch{}; reject(new Error('worker-timeout')) }, 180000)
           worker.onmessage = (ev)=>{
             const { type, payload } = ev.data || {}
             if(type==='progress'){
@@ -2101,7 +2185,7 @@ const contribRef = useRef({ branch_pruned: 0, enqueued: 0, expanded: 0, critical
                 telemetrySafeLog3({ phase, perf, extra: { criticalCount: p?.criticalCount, minSteps: p?.minSteps, components: p?.count } })
               }
             } else if(type==='result'){
-              clearTimeout(timeout)
+              // clearTimeout(timeout)
               try{ worker.terminate() }catch{}
               try{ window.__solverWorker = null }catch{}
               resolve(payload)

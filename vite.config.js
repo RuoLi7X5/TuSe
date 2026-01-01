@@ -7,6 +7,12 @@ export default defineConfig({
   server: {
     host: true,
     proxy: {
+      // Local Backend API Proxy
+      '/api': {
+        target: 'http://localhost:3001',
+        changeOrigin: true,
+        secure: false,
+      },
       // 开发代理：前端请求 /api/deepseek 将被转发到 DeepSeek Chat Completions
       '/api/deepseek': {
         target: 'https://api.deepseek.com',

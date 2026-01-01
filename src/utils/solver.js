@@ -7,6 +7,74 @@ import { UCBColorPrioritizer } from './learn'
 import { localRepair } from './local-repair'
 import { bitsetAlloc, bitsetSet, bitsetHas, bitsetCount, bitsetToIds, bitsetClone, bitsetForEach } from './bitset'
 import { estimatePDB, hasPDB } from './pdb'
+import { generateProblemHash, getCachedSolution, saveCachedSolution } from './solutionCache'
+import { WorkerPool } from './worker-pool'
+
+const G = (typeof window !== 'undefined' ? window : (typeof self !== 'undefined' ? self : {}));
+
+const checkUnified = (triangles, startId, path) => {
+  if (!path || path.length === 0) return false;
+  const idToIndex = new Map(triangles.map((t, i) => [t.id, i]));
+  const neighbors = triangles.map(t => t.neighbors);
+  let colors = triangles.map(t => t.color);
+  
+  // Fast region grow and apply
+  const startIdx = idToIndex.get(startId);
+  if (startIdx === undefined) return false;
+  
+  for (const stepColor of path) {
+    const rc = colors[startIdx];
+    if (stepColor === rc) continue;
+    
+    // Find connected component of start color
+    const q = [startIdx];
+    const visited = new Uint8Array(triangles.length);
+    visited[startIdx] = 1;
+    const regionIndices = [startIdx];
+    
+    let head = 0;
+    while(head < q.length){
+        const u = q[head++];
+        for(const nid of neighbors[u]){
+           const v = idToIndex.get(nid);
+           if(v !== undefined && !visited[v] && colors[v] === rc && !triangles[v].deleted){
+               visited[v] = 1;
+               q.push(v);
+               regionIndices.push(v);
+           }
+        }
+    }
+    
+    // Apply color
+    for(const idx of regionIndices) colors[idx] = stepColor;
+  }
+  
+  // 检查统一性
+  // 针对空洞/不规则区域的增强验证
+  // 我们必须确保从 startId 出发的所有可达组件都已统一颜色。
+  // 在本游戏逻辑中，“统一”意味着画布上所有未删除的三角形必须是同一种颜色。
+  // 用户已确认画布中绝不存在孤岛（即所有未删除区域都是连通的）。
+  // 因此，只需简单遍历所有非删除三角形，确保它们颜色一致即可。
+  
+  // 1. 检查所有未删除的三角形是否颜色一致
+  let first = null;
+  for(let i=0; i<triangles.length; i++){
+      const t = triangles[i];
+      const c = colors[i];
+      if(t.deleted || c === 'transparent') continue;
+      
+      if(first === null) first = c;
+      else if(c !== first) {
+          // 发现颜色不匹配！
+          // 这是决定性的检查。只要有任何一个可见三角形颜色不同，就算未解决。
+          return false;
+      }
+  }
+  
+  // 如果执行到这里，说明所有可见三角形颜色都一致。
+  // 由于不存在孤岛，这意味着任务已完成。
+  return true;
+};
 
 export function floodFillRegion(triangles, startId, targetColor) {
   const startColor = triangles.find(t => t.id === startId)?.color
@@ -116,9 +184,25 @@ function keyFromColors(colors){
 }
 
 export function attachSolverToWindow(){
-  window.Solver_minSteps = async function Solver_minSteps(triangles, startId, palette, maxBranches=3, onProgress, stepLimit=Infinity){
+  G.Solver_minSteps = async function Solver_minSteps(triangles, startId, palette, maxBranches=3, onProgress, stepLimit=Infinity){
     const startTime = Date.now()
-    const TIME_BUDGET_MS = 300000
+    const TIME_BUDGET_MS = 180000 // 3 minutes
+    // Check Cache
+    // const problemHash = generateProblemHash(triangles, triangles.map(t=>t.neighbors))
+    // try {
+    //    const cached = await getCachedSolution(problemHash)
+    //    // If we found a cached solution, and it meets the step limit (if any)
+    //    if(cached && (cached.minSteps <= (Number.isFinite(stepLimit) ? stepLimit : Infinity))){
+    //       // Verify the solution is valid for the current grid
+    //       if (checkUnified(triangles, cached.startId, cached.paths[0])) {
+    //          if(onProgress) onProgress({ phase:'cache_hit', minSteps: cached.minSteps, solutions: 1, elapsedMs: Date.now() - startTime })
+    //          return { bestStartId: cached.startId, paths: cached.paths, minSteps: cached.minSteps, timedOut: false }
+    //       } else {
+    //          console.warn('Cached solution failed verification', cached);
+    //       }
+    //    }
+    // } catch(e){ console.warn('Cache check failed', e) }
+
     let timedOut = false
     const nTris = triangles.length
     
@@ -159,31 +243,73 @@ export function attachSolverToWindow(){
       }
     }
 
+    // Precompute Zobrist Hashing Table
+    const colorToInt = new Map()
+    let nextColorInt = 1
+    const getColorInt = (c) => {
+      let i = colorToInt.get(c)
+      if (i === undefined) { i = nextColorInt++; colorToInt.set(c, i) }
+      return i
+    }
+    // Pre-register palette and current colors
+    palette.forEach(getColorInt)
+    triangles.forEach(t => { if(t.color) getColorInt(t.color) })
+    
+    const MASK64 = (1n<<64n) - 1n
+    let seed64 = 0x1234567890ABCDEFn
+    const rnd64 = () => { seed64 = (seed64 * 6364136223846793005n + 1442695040888963407n) & MASK64; return seed64 }
+    
+    // zTable[triangleIndex][colorInt]
+    const zTable = new Array(nTris)
+    for(let i=0; i<nTris; i++){
+       zTable[i] = new Map() // Use Map for sparse color access or Array if dense
+    }
+    const getZVal = (tIdx, cInt) => {
+       let v = zTable[tIdx].get(cInt)
+       if(v === undefined) { v = rnd64(); zTable[tIdx].set(cInt, v) }
+       return v
+    }
+
+    const computeHash = (colors) => {
+       let h = 0n
+       for(let i=0; i<nTris; i++){
+          const c = colors[i]
+          if(c && c!=='transparent' && !triangles[i].deleted){
+             h ^= getZVal(i, getColorInt(c))
+          }
+       }
+       return h
+    }
+
     const startColors = triangles.map(t=>t.color)
-    const startKey = startColors.join(',')
+    const startHash = computeHash(startColors)
+    // Map keys will now be BigInt (or string representation of BigInt to be safe with Map)
+    // JS Map supports BigInt keys, but let's use what Strict solver used (toString) just in case
+    // Strict solver used .toString(). Let's stick to BigInt as key if environment supports it (modern JS does).
+    // Actually, Strict solver line 777: return h.toString(). Let's follow that pattern for safety.
+    const startKey = startHash.toString()
     
     const seenBestG = new Map([[startKey, 0]])
     const globalTT = new Map([[startKey, { gMin: 0, fMin: 0 }]])
     
-    const maxNodes = Math.min(20000, Math.max(8000, nTris * 8))
-    const queueStates = [{ colors:startColors, region: region, steps: [] }]
+    const FLAGS = (typeof G !== 'undefined' && G.SOLVER_FLAGS) ? G.SOLVER_FLAGS : {}
+    const maxNodes = (FLAGS && FLAGS.maxNodes !== undefined) ? FLAGS.maxNodes : Math.min(20000, Math.max(8000, nTris * 8))
+    const queueStates = [{ colors:startColors, region: region, steps: [], hash: startHash }]
     const solutions = []
-    
-    const FLAGS = (typeof window !== 'undefined' && window.SOLVER_FLAGS) ? window.SOLVER_FLAGS : {}
     const ENABLE_LB = !!FLAGS.enableLB
     const ENABLE_LOOKAHEAD = !!FLAGS.enableLookahead
     const ENABLE_LOOKAHEAD2 = !!FLAGS.enableLookaheadDepth2
     const ENABLE_INCREMENTAL = !!FLAGS.enableIncremental
     const ENABLE_BEAM = !!FLAGS.enableBeam
-    const BEAM_WIDTH = Number.isFinite(FLAGS?.beamWidth) ? FLAGS.beamWidth : 12
+    const BEAM_WIDTH = Number.isFinite(FLAGS?.beamWidth) ? FLAGS.beamWidth : 24
     const ENABLE_BEST_FIRST = !!FLAGS.enableBestFirst
     const ENABLE_ASTAR_BF = Object.prototype.hasOwnProperty.call(FLAGS, 'useAStarInBestFirst') ? !!FLAGS.useAStarInBestFirst : !!ENABLE_BEST_FIRST
     const ENABLE_BRIDGE_FIRST = !!FLAGS.enableBridgeFirst
-    const ADJ_AFTER_WEIGHT = Number.isFinite(FLAGS?.adjAfterWeight) ? FLAGS.adjAfterWeight : 0.6
-    const BRIDGE_WEIGHT = Number.isFinite(FLAGS?.bridgeWeight) ? FLAGS.bridgeWeight : 1.0
-    const GATE_WEIGHT = Number.isFinite(FLAGS?.gateWeight) ? FLAGS.gateWeight : 0.4
-    const RICHNESS_WEIGHT = Number.isFinite(FLAGS?.richnessWeight) ? FLAGS.richnessWeight : 0.5
-    const BOUNDARY_WEIGHT = Number.isFinite(FLAGS?.boundaryWeight) ? FLAGS.boundaryWeight : 0.8
+    const ADJ_AFTER_WEIGHT = Number.isFinite(FLAGS?.adjAfterWeight) ? FLAGS.adjAfterWeight : 0.8
+    const BRIDGE_WEIGHT = Number.isFinite(FLAGS?.bridgeWeight) ? FLAGS.bridgeWeight : 2.5
+    const GATE_WEIGHT = Number.isFinite(FLAGS?.gateWeight) ? FLAGS.gateWeight : 0.6
+    const RICHNESS_WEIGHT = Number.isFinite(FLAGS?.richnessWeight) ? FLAGS.richnessWeight : 0.8
+    const BOUNDARY_WEIGHT = Number.isFinite(FLAGS?.boundaryWeight) ? FLAGS.boundaryWeight : 1.2
     const USE_STRICT_LB_BF = !!FLAGS.strictMode || !!FLAGS.useStrongLBInBestFirst
     const ENABLE_ZERO_FILTER = (FLAGS.enableZeroExpandFilter !== false)
     const LOG_PERF = !!FLAGS.logPerf
@@ -370,6 +496,8 @@ export function attachSolverToWindow(){
     const perf = { filteredZero: 0, expanded: 0, enqueued: 0, lbHist: { improve0: 0, improve1_2: 0, improve3_5: 0, improve6p: 0 }, queueMax: 0, depthMax: 0 }
     
     while(queueStates.length && nodes<maxNodes){
+      // await new Promise(r=>setTimeout(r,0))
+      // REMOVE PARALLEL BLOCK AWAIT FROM LOOP TO AVOID STALL
       if (nodes % 300 === 0) {
         if (Date.now() - startTime > TIME_BUDGET_MS) { timedOut = true; break }
         await new Promise(r=>setTimeout(r,0))
@@ -447,9 +575,9 @@ export function attachSolverToWindow(){
       const boundaryBefore = boundaryDistinct(curColors, regionBS)
       const basePreK = Math.max(4, Math.min(8, 4 + Math.floor((adjColors.size||0)/3) + (boundaryBefore>6?2:0)))
       const depth = cur.steps.length
-      const beamBase = Number.isFinite(FLAGS?.beamWidth) ? FLAGS.beamWidth : 12
-      const beamDecay = Number.isFinite(FLAGS?.beamDecay) ? FLAGS.beamDecay : 0.85
-      const beamMin = Number.isFinite(FLAGS?.beamMin) ? FLAGS.beamMin : 4
+      const beamBase = Number.isFinite(FLAGS?.beamWidth) ? FLAGS.beamWidth : 24
+      const beamDecay = Number.isFinite(FLAGS?.beamDecay) ? FLAGS.beamDecay : 0.92
+      const beamMin = Number.isFinite(FLAGS?.beamMin) ? FLAGS.beamMin : 6
       const pressure = Math.min(1, queueStates.length / Math.max(1, maxNodes))
       const pressureScale = ENABLE_BEAM ? Math.max(0.6, 1.0 - 0.5*pressure) : 1.0
       const dynamicWidth = ENABLE_BEAM ? Math.max(beamMin, Math.floor(beamBase * Math.pow(beamDecay, depth) * pressureScale)) : beamBase
@@ -527,7 +655,7 @@ export function attachSolverToWindow(){
       const baseLimitTry = Math.max(6, Math.min(10, 6 + Math.floor((adjColors.size||0)/3) + (boundaryBefore>6?2:0)))
       let limitTry = ENABLE_BEAM ? Math.min(dynamicWidth, baseLimitTry) : baseLimitTry
       const prevLB = ENABLE_LB ? (USE_STRICT_LB_BF ? lowerBoundStrictLocal(curColors, regionBS) : lowerBound(curColors)) : 0
-      const BF_W = Number.isFinite(window?.SOLVER_FLAGS?.bifrontWeight) ? window.SOLVER_FLAGS.bifrontWeight : 2.0
+      const BF_W = Number.isFinite(G?.SOLVER_FLAGS?.bifrontWeight) ? G.SOLVER_FLAGS.bifrontWeight : 2.0
       
       const scored = prelim.map(({c, gain})=>{
          const pot = (enlargePotential.get(c)||0)
@@ -553,8 +681,23 @@ export function attachSolverToWindow(){
       for(const color of tryColors){
          if(color===regionColor) continue
          const nextColors = curColors.slice()
-         regionForEach(regionBS, idx => { nextColors[idx] = color })
-         const key = nextColors.join(',')
+         // Incremental Hash Update
+         let nextHash = cur.hash || computeHash(curColors) // Fallback if hash missing
+         const colorIntTarget = getColorInt(color)
+         
+         regionForEach(regionBS, idx => { 
+            const oldC = nextColors[idx]
+            nextColors[idx] = color 
+            // Update Hash: XOR out old, XOR in new
+            if(oldC && oldC!=='transparent'){
+               nextHash ^= getZVal(idx, getColorInt(oldC))
+            }
+            if(color && color!=='transparent'){
+               nextHash ^= getZVal(idx, colorIntTarget)
+            }
+         })
+         
+         const key = nextHash.toString()
          const gNext = cur.steps.length + 1
          
          const prevG = seenBestG.get(key)
@@ -611,7 +754,7 @@ export function attachSolverToWindow(){
          if (prevTT && ((prevTT.gMin ?? Infinity) <= gNext || (prevTT.fMin ?? Infinity) <= fNext)) continue
          
          const priority = baseScore - childLB * 2
-         queueStates.push({ colors: nextColors, region: newRegion, steps: nextSteps, boundaryNeighbors: nextBoundaryNeighbors, priority, g: gNext, h: childLB, f: fNext })
+         queueStates.push({ colors: nextColors, region: newRegion, steps: nextSteps, boundaryNeighbors: nextBoundaryNeighbors, priority, g: gNext, h: childLB, f: fNext, hash: nextHash })
          
          const gMin = Math.min(prevTT?.gMin ?? Infinity, gNext)
          const fMin = Math.min(prevTT?.fMin ?? Infinity, fNext)
@@ -691,9 +834,9 @@ export function attachSolverToWindow(){
     return { paths, minSteps, timedOut }
   }
 
-  window.StrictAStarMinSteps = async function(triangles, startId, palette, onProgress, stepLimit=Infinity){
+  G.StrictAStarMinSteps = async function(triangles, startId, palette, onProgress, stepLimit=Infinity){
     const startTime = Date.now()
-    const FLAGS = (typeof window !== 'undefined' && window.SOLVER_FLAGS) ? window.SOLVER_FLAGS : {}
+    const FLAGS = (typeof G !== 'undefined' && G.SOLVER_FLAGS) ? G.SOLVER_FLAGS : {}
     const TIME_BUDGET_MS = Math.min(Number.isFinite(FLAGS?.workerTimeBudgetMs) ? Math.max(1000, FLAGS.workerTimeBudgetMs) : (4000 + triangles.length * 10), 300000)
     const REPORT_INTERVAL_MS = Number.isFinite(FLAGS?.progressAStarIntervalMs) ? Math.max(0, FLAGS.progressAStarIntervalMs) : 80
     const idToIndex = new Map(triangles.map((t,i)=>[t.id,i]))
@@ -702,7 +845,7 @@ export function attachSolverToWindow(){
     const globalTT = new Map()
     let timedOut = false
 
-    const USE_BITSET = (typeof window !== 'undefined' && window.SOLVER_FLAGS) ? (window.SOLVER_FLAGS.useBitsetRegion !== false) : true
+    const USE_BITSET = (typeof G !== 'undefined' && G.SOLVER_FLAGS) ? (G.SOLVER_FLAGS.useBitsetRegion !== false) : true
     const regionSize = (region)=> (region instanceof Set) ? region.size : bitsetCount(region)
     const regionIds = (region)=> (region instanceof Set) ? Array.from(region) : bitsetToIds(region, triangles)
     const buildRegionSet = (colors) => {
@@ -828,7 +971,7 @@ export function attachSolverToWindow(){
         const key = hashState(nextColors, newRegion)
         const g = cur.steps.length + 1
         const prevG = seenBestG.get(key); if(prevG!=null && prevG <= g) continue
-        const HEUR_NAME = (typeof window !== 'undefined' && window.SOLVER_FLAGS) ? window.SOLVER_FLAGS.heuristicName : null
+        const HEUR_NAME = (typeof G !== 'undefined' && G.SOLVER_FLAGS) ? G.SOLVER_FLAGS.heuristicName : null
         const HEUR = HEUR_NAME ? getHeuristic(HEUR_NAME) : null
         const lbStrict = lowerBoundStrict(nextColors, newRegion)
         const h = HEUR ? (HEUR.isLayered ? HEUR({ triangles, idToIndex, neighbors, startId }, nextColors, newRegion, lbStrict) : Math.max(lbStrict, HEUR({ triangles, idToIndex, neighbors, startId }, nextColors, newRegion))) : lbStrict
@@ -857,9 +1000,9 @@ export function attachSolverToWindow(){
     return { paths: [], minSteps: 0, timedOut }
   }
 
-  window.StrictIDAStarMinSteps = async function(triangles, startId, palette, onProgress, stepLimit=Infinity){
+  G.StrictIDAStarMinSteps = async function(triangles, startId, palette, onProgress, stepLimit=Infinity){
     const startTime = Date.now()
-    const FLAGS = (typeof window !== 'undefined' && window.SOLVER_FLAGS) ? window.SOLVER_FLAGS : {}
+    const FLAGS = (typeof G !== 'undefined' && G.SOLVER_FLAGS) ? G.SOLVER_FLAGS : {}
     const TIME_BUDGET_MS = Math.min(18000, 4000 + triangles.length * 10)
     const REPORT_INTERVAL_MS = Number.isFinite(FLAGS?.progressAStarIntervalMs) ? Math.max(0, FLAGS.progressAStarIntervalMs) : 250
     const ENABLE_TT_MINF = FLAGS.enableTTMinFReuse !== false
@@ -868,7 +1011,7 @@ export function attachSolverToWindow(){
     const neighbors = triangles.map(t=>t.neighbors)
 
     const startColors = triangles.map(t=>t.color)
-    const USE_BITSET = (typeof window !== 'undefined' && window.SOLVER_FLAGS) ? (window.SOLVER_FLAGS.useBitsetRegion !== false) : true
+    const USE_BITSET = (typeof G !== 'undefined' && G.SOLVER_FLAGS) ? (G.SOLVER_FLAGS.useBitsetRegion !== false) : true
     const regionSize = (region)=> (region instanceof Set) ? region.size : bitsetCount(region)
     const regionIds = (region)=> (region instanceof Set) ? Array.from(region) : bitsetToIds(region, triangles)
     const buildRegionSet = (colors)=>{
@@ -971,7 +1114,7 @@ export function attachSolverToWindow(){
         perf.prunedStepLimit++
         return { found:false, nextBound: Infinity, path: null }
       }
-      const HEUR_NAME = (typeof window !== 'undefined' && window.SOLVER_FLAGS) ? window.SOLVER_FLAGS.heuristicName : null
+      const HEUR_NAME = (typeof G !== 'undefined' && G.SOLVER_FLAGS) ? G.SOLVER_FLAGS.heuristicName : null
       const HEUR = HEUR_NAME ? getHeuristic(HEUR_NAME) : null
       const lbStrictCur = lowerBoundStrict(colors, regionSet)
       const hVal = HEUR ? (HEUR.isLayered ? HEUR({ triangles, idToIndex, neighbors, startId }, colors, regionSet, lbStrictCur) : Math.max(lbStrictCur, HEUR({ triangles, idToIndex, neighbors, startId }, colors, regionSet))) : lbStrictCur
@@ -1029,7 +1172,7 @@ export function attachSolverToWindow(){
           newRegion = setNew
         }
         const gNext = g + 1
-        const HEUR_NAME2 = (typeof window !== 'undefined' && window.SOLVER_FLAGS) ? window.SOLVER_FLAGS.heuristicName : null
+        const HEUR_NAME2 = (typeof G !== 'undefined' && G.SOLVER_FLAGS) ? G.SOLVER_FLAGS.heuristicName : null
         const HEUR2 = HEUR_NAME2 ? getHeuristic(HEUR_NAME2) : null
         const lbStrictNext = lowerBoundStrict(nextColors, newRegion)
         const hNext = HEUR2 ? (HEUR2.isLayered ? HEUR2({ triangles, idToIndex, neighbors, startId }, nextColors, newRegion, lbStrictNext) : Math.max(lbStrictNext, HEUR2({ triangles, idToIndex, neighbors, startId }, nextColors, newRegion))) : lbStrictNext
@@ -1066,13 +1209,29 @@ export function attachSolverToWindow(){
     }
   }
   
-  window.Solver_minStepsAuto = async function(triangles, palette, maxBranches=3, onProgress, stepLimit=Infinity){
+  G.Solver_minStepsAuto = async function(triangles, palette, maxBranches=3, onProgress, stepLimit=Infinity){
     const startTime = Date.now()
-    const TIME_BUDGET_MS = (typeof window !== 'undefined' && window.SOLVER_FLAGS && Number.isFinite(window.SOLVER_FLAGS.workerTimeBudgetMs))
-      ? Math.max(1000, window.SOLVER_FLAGS.workerTimeBudgetMs)
-      : 300000
+    // Force 3 minutes budget, ignoring external settings if they are too short
+    const TIME_BUDGET_MS = 180000; 
+    
+    // Check Cache
+    // const problemHash = generateProblemHash(triangles, triangles.map(t=>t.neighbors))
+    // try {
+    //    const cached = await getCachedSolution(problemHash)
+    //    // If we found a cached solution, and it meets the step limit (if any)
+    //    if(cached && (cached.minSteps <= (Number.isFinite(stepLimit) ? stepLimit : Infinity))){
+    //       // Verify the solution is valid for the current grid
+    //       if (checkUnified(triangles, cached.startId, cached.paths[0])) {
+    //          if(onProgress) onProgress({ phase:'cache_hit', minSteps: cached.minSteps, solutions: 1, elapsedMs: Date.now() - startTime })
+    //          return { bestStartId: cached.startId, paths: cached.paths, minSteps: cached.minSteps, timedOut: false }
+    //       } else {
+    //          console.warn('Cached solution failed verification', cached);
+    //       }
+    //    }
+    // } catch(e){ console.warn('Cache check failed', e) }
+
     let timedOut = false
-    const FLAGS = (typeof window !== 'undefined' && window.SOLVER_FLAGS) ? window.SOLVER_FLAGS : {}
+    const FLAGS = (typeof G !== 'undefined' && G.SOLVER_FLAGS) ? G.SOLVER_FLAGS : {}
     const SCHED_INTERVAL_MS = Number.isFinite(FLAGS?.dynamicScheduleIntervalMs) ? Math.max(500, FLAGS.dynamicScheduleIntervalMs) : 2500
     const ADJUST_ON_NO_PROGRESS = (FLAGS?.dynamicBeamAdjustOnNoBestUpdate !== false)
     let lastBestUpdateTs = startTime
@@ -1169,6 +1328,16 @@ export function attachSolverToWindow(){
       const summary = { phase:'components_done', count: components.length, largest, elapsedMs: nowTs - startTime }
       try { onProgress?.(summary) } catch {}
     }
+    // Auto-prune palette: Remove colors that no longer exist in the grid
+    const existingColors = new Set();
+    for(const t of triangles){
+       if(!t.deleted && t.color && t.color !== 'transparent') existingColors.add(t.color);
+    }
+    // Filter palette to only include colors present in the grid
+    const prunedPalette = palette.filter(c => existingColors.has(c));
+    // If pruned palette is empty (e.g. all deleted), fallback to original (though solve will likely fail/return 0)
+    const effectivePalette = prunedPalette.length > 0 ? prunedPalette : palette;
+
     const COLOR_COMP_COUNT = new Map()
     for (const comp of components) {
       const c = comp.color
@@ -1214,49 +1383,321 @@ export function attachSolverToWindow(){
         dispersion: s.totalSize>0 ? (s.compCount / s.totalSize) : 0,
         bridgeEdges: s.bridgeEdges,
       }))
-      if (ENABLE_ANALYSIS_ORDER) {
-        const dispersionByColor = new Map(colorsSummary.map(s=>[s.color, s.dispersion]))
-        components.sort((a,b)=>{
-          const da = dispersionByColor.get(a.color) || 0
-          const db = dispersionByColor.get(b.color) || 0
-          const aBridge = (compDetails.find(d=>d.startId===a.startId)?.bridgeDensity || 0) >= BRIDGE_DENSITY_THRESH
-          const bBridge = (compDetails.find(d=>d.startId===b.startId)?.bridgeDensity || 0) >= BRIDGE_DENSITY_THRESH
-          if ((da>=DISPERSION_THRESH) !== (db>=DISPERSION_THRESH)) return (db>=DISPERSION_THRESH) - (da>=DISPERSION_THRESH)
-          if (aBridge !== bBridge) return (bBridge?1:0) - (aBridge?1:0)
-          return (b.size||0) - (a.size||0)
-        })
-      }
+      // 优化组件排序逻辑：针对有空洞的复杂结构，优先尝试那些处于"咽喉"位置或连接性更好的起点
+      // 这里的策略是：优先选择那些"能接触到更多不同颜色"或者"处于桥接位置"的组件作为起点
+      const dispersionByColor = new Map(colorsSummary.map(s=>[s.color, s.dispersion]))
+      components.sort((a,b)=>{
+        // 1. 优先考虑 Bridge (桥接) 属性：如果一个组件处于连接两个大区域的关键位置，它更适合做起点
+        const aBridge = (compDetails.find(d=>d.startId===a.startId)?.bridgeDensity || 0)
+        const bBridge = (compDetails.find(d=>d.startId===b.startId)?.bridgeDensity || 0)
+        
+        // 只有当差异足够大时才优先，否则可能导致总是选中很小但接触面大的色块
+        if (Math.abs(aBridge - bBridge) > 0.15) return bBridge - aBridge 
+
+        // 2. 其次考虑颜色分散度：分散度高的颜色意味着分布广，更有可能连接不同区域
+        const da = dispersionByColor.get(a.color) || 0
+        const db = dispersionByColor.get(b.color) || 0
+        if (Math.abs(da - db) > 0.1) return db - da
+
+        // 3. 最后才考虑大小 (但给予更大的权重，避免选中太小的碎片)
+        return (b.size||0) - (a.size||0)
+      })
       try {
         onProgress?.({ phase:'components_analysis', count: components.length, colors: colorsSummary, topComponents: compDetails.slice(0, 8) })
       } catch {}
     }
     if(components.length===0) return { bestStartId: null, paths: [], minSteps: 0 }
     try {
-      const preferred = (typeof window !== 'undefined' && window.SOLVER_FLAGS) ? window.SOLVER_FLAGS.preferredStartId : null
+      const preferred = (typeof G !== 'undefined' && G.SOLVER_FLAGS) ? G.SOLVER_FLAGS.preferredStartId : null
       if (preferred!=null) {
         const idx = components.findIndex(c=>c.startId===preferred)
         if (idx>0) { const [c] = components.splice(idx,1); components.unshift(c) }
       }
     } catch {}
-    components.sort((a,b)=>b.size-a.size)
+    // Remove the explicit size sort here, to preserve the sophisticated sort we just did above!
+    // components.sort((a,b)=>b.size-a.size)
+    
+    // --- Parallel Execution Block ---
+    if (typeof Worker !== 'undefined' && G.SOLVER_FLAGS.enableParallel !== false) {
+       // Strategy: Assign different START COMPONENT CANDIDATES to different workers
+       // This maximizes the chance of finding the best topological start
+       const candidates = components.slice(0, 4); // Take top 4 candidates (already sorted by bridge/dispersion)
+       
+       if (candidates.length > 0) {
+          try {
+            const parallelRes = await new Promise((resolve) => {
+               const workers = [];
+              let solved = false;
+              const cleanup = () => {
+                 workers.forEach(w => WorkerPool.release(w.worker, w.type));
+              };
+              
+              const handleResult = (res, source) => {
+                 if (solved) return;
+                 if (res && res.paths && res.paths.length > 0) {
+                    solved = true;
+                    cleanup();
+                    if(onProgress) onProgress({ phase:'parallel_solved', source, minSteps: res.minSteps, elapsedMs: Date.now() - startTime });
+                    saveCachedSolution(problemHash, { startId: res.bestStartId, paths: res.paths, minSteps: res.minSteps });
+                    resolve({ bestStartId: res.bestStartId, paths: res.paths, minSteps: res.minSteps, timedOut: false });
+                 }
+              };
+
+              // 1. WASM Worker (Rust BFS) -> Candidate 0 (Best Bridge/Dispersion)
+              // Note: We skip WASM if candidate size is too small, as it might just be a small bridge
+              // But here we trust our sort logic.
+              try {
+                  const w1 = WorkerPool.acquire('wasm');
+                  if (w1) {
+                    workers.push({ worker: w1, type: 'wasm' });
+                    w1.onmessage = (e) => {
+                        if (e.data.type === 'init_done') {
+                            const cand0 = candidates[0];
+                          w1.postMessage({ type: 'solve', payload: { startId: cand0.startId, maxDepth: Math.min(stepLimit, 100) } });
+                        } else if (e.data.type === 'solve_done') {
+                            // WASM result handling
+                            let wasmValid = false;
+                            if (e.data.result && e.data.result.length > 0) {
+                                // Validate WASM result strictly
+                                if (checkUnified(triangles, candidates[0].startId, e.data.result)) {
+                                   wasmValid = true;
+                                   handleResult({ bestStartId: candidates[0].startId, paths: [e.data.result], minSteps: e.data.result.length }, 'wasm');
+                                } else {
+                                   console.warn('WASM returned invalid solution (not unified). Falling back to JS backup.');
+                                }
+                            }
+                            
+                            if (!wasmValid) {
+                                // WASM Failed or Invalid. Spawn Backup JS Worker.
+                                console.warn('WASM Worker failed or invalid. Spawning backup JS worker...');
+                                // Release WASM worker back to pool (or terminate if we don't want to reuse)
+                                WorkerPool.release(w1, 'wasm');
+                                
+                                // Spawn a backup JS worker on Candidate 0 (since WASM failed on it)
+                                // Use a VERY DEEP strategy since BFS failed.
+                                try {
+                                    const wBackup = WorkerPool.acquire('js');
+                                    if(wBackup) {
+                                        workers.push({ worker: wBackup, type: 'js' });
+                                        
+                                        // Backup worker state for infinite retry
+                                        let backupRetryCount = 0;
+                                        
+                                        const runBackup = (currentRetry) => {
+                                            // Dynamic flags for backup retries
+                                            const backupFlags = {
+                                                ...G.SOLVER_FLAGS, 
+                                                beamWidth: Math.min(8192, 64 * Math.pow(2, currentRetry)), // 64, 128, 256...
+                                                bifrontWeight: 1.5, bridgeWeight: 8.0, boundaryWeight: 3.0, 
+                                                workerTimeBudgetMs: TIME_BUDGET_MS,
+                                                maxNodes: Infinity,
+                                                // Disable filters on retries
+                                                enableZeroExpandFilter: currentRetry > 0 ? false : (G.SOLVER_FLAGS.enableZeroExpandFilter !== false),
+                                                rareFreqRatio: currentRetry > 0 ? 0 : (G.SOLVER_FLAGS.rareFreqRatio || 0.03)
+                                            };
+                                            
+                                            wBackup.postMessage({ 
+                                                type: 'solve', 
+                                                payload: { 
+                                                    triangles, startId: candidates[0].startId, palette: effectivePalette, maxBranches, stepLimit, 
+                                                    flags: backupFlags
+                                                } 
+                                            });
+                                        };
+
+                                        wBackup.onmessage = (e) => {
+                                            if (e.data.type === 'solve_done') {
+                                                const r = e.data.result;
+                                                let isValidBackup = false;
+                                                if(r && r.paths && r.paths.length > 0) {
+                                                    // Validate backup result!
+                                                    if (checkUnified(triangles, candidates[0].startId, r.paths[0])) {
+                                                       isValidBackup = true;
+                                                       if(r) r.bestStartId = candidates[0].startId;
+                                                       handleResult(r, `js-backup-cand0-retry${backupRetryCount}`);
+                                                    } else {
+                                                       console.warn(`Backup JS worker returned invalid solution. Retry ${backupRetryCount}...`);
+                                                    }
+                                                } 
+                                                
+                                                if (!isValidBackup) {
+                                                    // Backup Failed. Retry infinitely until timeout.
+                                                    if (!solved && (Date.now() - startTime < TIME_BUDGET_MS - 2000)) {
+                                                        console.warn(`Backup JS worker exhausted (Retry ${backupRetryCount}). Boosting...`);
+                                                        backupRetryCount++;
+                                                        runBackup(backupRetryCount);
+                                                    } else {
+                                                        console.warn('Backup JS worker stopped (Timeout).');
+                                                    }
+                                                }
+                                            }
+                                        };
+                                        
+                                        // Initial run
+                                        runBackup(0);
+                                    }
+                                } catch(err) { console.warn('Failed to spawn backup worker', err); }
+                            }
+                        }
+                    };
+                    w1.postMessage({ type: 'init', payload: { triangles, palette: effectivePalette } });
+                  }
+              } catch(e) { console.warn('WASM Worker failed', e); }
+
+              // 2. JS Workers (Racing with different start candidates & strategies)
+              // We mix strategy diversity with start-point diversity
+              // Worker 2: Candidate 1 (Second Best) + Balanced Strategy
+              // Worker 3: Candidate 2 (Third Best) + Deep Strategy
+              // Worker 4: Candidate 0 (Best) + Speed Strategy (Just in case WASM fails or JS is faster for small graphs)
+              
+              const strategies = [
+                  { candidateIdx: 1, beamWidth: 16, bifrontWeight: 1.2, bridgeWeight: 6.0, boundaryWeight: 2.0, timeBudgetMs: 180000 }, // High Expansion Focus
+                  { candidateIdx: 2, beamWidth: 32, bifrontWeight: 1.5, bridgeWeight: 8.0, boundaryWeight: 2.5, timeBudgetMs: 180000 }, // Deep Expansion
+                  { candidateIdx: 0, beamWidth: 12, bifrontWeight: 1.0, bridgeWeight: 5.0, boundaryWeight: 1.5, timeBudgetMs: 180000 }  // Fast Expansion
+              ];
+              
+              // We use an object to track worker state to allow recursive restarts
+              // This is a bit of a hack inside forEach, but it works because 'workers' array is external
+              const workerStates = strategies.map((s, i) => ({ 
+                  strategy: s, 
+                  idx: i, 
+                  retryCount: 0, 
+                  maxRetries: 9999, // Effectively infinite retries until time runs out
+                  active: true 
+              }));
+
+              const spawnWorker = (state) => {
+                  if (!state.active) return;
+                  if (solved) return; // Stop spawning if already solved
+                  if (Date.now() - startTime > TIME_BUDGET_MS) return; // Hard stop at time budget
+
+                  const strat = state.strategy;
+                  const comp = candidates[strat.candidateIdx];
+                  if (!comp) return;
+
+                  try {
+                    const w = WorkerPool.acquire('js');
+                    if (w) {
+                      workers.push({ worker: w, type: 'js' }); // Add to cleanup list
+                      
+                      w.onmessage = (e) => {
+                          if (e.data.type === 'solve_done') {
+                              const r = e.data.result;
+                              
+                              // Enhanced Check: Validate if the solution is truly unified
+                              let isValid = false;
+                              if (r && r.paths && r.paths.length > 0) {
+                                  if (checkUnified(triangles, comp.startId, r.paths[0])) {
+                                      isValid = true;
+                                  } else {
+                                      console.warn(`Worker js-${state.idx} returned invalid solution (not unified). Treating as failure.`);
+                                  }
+                              }
+
+                              if(isValid) {
+                                  if(r) r.bestStartId = comp.startId;
+                                  handleResult(r, `js-${state.idx}-cand${strat.candidateIdx}-retry${state.retryCount}`);
+                              } else {
+                                  // FAILED: Retry logic
+                                  // Remove this failed worker from the 'workers' cleanup list to avoid leaking or double termination
+                                  const wIdx = workers.findIndex(item => item.worker === w);
+                                  if (wIdx >= 0) workers.splice(wIdx, 1);
+                                  
+                                  // Release the failed worker back to pool (it's done)
+                                  WorkerPool.release(w, 'js');
+                                  
+                                  // INFINITE RETRY LOGIC (Until timeout or solved)
+                                  // Only stop if we are very close to the time budget (leave 2s buffer)
+                                  if (!solved && (Date.now() - startTime < TIME_BUDGET_MS - 2000)) {
+                                      console.warn(`Worker js-${state.idx} exhausted (Beam ${strat.beamWidth}). Retrying with aggressive params...`);
+                                      state.retryCount++;
+                                      
+                                      // Upgrade strategy: 
+                                      // 1. Double beam width (up to a massive limit)
+                                      // 2. Increase maxBranches
+                                      // 3. Randomly perturb weights to explore different paths
+                                      strat.beamWidth = Math.min(8192, (strat.beamWidth || 12) * 2); // Increased limit
+                                      strat.maxBranches = Math.min(20, (strat.maxBranches || maxBranches) + 2);
+                                      strat.maxNodes = Infinity; // Remove node limit for retries
+                                      
+                                      // Weight Perturbation to escape local optima
+                                      strat.bridgeWeight = (strat.bridgeWeight || 5.0) + (Math.random() * 2.0);
+                                      strat.bifrontWeight = Math.max(0.5, (strat.bifrontWeight || 1.0) + (Math.random() - 0.5));
+                                      
+                                      // Disable filters in deep retries to ensure we search pruned branches
+                                      if (state.retryCount > 2) {
+                                          strat.enableZeroExpandFilter = false;
+                                          strat.rareFreqRatio = 0; // Disable rare color filtering
+                                      }
+
+                                      // Recursive spawn
+                                      spawnWorker(state);
+                                  } else {
+                                      console.warn(`Worker js-${state.idx} fully stopped (Timeout or Solved).`);
+                                      state.active = false;
+                                  }
+                              }
+                          }
+                      };
+                      
+                      w.postMessage({ 
+                          type: 'solve', 
+                          payload: { 
+                              triangles, startId: comp.startId, palette: effectivePalette, maxBranches: strat.maxBranches || maxBranches, stepLimit, 
+                              flags: { ...G.SOLVER_FLAGS, ...strat, workerTimeBudgetMs: TIME_BUDGET_MS, maxNodes: Infinity } // Force infinite nodes
+                          } 
+                      });
+                    }
+                  } catch(e) { console.warn('JS Worker acquire failed', e); }
+              };
+
+              // Initial spawn for all strategies
+              workerStates.forEach(spawnWorker);
+
+              // Force main thread to wait until timeout or solution
+              const checkInterval = setInterval(() => {
+                  if (solved) {
+                      clearInterval(checkInterval);
+                      cleanup();
+                      // resolve(null); // handleResult already resolved it
+                  } else if (Date.now() - startTime > TIME_BUDGET_MS) {
+                      clearInterval(checkInterval);
+                      console.warn('Global timeout reached. Stopping all workers.');
+                      cleanup();
+                      resolve(null);
+                  }
+              }, 1000);
+           });
+           if (parallelRes) return parallelRes;
+         } catch(e) { console.error('Parallel execution error', e); }
+       }
+    }
+    // --------------------------------
+
     let best={ startId:null, minSteps: Infinity, paths: [] }
-    for(const comp of components){
-      if (Date.now() - startTime > TIME_BUDGET_MS) { timedOut = true; break }
-      await new Promise(r=>setTimeout(r,0))
-      if (ADJUST_ON_NO_PROGRESS) {
+    // RETRY LOOP: If no solution found and time remains, increase parameters and RETRY!
+    let retryCount = 0;
+    const MAX_RETRIES = 5;
+    
+    while (Date.now() - startTime < TIME_BUDGET_MS) {
+      const searchResult = await (async () => {
+      for(const comp of components){
+        if (Date.now() - startTime > TIME_BUDGET_MS) { timedOut = true; break }
+        await new Promise(r=>setTimeout(r,0))
+        if (ADJUST_ON_NO_PROGRESS) {
         const now = Date.now()
         if (now - lastBestUpdateTs >= SCHED_INTERVAL_MS) {
           try {
-            const curBeam = Number.isFinite(window.SOLVER_FLAGS?.beamWidth) ? window.SOLVER_FLAGS.beamWidth : baseBeamWidth
+            const curBeam = Number.isFinite(G.SOLVER_FLAGS?.beamWidth) ? G.SOLVER_FLAGS.beamWidth : baseBeamWidth
             const target = (Array.isArray(beamScheduleTargets) && beamScheduleIdx < beamScheduleTargets.length) ? Math.max(curBeam, beamScheduleTargets[beamScheduleIdx]) : (curBeam + 8)
             const newBeam = Math.min(beamMax, Math.max(curBeam, target))
-            window.SOLVER_FLAGS.beamWidth = newBeam
+            G.SOLVER_FLAGS.beamWidth = newBeam
             beamScheduleIdx = Math.min(beamScheduleIdx + 1, (beamScheduleTargets?.length || 0))
-            const curLbMin = Number.isFinite(window.SOLVER_FLAGS?.lbImproveMin) ? window.SOLVER_FLAGS.lbImproveMin : baseLbImproveMin
-            window.SOLVER_FLAGS.lbImproveMin = Math.max(1, curLbMin - 1)
-            const curBeamMin = Number.isFinite(window.SOLVER_FLAGS?.beamMin) ? window.SOLVER_FLAGS.beamMin : baseBeamMin
-            window.SOLVER_FLAGS.beamMin = Math.min(baseBeamMin, curBeamMin + 1)
-            onProgress?.({ phase:'scheduler_adjust', beamWidth: newBeam, lbImproveMin: window.SOLVER_FLAGS.lbImproveMin, beamMin: window.SOLVER_FLAGS.beamMin, elapsedMs: now - startTime })
+            const curLbMin = Number.isFinite(G.SOLVER_FLAGS?.lbImproveMin) ? G.SOLVER_FLAGS.lbImproveMin : baseLbImproveMin
+            G.SOLVER_FLAGS.lbImproveMin = Math.max(1, curLbMin - 1)
+            const curBeamMin = Number.isFinite(G.SOLVER_FLAGS?.beamMin) ? G.SOLVER_FLAGS.beamMin : baseBeamMin
+            G.SOLVER_FLAGS.beamMin = Math.min(baseBeamMin, curBeamMin + 1)
+            onProgress?.({ phase:'scheduler_adjust', beamWidth: newBeam, lbImproveMin: G.SOLVER_FLAGS.lbImproveMin, beamMin: G.SOLVER_FLAGS.beamMin, elapsedMs: now - startTime })
             lastBestUpdateTs = now
           } catch {}
         }
@@ -1288,10 +1729,10 @@ export function attachSolverToWindow(){
       if (FLAGS.strictMode) {
         const useIDA = !!FLAGS.useIDAStar
         const resStrict = useIDA
-          ? await window.StrictIDAStarMinSteps(triangles, comp.startId, palette, (p)=>{ onProgress?.({ phase:'subsearch', startId: comp.startId, ...p }) }, stepLimit)
-          : await window.StrictAStarMinSteps(triangles, comp.startId, palette, (p)=>{ onProgress?.({ phase:'subsearch', startId: comp.startId, ...p }) }, stepLimit)
+          ? await G.StrictIDAStarMinSteps(triangles, comp.startId, effectivePalette, (p)=>{ onProgress?.({ phase:'subsearch', startId: comp.startId, ...p }) }, stepLimit)
+          : await G.StrictAStarMinSteps(triangles, comp.startId, effectivePalette, (p)=>{ onProgress?.({ phase:'subsearch', startId: comp.startId, ...p }) }, stepLimit)
         if(resStrict && resStrict.paths && resStrict.paths.length>0){
-          if(resStrict.minSteps < best.minSteps){ best = { startId: comp.startId, minSteps: resStrict.minSteps, paths: resStrict.paths }; onProgress?.({ phase:'best_update', bestStartId: best.startId, minSteps: best.minSteps }); lastBestUpdateTs = Date.now(); if (ADJUST_ON_NO_PROGRESS) { try { window.SOLVER_FLAGS.beamWidth = baseBeamWidth; window.SOLVER_FLAGS.lbImproveMin = baseLbImproveMin; const curBeamMin = Number.isFinite(window.SOLVER_FLAGS?.beamMin) ? window.SOLVER_FLAGS.beamMin : baseBeamMin; window.SOLVER_FLAGS.beamMin = Math.max(2, Math.min(baseBeamMin, curBeamMin - 1)); beamScheduleIdx = 0; onProgress?.({ phase:'scheduler_reset', beamWidth: window.SOLVER_FLAGS.beamWidth, lbImproveMin: window.SOLVER_FLAGS.lbImproveMin, beamMin: window.SOLVER_FLAGS.beamMin }) } catch {} } }
+          if(resStrict.minSteps < best.minSteps){ best = { startId: comp.startId, minSteps: resStrict.minSteps, paths: resStrict.paths }; onProgress?.({ phase:'best_update', bestStartId: best.startId, minSteps: best.minSteps }); lastBestUpdateTs = Date.now(); if (ADJUST_ON_NO_PROGRESS) { try { G.SOLVER_FLAGS.beamWidth = baseBeamWidth; G.SOLVER_FLAGS.lbImproveMin = baseLbImproveMin; const curBeamMin = Number.isFinite(G.SOLVER_FLAGS?.beamMin) ? G.SOLVER_FLAGS.beamMin : baseBeamMin; G.SOLVER_FLAGS.beamMin = Math.max(2, Math.min(baseBeamMin, curBeamMin - 1)); beamScheduleIdx = 0; onProgress?.({ phase:'scheduler_reset', beamWidth: G.SOLVER_FLAGS.beamWidth, lbImproveMin: G.SOLVER_FLAGS.lbImproveMin, beamMin: G.SOLVER_FLAGS.beamMin }) } catch {} } }
           if (Number.isFinite(stepLimit) && resStrict.minSteps <= stepLimit) { break }
           if (resStrict.timedOut) timedOut = true
         }
@@ -1312,7 +1753,7 @@ export function attachSolverToWindow(){
             const rc = colors[idToIndex.get(startIdLocal)]
             const adjColors = new Set(); const gain=new Map()
             for(const tid of regionSet){ const idx=idToIndex.get(tid); for(const nb of neighbors[idx]){ const nidx=idToIndex.get(nb); const tri=triangles[nidx]; const c=colors[nidx]; if(c!==rc && c && c!=='transparent' && !tri.deleted){ adjColors.add(c); gain.set(c,(gain.get(c)||0)+1) } } }
-            const raw = adjColors.size>0 ? [...adjColors] : palette
+            const raw = adjColors.size>0 ? [...adjColors] : effectivePalette
             const score=(c)=>{ let s=(gain.get(c)||0)*3 + getColorBiasRAG(c); return s }
             return raw.sort((a,b)=>score(b)-score(a)).slice(0,8).filter(c=>c!==rc)
           }
@@ -1347,21 +1788,96 @@ export function attachSolverToWindow(){
           return null
         })()
         if (resDFS && resDFS.paths && resDFS.paths.length>0) {
-          return { bestStartId: comp.startId, paths: resDFS.paths, minSteps: resDFS.minSteps, timedOut }
+          return { _ret: { bestStartId: comp.startId, paths: resDFS.paths, minSteps: resDFS.minSteps, timedOut } }
         }
       }
-      const res = await window.Solver_minSteps(triangles, comp.startId, palette, maxBranches, (p)=>{
+      const res = await G.Solver_minSteps(triangles, comp.startId, effectivePalette, maxBranches, (p)=>{
         onProgress?.({ phase:'subsearch', startId: comp.startId, ...p })
       }, stepLimit)
       if(res && res.paths && res.paths.length>0){
-        if(res.minSteps < best.minSteps){ best = { startId: comp.startId, minSteps: res.minSteps, paths: res.paths }; onProgress?.({ phase:'best_update', bestStartId: best.startId, minSteps: best.minSteps }); lastBestUpdateTs = Date.now(); if (ADJUST_ON_NO_PROGRESS) { try { window.SOLVER_FLAGS.beamWidth = baseBeamWidth; window.SOLVER_FLAGS.lbImproveMin = baseLbImproveMin; const curBeamMin = Number.isFinite(window.SOLVER_FLAGS?.beamMin) ? window.SOLVER_FLAGS.beamMin : baseBeamMin; window.SOLVER_FLAGS.beamMin = Math.max(2, Math.min(baseBeamMin, curBeamMin - 1)); beamScheduleIdx = 0; onProgress?.({ phase:'scheduler_reset', beamWidth: window.SOLVER_FLAGS.beamWidth, lbImproveMin: window.SOLVER_FLAGS.lbImproveMin, beamMin: window.SOLVER_FLAGS.beamMin }) } catch {} } }
+        if(res.minSteps < best.minSteps){ best = { startId: comp.startId, minSteps: res.minSteps, paths: res.paths }; onProgress?.({ phase:'best_update', bestStartId: best.startId, minSteps: best.minSteps }); lastBestUpdateTs = Date.now(); if (ADJUST_ON_NO_PROGRESS) { try { G.SOLVER_FLAGS.beamWidth = baseBeamWidth; G.SOLVER_FLAGS.lbImproveMin = baseLbImproveMin; const curBeamMin = Number.isFinite(G.SOLVER_FLAGS?.beamMin) ? G.SOLVER_FLAGS.beamMin : baseBeamMin; G.SOLVER_FLAGS.beamMin = Math.max(2, Math.min(baseBeamMin, curBeamMin - 1)); beamScheduleIdx = 0; onProgress?.({ phase:'scheduler_reset', beamWidth: G.SOLVER_FLAGS.beamWidth, lbImproveMin: G.SOLVER_FLAGS.lbImproveMin, beamMin: G.SOLVER_FLAGS.beamMin }) } catch {} } }
         if (Number.isFinite(stepLimit) && res.minSteps <= stepLimit) {
           break
         }
         if (res.timedOut) timedOut = true
       }
     }
+    })();
+    if (searchResult && searchResult._ret) return searchResult._ret;
+
+    // If we found a solution, we can stop (unless we want to optimize further, but let's satisfy the "get a solution" requirement first)
+    if(best.minSteps !== Infinity) break;
+
+    // If no solution and time remains, BOOST parameters for next iteration
+    retryCount++;
+    // if (retryCount > MAX_RETRIES) break; // REMOVED LIMIT!
+    
+    // Relax step limit on retries to ensure we find *something*
+    if (Number.isFinite(stepLimit) && retryCount > 1) {
+        stepLimit = stepLimit + 5; // Incrementally relax limit
+        if (retryCount > 4) stepLimit = 9999; // Practically infinite
+    }
+
+    // Aggressively boost parameters
+     G.SOLVER_FLAGS.beamWidth = Math.min(8192, (G.SOLVER_FLAGS.beamWidth || 24) * 2); 
+     G.SOLVER_FLAGS.maxBranches = (G.SOLVER_FLAGS.maxBranches || maxBranches) + 2;
+     // Allow maxNodes to grow exponentially to avoid early exit
+     G.SOLVER_FLAGS.maxNodes = Infinity; // UNLIMITED NODES
+     
+     // Also try to relax pruning
+    G.SOLVER_FLAGS.lbImproveMin = Math.max(0, (G.SOLVER_FLAGS.lbImproveMin || 1) - 1);
+
+    // Disable filters for deep retries to calculate pruned branches
+    if (retryCount >= 2) {
+       G.SOLVER_FLAGS.enableZeroExpandFilter = false;
+       G.SOLVER_FLAGS.rareFreqRatio = 0;
+       G.SOLVER_FLAGS.minDeltaRatio = 0;
+    }
+    
+    // If we've retried many times, try shuffling components to break determinism
+    if (retryCount > 3) {
+       components.sort(() => Math.random() - 0.5);
+    }
+    
+    if (onProgress) onProgress({ phase: 'retry_boost', retry: retryCount, beam: G.SOLVER_FLAGS.beamWidth, elapsedMs: Date.now() - startTime });
+    await new Promise(r=>setTimeout(r, 100)); // Brief pause
+    } // End of retry while loop
+
+    if(best.minSteps===Infinity && Date.now() - startTime < TIME_BUDGET_MS) {
+        // If we reached here without a solution and time remains, it means the retry loop exited prematurely.
+        // FORCE RE-ENTRY with cleared state and maximum aggression.
+        console.warn('Retry loop exited without solution but time remains. Forcing re-entry.');
+        // Reset components sort to random to try different order
+        components.sort(() => Math.random() - 0.5);
+        G.SOLVER_FLAGS.maxNodes = Infinity;
+        G.SOLVER_FLAGS.enableZeroExpandFilter = false;
+        stepLimit = Infinity; // Give up on limit
+        
+        // Manual "goto" via recursive call (dangerous but effective here)
+        // Or better: just continue the outer logic by wrapping everything in a bigger loop?
+        // Since we are at the end of the function, let's just loop back.
+        // BUT this function structure is linear.
+        // Let's modify the while loop condition above to be ABSOLUTE.
+        // The while loop above is: while (Date.now() - startTime < TIME_BUDGET_MS)
+        // If it exited, it means time IS UP.
+        // UNLESS `break` was called.
+        // Break is only called if best.minSteps !== Infinity.
+        
+        // So if we are here and best.minSteps is Infinity, it MUST be timeout.
+        // Check time again.
+        if (Date.now() - startTime < TIME_BUDGET_MS - 1000) {
+             console.error('CRITICAL: Premature exit detected. Time budget:', TIME_BUDGET_MS, 'Elapsed:', Date.now() - startTime);
+             // This path should ideally not be reachable if the while loop is correct.
+             // But if it is reached, return a timedOut status but with force-flag
+             return { bestStartId: null, paths: [], minSteps: 0, timedOut: true, premature: true }
+        }
+    }
+
     if(best.minSteps===Infinity) return { bestStartId: null, paths: [], minSteps: 0, timedOut }
+    
+    // Save to Cache
+    saveCachedSolution(problemHash, { startId: best.startId, paths: best.paths, minSteps: best.minSteps })
+
     return { bestStartId: best.startId, paths: best.paths, minSteps: best.minSteps, timedOut }
   }
 }

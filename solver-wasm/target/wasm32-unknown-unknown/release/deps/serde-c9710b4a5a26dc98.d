@@ -1,0 +1,14 @@
+D:\Trae\zhezhituse\solver-wasm\target\wasm32-unknown-unknown\release\deps\serde-c9710b4a5a26dc98.d: C:\Users\86133\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\serde-1.0.228\src\lib.rs C:\Users\86133\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\serde-1.0.228\src\integer128.rs C:\Users\86133\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\serde-1.0.228\src\private\mod.rs C:\Users\86133\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\serde-1.0.228\src\private\de.rs C:\Users\86133\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\serde-1.0.228\src\private\ser.rs D:\Trae\zhezhituse\solver-wasm\target\wasm32-unknown-unknown\release\build\serde-c9bb42769c2fb88f\out/private.rs
+
+D:\Trae\zhezhituse\solver-wasm\target\wasm32-unknown-unknown\release\deps\libserde-c9710b4a5a26dc98.rlib: C:\Users\86133\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\serde-1.0.228\src\lib.rs C:\Users\86133\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\serde-1.0.228\src\integer128.rs C:\Users\86133\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\serde-1.0.228\src\private\mod.rs C:\Users\86133\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\serde-1.0.228\src\private\de.rs C:\Users\86133\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\serde-1.0.228\src\private\ser.rs D:\Trae\zhezhituse\solver-wasm\target\wasm32-unknown-unknown\release\build\serde-c9bb42769c2fb88f\out/private.rs
+
+D:\Trae\zhezhituse\solver-wasm\target\wasm32-unknown-unknown\release\deps\libserde-c9710b4a5a26dc98.rmeta: C:\Users\86133\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\serde-1.0.228\src\lib.rs C:\Users\86133\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\serde-1.0.228\src\integer128.rs C:\Users\86133\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\serde-1.0.228\src\private\mod.rs C:\Users\86133\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\serde-1.0.228\src\private\de.rs C:\Users\86133\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\serde-1.0.228\src\private\ser.rs D:\Trae\zhezhituse\solver-wasm\target\wasm32-unknown-unknown\release\build\serde-c9bb42769c2fb88f\out/private.rs
+
+C:\Users\86133\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\serde-1.0.228\src\lib.rs:
+C:\Users\86133\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\serde-1.0.228\src\integer128.rs:
+C:\Users\86133\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\serde-1.0.228\src\private\mod.rs:
+C:\Users\86133\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\serde-1.0.228\src\private\de.rs:
+C:\Users\86133\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\serde-1.0.228\src\private\ser.rs:
+D:\Trae\zhezhituse\solver-wasm\target\wasm32-unknown-unknown\release\build\serde-c9bb42769c2fb88f\out/private.rs:
+
+# env-dep:OUT_DIR=D:\\Trae\\zhezhituse\\solver-wasm\\target\\wasm32-unknown-unknown\\release\\build\\serde-c9bb42769c2fb88f\\out

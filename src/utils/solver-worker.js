@@ -1,5 +1,8 @@
 import { buildRAG, colorFrequency } from './grid-utils'
 import { getHeuristic } from './heuristics'
+import { mctsSolve } from './mcts'
+import { localRepair } from './local-repair'
+import { satMacroColorPlan } from './sat'
 // Web Worker for parallel auto-solve
 // Runs the enhanced solver in a dedicated thread and streams progress back to main thread.
 
@@ -15,16 +18,16 @@ function isUniformSimple(triangles){
 
 async function Solver_minSteps(triangles, startId, palette, maxBranches=3, onProgress, stepLimit=Infinity){
   const startTime = Date.now()
-  // 计算时限：可通过 SOLVER_FLAGS.workerTimeBudgetMs 配置（默�?300000 ms�?
-  const TIME_BUDGET_MS = (typeof self !== 'undefined' && self.SOLVER_FLAGS && Number.isFinite(self.SOLVER_FLAGS.workerTimeBudgetMs))
-    ? Math.max(1000, self.SOLVER_FLAGS.workerTimeBudgetMs)
-    : 300000
+  // 计算总时限：固定 3 分钟（用户要求：不因重试/节点上限提前停止）
+  // 注意：仍会在达到 3 分钟后停止并返回（若无合格解则 timedOut=true）。
+  const TIME_BUDGET_MS = 180000
   let timedOut = false
   const startColor = triangles.find(t=>t.id===startId)?.color
   const idToIndex = new Map(triangles.map((t,i)=>[t.id,i]))
   const neighbors = triangles.map(t=>t.neighbors)
   // 可选开关（默认关闭）：从全局覆写
   const FLAGS = (typeof self !== 'undefined' && self.SOLVER_FLAGS) ? self.SOLVER_FLAGS : {}
+  const FULL_EXPAND = !!FLAGS.fullExpand
   const ENABLE_LB = !!FLAGS.enableLB
   const ENABLE_LOOKAHEAD = !!FLAGS.enableLookahead
   const ENABLE_INCREMENTAL = !!FLAGS.enableIncremental
@@ -239,7 +242,8 @@ async function Solver_minSteps(triangles, startId, palette, maxBranches=3, onPro
   const startColors = triangles.map(t=>t.color)
   const startKey = keyFromColors(startColors)
   const seen = new Set([startKey])
-  const maxNodes = Math.min(20000, Math.max(8000, triangles.length * 8))
+  // 用户要求：取消所有尝试/节点上限，直到时间耗尽
+  const maxNodes = Infinity
   const queueStates = [{ colors:startColors, region: new Set(region), steps: [] }]
   // 用堆替代全排序：根据 priority 维护最大堆（仅�?ENABLE_BEST_FIRST 下生效）
   const heapOn = ENABLE_BEST_FIRST
@@ -286,7 +290,12 @@ async function Solver_minSteps(triangles, startId, palette, maxBranches=3, onPro
   const BN_POOL_MAX = Number.isFinite(self?.SOLVER_FLAGS?.boundaryPoolMax) ? self.SOLVER_FLAGS.boundaryPoolMax : 64
   const boundaryArrayPool = []
   function releaseBoundaryArray(arr){ if (Array.isArray(arr) && boundaryArrayPool.length < BN_POOL_MAX){ arr.length = 0; boundaryArrayPool.push(arr) } }
-  while(queueStates.length && nodes<maxNodes){
+  while(queueStates.length){
+    // 高频兜底：避免因长时间不触发进度节流而越过总时限
+    if ((nodes & 1023) === 0) {
+      const nowTop = Date.now()
+      if (nowTop - startTime > TIME_BUDGET_MS) { timedOut = true; break }
+    }
     // 更高频的搜索阶段进度上报（按时间节流，而非固定节点间隔�?
     if (!lastSearchReportTs) { var lastSearchReportTs = startTime }
     const nowTsSearch = Date.now()
@@ -419,7 +428,8 @@ async function Solver_minSteps(triangles, startId, palette, maxBranches=3, onPro
     const pressure = Math.min(1, (Array.isArray(queueStates) ? queueStates.length : 0) / Math.max(1, maxNodes))
     const pressureScale = ENABLE_BEAM ? Math.max(0.6, 1.0 - 0.5*pressure) : 1.0
     const dynamicWidth = ENABLE_BEAM ? Math.min(beamMax, Math.max(beamMin, Math.floor(beamBase * Math.pow(beamDecay, depth) * pressureScale))) : Math.min(beamMax, beamBase)
-    const preK = ENABLE_BEAM ? Math.min(dynamicWidth, basePreK) : basePreK
+    // 深度降级（fullExpand）时：不截断候选颜色，确保之前被剪除的分支也会被计算
+    const preK = FULL_EXPAND ? tryColorsRaw.length : (ENABLE_BEAM ? Math.min(dynamicWidth, basePreK) : basePreK)
     const LOOKAHEAD_PRESSURE_MAX = Number.isFinite(FLAGS?.lookaheadMaxPressure) ? FLAGS.lookaheadMaxPressure : 0.7
     const ENABLE_LOOKAHEAD2_LOCAL = ((!!FLAGS.enableLookaheadDepth2) || (Number.isFinite(stepLimit) && Array.isArray(palette) && palette.length <= 8 && !FLAGS?.disableAutoLookaheadDepth2)) && (pressure < LOOKAHEAD_PRESSURE_MAX)
     const prelim = tryColorsRaw.map(c=>{
@@ -455,7 +465,7 @@ async function Solver_minSteps(triangles, startId, palette, maxBranches=3, onPro
       // 非面积“saddle”：以分量数量衡量多前沿潜力
       saddlePotential.set(c, compSizes.length)
     }
-    let limitTry = ENABLE_BEAM ? Math.max(beamMin, Math.floor(dynamicWidth)) : 8
+    let limitTry = FULL_EXPAND ? tryColorsRaw.length : (ENABLE_BEAM ? Math.max(beamMin, Math.floor(dynamicWidth)) : 8)
     const prevLB = ENABLE_LB ? (USE_STRICT_LB_BF ? lowerBoundStrictLocal(curColors, regionSet) : lowerBound(curColors)) : 0
     const BF_W = Number.isFinite(self?.SOLVER_FLAGS?.bifrontWeight) ? self.SOLVER_FLAGS.bifrontWeight : 2.0
     let scored = prelim
@@ -545,14 +555,14 @@ async function Solver_minSteps(triangles, startId, palette, maxBranches=3, onPro
         if (nextSteps.length <= (Number.isFinite(stepLimit) ? stepLimit : Infinity)) {
           // 过滤：零扩张候选（应用颜色后区域未增长�?
           const delta = newRegion.size - regionSet.size
-          if (ENABLE_ZERO_FILTER && delta <= 0) {
+          if (!FULL_EXPAND && ENABLE_ZERO_FILTER && delta <= 0) {
             perf.filteredZero++
             try { onProgress?.({ phase:'branch_pruned', reason:'zero_expand', step: nextSteps.length, color, delta, regionSize: regionSet.size }) } catch {}
             continue
           }
           // 准零扩张：相对增长过小则跳过（避免“几乎没用”的动作�?
           const deltaRatio = delta / Math.max(1, regionSet.size)
-          if (deltaRatio < MIN_DELTA_RATIO) {
+          if (!FULL_EXPAND && deltaRatio < MIN_DELTA_RATIO) {
             try { onProgress?.({ phase:'branch_pruned', reason:'delta_small', step: nextSteps.length, color, deltaRatio, regionSize: regionSet.size }) } catch {}
             continue
           }
@@ -574,7 +584,7 @@ async function Solver_minSteps(triangles, startId, palette, maxBranches=3, onPro
               RARE_BRIDGE_MIN_EFF = Math.max(1, Math.floor(RARE_ALLOW_BRIDGE_MIN * coeff))
               RARE_GATE_MIN_EFF = Math.max(1, Math.floor(RARE_ALLOW_GATE_MIN * coeff))
             }
-            if (bridgePotential < RARE_BRIDGE_MIN_EFF && gateScore < RARE_GATE_MIN_EFF && adjAfter < RARE_BRIDGE_MIN_EFF) {
+            if (!FULL_EXPAND && bridgePotential < RARE_BRIDGE_MIN_EFF && gateScore < RARE_GATE_MIN_EFF && adjAfter < RARE_BRIDGE_MIN_EFF) {
               try { onProgress?.({ phase:'branch_pruned', reason:'rare_no_bridge_gate', step: nextSteps.length, color, adjAfter, bridgePotential, gateScore, rareEff:{ bridge: RARE_BRIDGE_MIN_EFF, gate: RARE_GATE_MIN_EFF } }) } catch {}
               continue
             }
@@ -603,7 +613,7 @@ async function Solver_minSteps(triangles, startId, palette, maxBranches=3, onPro
             const rareTh = Math.max(RARE_FREQ_ABS, Math.floor(triangles.length * RARE_FREQ_RATIO))
             const isRare = freqCount < rareTh
             const g0 = (gain.get(color) || 0)
-            if (isRare && g0 <= 0) {
+            if (!FULL_EXPAND && isRare && g0 <= 0) {
               try { onProgress?.({ phase:'branch_pruned', reason:'rare_hard_guard', step: nextSteps.length, color, gain: g0, freq: freqCount }) } catch {}
               continue
             }
@@ -635,7 +645,7 @@ async function Solver_minSteps(triangles, startId, palette, maxBranches=3, onPro
           const coeff = (1 - relax) + relax * s
           LB_MIN_EFF = Math.max(1, Math.floor(LB_IMPROVE_MIN * coeff))
         }
-        if ((prevLBLocal - childLB) < LB_MIN_EFF) {
+        if (!FULL_EXPAND && (prevLBLocal - childLB) < LB_MIN_EFF) {
           try { onProgress?.({ phase:'branch_pruned', reason:'lb_improve_small', step: nextSteps.length, color, prevLB: prevLBLocal, childLB, improve: (prevLBLocal - childLB), lbMinEff: LB_MIN_EFF }) } catch {}
           continue
         }
@@ -808,7 +818,8 @@ async function Solver_minSteps(triangles, startId, palette, maxBranches=3, onPro
 async function StrictAStarMinSteps(triangles, startId, palette, onProgress, stepLimit=Infinity){
   const startTime = Date.now()
   const FLAGS = (typeof self !== 'undefined' && self.SOLVER_FLAGS) ? self.SOLVER_FLAGS : {}
-  const TIME_BUDGET_MS = Number.isFinite(FLAGS?.workerTimeBudgetMs) ? Math.max(1000, FLAGS.workerTimeBudgetMs) : 300000
+  // 固定总预算 3 分钟（避免 strict 子搜索用更短预算导致提前退出）
+  const TIME_BUDGET_MS = 180000
   const REPORT_INTERVAL_MS = Number.isFinite(FLAGS?.progressAStarIntervalMs) ? Math.max(0, FLAGS.progressAStarIntervalMs) : 80
   const idToIndex = new Map(triangles.map((t,i)=>[t.id,i]))
   const neighbors = triangles.map(t=>t.neighbors)
@@ -959,7 +970,8 @@ async function StrictIDAStarMinSteps(triangles, startId, palette, onProgress, st
   const startTime = Date.now()
   // �?A* 保持一致的时间预算与进度间�?
   const FLAGS = (typeof self !== 'undefined' && self.SOLVER_FLAGS) ? self.SOLVER_FLAGS : {}
-  const TIME_BUDGET_MS = Number.isFinite(FLAGS?.workerTimeBudgetMs) ? Math.max(1000, FLAGS.workerTimeBudgetMs) : 300000
+  // 固定总预算 3 分钟（用户要求）
+  const TIME_BUDGET_MS = 180000
   const REPORT_INTERVAL_MS = Number.isFinite(FLAGS?.progressAStarIntervalMs) ? Math.max(0, FLAGS.progressAStarIntervalMs) : 250
   const ENABLE_BRIDGE_FIRST = !!FLAGS.enableBridgeFirst
   const ADJ_AFTER_WEIGHT = Number.isFinite(FLAGS?.adjAfterWeight) ? FLAGS.adjAfterWeight : 0.6
@@ -1232,12 +1244,14 @@ async function StrictIDAStarMinSteps(triangles, startId, palette, onProgress, st
 
 async function Solver_minStepsAuto(triangles, palette, maxBranches=3, onProgress, stepLimit=Infinity){
   const startTime = Date.now()
-  // 计算时限：可通过 SOLVER_FLAGS.workerTimeBudgetMs 配置（默�?300000 ms�?
-  const TIME_BUDGET_MS = (typeof self !== 'undefined' && self.SOLVER_FLAGS && Number.isFinite(self.SOLVER_FLAGS.workerTimeBudgetMs))
-    ? Math.max(1000, self.SOLVER_FLAGS.workerTimeBudgetMs)
-    : 300000
+  // 计算总时限：固定 3 分钟（用户要求：没出合格解且时间没到就必须继续算）
+  const TIME_BUDGET_MS = 180000
   let timedOut = false
   const FLAGS = (typeof self !== 'undefined' && self.SOLVER_FLAGS) ? self.SOLVER_FLAGS : {}
+  // 用户指定步数上限时，必须严格满足；默认不允许自动放宽（否则会产生“上限5却返回6步”的不合格解）
+  const ALLOW_STEP_LIMIT_RELAX = (FLAGS?.allowStepLimitRelax === true)
+  const requiredStepLimit = stepLimit
+  let stepLimitLocal = stepLimit
   // 动态束�?阈值调度参�?
   const SCHED_INTERVAL_MS = Number.isFinite(FLAGS?.dynamicScheduleIntervalMs) ? Math.max(500, FLAGS.dynamicScheduleIntervalMs) : 2500
   const ADJUST_ON_NO_PROGRESS = (FLAGS?.dynamicBeamAdjustOnNoBestUpdate !== false)
@@ -1248,10 +1262,8 @@ async function Solver_minStepsAuto(triangles, palette, maxBranches=3, onProgress
   const beamMax = Number.isFinite(FLAGS?.beamMax) ? FLAGS.beamMax : 64
   const beamScheduleTargets = Array.isArray(FLAGS?.beamScheduleTargets) ? FLAGS.beamScheduleTargets : [32, 40, 48]
   let beamScheduleIdx = 0
-  // 预处理（components）阶段单独时间预算，默认 5 分钟，可�?
-  const PREPROC_TIME_BUDGET_MS = Number.isFinite(FLAGS?.preprocessTimeBudgetMs)
-    ? Math.max(0, FLAGS.preprocessTimeBudgetMs)
-    : 300000
+  // 预处理（components）阶段：不允许因为 20s 之类的配置而提前截断（会导致搜索空间不完整）
+  const PREPROC_TIME_BUDGET_MS = TIME_BUDGET_MS
   const PROG_COMP_INTERVAL = Number.isFinite(FLAGS?.progressComponentsIntervalMs) ? Math.max(0, FLAGS.progressComponentsIntervalMs) : 100
   const PROGRESS_DFS_INTERVAL_MS = Number.isFinite(FLAGS?.progressDFSIntervalMs) ? Math.max(0, FLAGS.progressDFSIntervalMs) : 50
   const USE_DFS_FIRST = !!FLAGS.useDFSFirst
@@ -1413,6 +1425,67 @@ async function Solver_minStepsAuto(triangles, palette, maxBranches=3, onProgress
     } catch {}
   }
   if(components.length===0) return { bestStartId: null, paths: [], minSteps: 0 }
+
+  // 为每个颜色分量生成多个候选起点（边界更“桥接”的点更容易出解）
+  const idToIndexGlobal = idToIndex
+  const neighborsGlobal = neighbors
+  function boundaryScoreForId(id){
+    try {
+      const idx = idToIndexGlobal.get(id)
+      if (idx==null) return -Infinity
+      const t = triangles[idx]
+      if (!t || t.deleted || t.color==='transparent') return -Infinity
+      const c0 = t.color
+      let score = 0
+      for (const nb of (neighborsGlobal[idx] || [])) {
+        const nidx = idToIndexGlobal.get(nb)
+        if (nidx==null) continue
+        const tn = triangles[nidx]
+        if (!tn || tn.deleted || tn.color==='transparent') continue
+        if (tn.color !== c0) score++
+      }
+      return score
+    } catch { return -Infinity }
+  }
+  function pickStartCandidates(comp, k=4){
+    const ids = comp?.ids || []
+    if (!Array.isArray(ids) || ids.length===0) return [comp?.startId].filter(x=>x!=null)
+    const preferred = (typeof self !== 'undefined' && self.SOLVER_FLAGS) ? self.SOLVER_FLAGS.preferredStartId : null
+    const out = []
+    const seen = new Set()
+    function push(id){ if(id!=null && !seen.has(id)){ seen.add(id); out.push(id) } }
+    // 1) 优先起点
+    if (preferred!=null && ids.includes(preferred)) push(preferred)
+    // 2) 原始 startId
+    push(comp.startId)
+
+    // 3) 采样一部分 id 做边界评分，取 top-k
+    const SAMPLE_MAX = 220
+    const sample = []
+    if (ids.length <= SAMPLE_MAX) {
+      for (const id of ids) sample.push(id)
+    } else {
+      // 均匀采样 + 少量随机
+      const step = Math.max(1, Math.floor(ids.length / 180))
+      for (let i=0;i<ids.length && sample.length<180;i+=step) sample.push(ids[i])
+      for (let i=0;i<40;i++){
+        const rid = ids[Math.floor(Math.random()*ids.length)]
+        if (rid!=null) sample.push(rid)
+      }
+    }
+    const scored = []
+    for (const id of sample) {
+      const s = boundaryScoreForId(id)
+      if (Number.isFinite(s)) scored.push({ id, s })
+    }
+    scored.sort((a,b)=> b.s - a.s)
+    for (const it of scored.slice(0, Math.max(1, k))) push(it.id)
+    return out
+  }
+  // 预计算候选起点（默认 4 个），后续会随降级扩大
+  for (const comp of components) {
+    comp.startCandidates = pickStartCandidates(comp, 4)
+  }
   // 若指定了优先起点，则将对应分量置�?
   try {
     const preferred = (typeof self !== 'undefined' && self.SOLVER_FLAGS) ? self.SOLVER_FLAGS.preferredStartId : null
@@ -1423,9 +1496,109 @@ async function Solver_minStepsAuto(triangles, palette, maxBranches=3, onProgress
   } catch {}
   components.sort((a,b)=>b.size-a.size)
   let best={ startId:null, minSteps: Infinity, paths: [] }
-  for(const comp of components){
-    if (Date.now() - startTime > TIME_BUDGET_MS) { timedOut = true; break }
-    await new Promise(r=>setTimeout(r,0))
+
+  // 重试/降级循环：无上限（直到 3 分钟耗尽）
+  const baseFlagsSnapshot = { ...(self.SOLVER_FLAGS || {}) }
+  let retry = 0
+
+  // Phase A: 快速种子阶段（MCTS / SAT 宏规划）——目标：尽快拿到任何“统一颜色”的合格解
+  try {
+    const remaining0 = TIME_BUDGET_MS - (Date.now() - startTime)
+    const seedBudget = Math.max(0, Math.min(25000, Math.floor(remaining0 * 0.25)))
+    if (seedBudget >= 3000) {
+      const seedStartTs = Date.now()
+      const TOP_COMPS = Math.min(4, components.length)
+      for (let ci=0; ci<TOP_COMPS; ci++){
+        if (Date.now() - seedStartTs > seedBudget) break
+        const comp = components[ci]
+        const candList = (comp?.startCandidates || [comp?.startId]).slice(0, 2)
+        for (const sid of candList){
+          if (sid==null) continue
+          if (Date.now() - seedStartTs > seedBudget) break
+          try { onProgress?.({ phase:'seed_start', algo:'mcts/sat', startId: sid, elapsedMs: Date.now() - startTime }) } catch {}
+
+          // SAT 宏规划（可选）：依赖后端服务，失败则忽略
+          if (FLAGS?.enableSATPlanner) {
+            try {
+              const plan = await satMacroColorPlan(triangles, sid, palette)
+              const order = Array.isArray(plan?.order) ? plan.order.filter(Boolean) : []
+              if (order.length) {
+                // 直接验证宏序列是否能统一（很快）
+                const baseColors = triangles.map(t=>t.color)
+                const idToIndexL = idToIndex
+                const neighborsL = neighbors
+                const applyOne = (colorsArr, color)=>{
+                  const startColor = colorsArr[idToIndexL.get(sid)]
+                  if (color===startColor) return colorsArr
+                  const visited=new Set([sid]); const q=[sid]; const region=[]
+                  while(q.length){ const id=q.shift(); const idx=idToIndexL.get(id); if(colorsArr[idx]!==startColor) continue; region.push(id); for(const nb of neighborsL[idx]){ if(!visited.has(nb)){ visited.add(nb); q.push(nb) } } }
+                  const next = colorsArr.slice()
+                  for(const id of region){ next[idToIndexL.get(id)] = color }
+                  return next
+                }
+                let colorsNow = baseColors.slice()
+                const path = []
+                for (const c of order) { colorsNow = applyOne(colorsNow, c); path.push(c) }
+                // 验证统一性
+                let first=null; let ok=true
+                for(let i=0;i<triangles.length;i++){ const t=triangles[i]; const c=colorsNow[i]; if(t.deleted || !c || c==='transparent') continue; if(first===null) first=c; else if(c!==first){ ok=false; break } }
+                if (ok && first!==null) {
+                  // 压缩修复（安全）
+                  const repaired = await localRepair(triangles, palette, sid, path, (p)=>{ try{ onProgress?.({ ...p, phase: p?.phase || 'local_repair' }) } catch {} })
+                  const finalPath = repaired?.path || path
+                  if (Number.isFinite(requiredStepLimit) && finalPath.length > requiredStepLimit) {
+                    try { onProgress?.({ phase:'seed_reject', reason:'step_limit', startId: sid, len: finalPath.length, stepLimit: requiredStepLimit }) } catch {}
+                  } else {
+                  return { bestStartId: sid, paths: [finalPath], minSteps: finalPath.length, timedOut: false }
+                  }
+                }
+              }
+            } catch {}
+          }
+
+          // MCTS rollout：时间切片
+          const slice = Math.max(800, Math.min(6000, Math.floor(seedBudget / (TOP_COMPS*2))))
+          const m = await mctsSolve(triangles, sid, palette, slice, (p)=>{
+            try { onProgress?.({ ...p, phase: p?.phase || 'mcts_rollout', startId: sid }) } catch {}
+          })
+          const path0 = Array.isArray(m?.path) ? m.path.filter(Boolean) : []
+          if (path0.length) {
+            // 验证统一性
+            const baseColors = triangles.map(t=>t.color)
+            const idToIndexL = idToIndex
+            const neighborsL = neighbors
+            const applyOne = (colorsArr, color)=>{
+              const startColor = colorsArr[idToIndexL.get(sid)]
+              if (color===startColor) return colorsArr
+              const visited=new Set([sid]); const q=[sid]; const region=[]
+              while(q.length){ const id=q.shift(); const idx=idToIndexL.get(id); if(colorsArr[idx]!==startColor) continue; region.push(id); for(const nb of neighborsL[idx]){ if(!visited.has(nb)){ visited.add(nb); q.push(nb) } } }
+              const next = colorsArr.slice()
+              for(const id of region){ next[idToIndexL.get(id)] = color }
+              return next
+            }
+            let colorsNow = baseColors.slice()
+            for (const c of path0) colorsNow = applyOne(colorsNow, c)
+            let first=null; let ok=true
+            for(let i=0;i<triangles.length;i++){ const t=triangles[i]; const c=colorsNow[i]; if(t.deleted || !c || c==='transparent') continue; if(first===null) first=c; else if(c!==first){ ok=false; break } }
+            if (ok && first!==null) {
+              const repaired = await localRepair(triangles, palette, sid, path0, (p)=>{ try{ onProgress?.({ ...p, phase: p?.phase || 'local_repair' }) } catch {} })
+              const finalPath = repaired?.path || path0
+              if (Number.isFinite(requiredStepLimit) && finalPath.length > requiredStepLimit) {
+                try { onProgress?.({ phase:'seed_reject', reason:'step_limit', startId: sid, len: finalPath.length, stepLimit: requiredStepLimit }) } catch {}
+              } else {
+              return { bestStartId: sid, paths: [finalPath], minSteps: finalPath.length, timedOut: false }
+              }
+            }
+          }
+        }
+      }
+    }
+  } catch {}
+
+  while (Date.now() - startTime < TIME_BUDGET_MS) {
+    for(const comp of components){
+      if (Date.now() - startTime > TIME_BUDGET_MS) { timedOut = true; break }
+      await new Promise(r=>setTimeout(r,0))
     // 动态束宽调度：长时间无 best_update 则增�?beamWidth、放�?lbImproveMin
     if (ADJUST_ON_NO_PROGRESS) {
       const now = Date.now()
@@ -1437,7 +1610,8 @@ async function Solver_minStepsAuto(triangles, palette, maxBranches=3, onProgress
           self.SOLVER_FLAGS.beamWidth = newBeam
           beamScheduleIdx = Math.min(beamScheduleIdx + 1, (beamScheduleTargets?.length || 0))
           const curLbMin = Number.isFinite(self?.SOLVER_FLAGS?.lbImproveMin) ? self.SOLVER_FLAGS.lbImproveMin : baseLbImproveMin
-          self.SOLVER_FLAGS.lbImproveMin = Math.max(1, curLbMin - 1)
+            // 允许降到 0（彻底放开“下界必须改善”的剪枝）
+            self.SOLVER_FLAGS.lbImproveMin = Math.max(0, curLbMin - 1)
           // 联动：无进展时小幅提高束宽下限，避免过窄�?
           const curBeamMin = Number.isFinite(self?.SOLVER_FLAGS?.beamMin) ? self.SOLVER_FLAGS.beamMin : baseBeamMin
           self.SOLVER_FLAGS.beamMin = Math.min(baseBeamMin, curBeamMin + 1)
@@ -1447,7 +1621,7 @@ async function Solver_minStepsAuto(triangles, palette, maxBranches=3, onProgress
       }
     }
     // 起点 LB_local 预筛：若局部下界超出步数预算，跳过该分�?
-    if (Number.isFinite(stepLimit)) {
+    if (!self?.SOLVER_FLAGS?.disableStartPrune && Number.isFinite(stepLimitLocal)) {
       try {
         const colorsStart = triangles.map(t=>t.color)
         const startColorLocal = triangles[idToIndex.get(comp.startId)]?.color
@@ -1464,26 +1638,34 @@ async function Solver_minStepsAuto(triangles, palette, maxBranches=3, onProgress
             for(const nb of neighbors[idx]){ if(!visitedLocal.has(nb)){ const nidx=idToIndex.get(nb); const tri2=triangles[nidx]; if(!tri2.deleted && tri2.color!=='transparent' && tri2.color===startColorLocal){ visitedLocal.add(nb); qLocal.push(nb) } } }
           }
           const lbLocalStart = lowerBoundStrictLocalAuto(colorsStart, regionSetLocal, comp.startId)
-          if (lbLocalStart > stepLimit) {
-            onProgress?.({ phase:'start_pruned', reason:'lb_local_over', startId: comp.startId, lbLocal: lbLocalStart, stepLimit })
+          if (lbLocalStart > stepLimitLocal) {
+            onProgress?.({ phase:'start_pruned', reason:'lb_local_over', startId: comp.startId, lbLocal: lbLocalStart, stepLimit: stepLimitLocal })
             continue
           }
         }
       } catch {}
     }
-    // 严格模式：若开启则优先�?A* 求最短路
-      if (FLAGS.strictMode) {
-      const useIDA = !!FLAGS.useIDAStar
-      const resStrict = useIDA
-        ? await StrictIDAStarMinSteps(triangles, comp.startId, palette, (p)=>{ onProgress?.({ phase:'subsearch', startId: comp.startId, ...p }) }, stepLimit)
-        : await StrictAStarMinSteps(triangles, comp.startId, palette, (p)=>{ onProgress?.({ phase:'subsearch', startId: comp.startId, ...p }) }, stepLimit)
-      if(resStrict && resStrict.paths && resStrict.paths.length>0){
-        if(resStrict.minSteps < best.minSteps){ best = { startId: comp.startId, minSteps: resStrict.minSteps, paths: resStrict.paths }; onProgress?.({ phase:'best_update', bestStartId: best.startId, minSteps: best.minSteps }); lastBestUpdateTs = Date.now(); if (ADJUST_ON_NO_PROGRESS) { try { self.SOLVER_FLAGS.beamWidth = baseBeamWidth; self.SOLVER_FLAGS.lbImproveMin = baseLbImproveMin; const curBeamMin = Number.isFinite(self?.SOLVER_FLAGS?.beamMin) ? self.SOLVER_FLAGS.beamMin : baseBeamMin; self.SOLVER_FLAGS.beamMin = Math.max(2, Math.min(baseBeamMin, curBeamMin - 1)); beamScheduleIdx = 0; onProgress?.({ phase:'scheduler_reset', beamWidth: self.SOLVER_FLAGS.beamWidth, lbImproveMin: self.SOLVER_FLAGS.lbImproveMin, beamMin: self.SOLVER_FLAGS.beamMin }) } catch {} } }
-        if (Number.isFinite(stepLimit) && resStrict.minSteps <= stepLimit) { break }
-        if (resStrict.timedOut) timedOut = true
+
+    // 多起点：同一颜色分量内尝试多个 startId（随降级扩大）
+    const startCandK = (retry >= 2) ? 6 : (retry >= 1 ? 3 : 1)
+    const startCandidates = (comp?.startCandidates || [comp?.startId]).slice(0, startCandK)
+    for (const startIdTry of startCandidates){
+      if (startIdTry==null) continue
+      if (Date.now() - startTime > TIME_BUDGET_MS) { timedOut = true; break }
+
+      // 严格模式：若开启则优先用 strict 求最短路
+      if ((self.SOLVER_FLAGS||{}).strictMode) {
+        const useIDA = !!(self.SOLVER_FLAGS||{}).useIDAStar
+        const resStrict = useIDA
+          ? await StrictIDAStarMinSteps(triangles, startIdTry, palette, (p)=>{ onProgress?.({ phase:'subsearch', startId: startIdTry, ...p }) }, stepLimitLocal)
+          : await StrictAStarMinSteps(triangles, startIdTry, palette, (p)=>{ onProgress?.({ phase:'subsearch', startId: startIdTry, ...p }) }, stepLimitLocal)
+        if(resStrict && resStrict.paths && resStrict.paths.length>0){
+          if(resStrict.minSteps < best.minSteps){ best = { startId: startIdTry, minSteps: resStrict.minSteps, paths: resStrict.paths }; onProgress?.({ phase:'best_update', bestStartId: best.startId, minSteps: best.minSteps }); lastBestUpdateTs = Date.now(); if (ADJUST_ON_NO_PROGRESS) { try { self.SOLVER_FLAGS.beamWidth = baseBeamWidth; self.SOLVER_FLAGS.lbImproveMin = baseLbImproveMin; const curBeamMin = Number.isFinite(self?.SOLVER_FLAGS?.beamMin) ? self.SOLVER_FLAGS.beamMin : baseBeamMin; self.SOLVER_FLAGS.beamMin = Math.max(2, Math.min(baseBeamMin, curBeamMin - 1)); beamScheduleIdx = 0; onProgress?.({ phase:'scheduler_reset', beamWidth: self.SOLVER_FLAGS.beamWidth, lbImproveMin: self.SOLVER_FLAGS.lbImproveMin, beamMin: self.SOLVER_FLAGS.beamMin }) } catch {} } }
+          if (Number.isFinite(stepLimitLocal) && resStrict.minSteps <= stepLimitLocal) { break }
+          if (resStrict.timedOut) timedOut = true
+        }
+        continue
       }
-      continue
-    }
     // 若启�?DFS-first，先用深度受�?DFS 找到任意可行解并立刻返回
     if (USE_DFS_FIRST && Number.isFinite(stepLimit)) {
       const resDFS = await (async function(){
@@ -1502,7 +1684,9 @@ async function Solver_minStepsAuto(triangles, palette, maxBranches=3, onProgress
           for(const tid of regionSet){ const idx=idToIndex.get(tid); for(const nb of neighbors[idx]){ const nidx=idToIndex.get(nb); const tri=triangles[nidx]; const c=colors[nidx]; if(c!==rc && c && c!=='transparent' && !tri.deleted){ adjColors.add(c); gain.set(c,(gain.get(c)||0)+1) } } }
           const raw = adjColors.size>0 ? [...adjColors] : palette
           const score=(c)=>{ let s=(gain.get(c)||0)*3 + getColorBiasRAG(c); return s }
-          return raw.sort((a,b)=>score(b)-score(a)).slice(0,8).filter(c=>c!==rc)
+          const fullExpand = !!(self.SOLVER_FLAGS||{}).fullExpand
+          const arr = raw.sort((a,b)=>score(b)-score(a))
+          return (fullExpand ? arr : arr.slice(0,8)).filter(c=>c!==rc)
         }
         const startTs = Date.now()
         let dfsNodesFirst = 0
@@ -1542,7 +1726,7 @@ async function Solver_minStepsAuto(triangles, palette, maxBranches=3, onProgress
         const dfsRes = await dfs(startColors, dfsRegion, [])
         if(dfsRes){
           // 仅在显式允许“找到可行解立即返回”时，才提前输出结果
-          const RETURN_FIRST = !!FLAGS.returnFirstFeasible
+          const RETURN_FIRST = !!(self.SOLVER_FLAGS||{}).returnFirstFeasible
           onProgress?.({ phase:'dfs_first_solution', minSteps: dfsRes.length, solutions: 1, elapsedMs: Date.now() - startTime })
           if (RETURN_FIRST) {
             return { paths:[dfsRes], minSteps: dfsRes.length, timedOut }
@@ -1555,18 +1739,72 @@ async function Solver_minStepsAuto(triangles, palette, maxBranches=3, onProgress
         return { bestStartId: comp.startId, paths: resDFS.paths, minSteps: resDFS.minSteps, timedOut }
       }
     }
-    const res = await Solver_minSteps(triangles, comp.startId, palette, maxBranches, (p)=>{
-      onProgress?.({ phase:'subsearch', startId: comp.startId, ...p })
-    }, stepLimit)
-    if(res && res.paths && res.paths.length>0){
-      if(res.minSteps < best.minSteps){ best = { startId: comp.startId, minSteps: res.minSteps, paths: res.paths }; onProgress?.({ phase:'best_update', bestStartId: best.startId, minSteps: best.minSteps }); lastBestUpdateTs = Date.now(); if (ADJUST_ON_NO_PROGRESS) { try { self.SOLVER_FLAGS.beamWidth = baseBeamWidth; self.SOLVER_FLAGS.lbImproveMin = baseLbImproveMin; const curBeamMin = Number.isFinite(self?.SOLVER_FLAGS?.beamMin) ? self.SOLVER_FLAGS.beamMin : baseBeamMin; self.SOLVER_FLAGS.beamMin = Math.max(2, Math.min(baseBeamMin, curBeamMin - 1)); beamScheduleIdx = 0; onProgress?.({ phase:'scheduler_reset', beamWidth: self.SOLVER_FLAGS.beamWidth, lbImproveMin: self.SOLVER_FLAGS.lbImproveMin, beamMin: self.SOLVER_FLAGS.beamMin }) } catch {} } }
-      if (Number.isFinite(stepLimit) && res.minSteps <= stepLimit) {
-        break
+      const res = await Solver_minSteps(triangles, startIdTry, palette, maxBranches, (p)=>{
+        onProgress?.({ phase:'subsearch', startId: startIdTry, ...p })
+      }, stepLimitLocal)
+      if(res && res.paths && res.paths.length>0){
+        if(res.minSteps < best.minSteps){ best = { startId: startIdTry, minSteps: res.minSteps, paths: res.paths }; onProgress?.({ phase:'best_update', bestStartId: best.startId, minSteps: best.minSteps }); lastBestUpdateTs = Date.now(); if (ADJUST_ON_NO_PROGRESS) { try { self.SOLVER_FLAGS.beamWidth = baseBeamWidth; self.SOLVER_FLAGS.lbImproveMin = baseLbImproveMin; const curBeamMin = Number.isFinite(self?.SOLVER_FLAGS?.beamMin) ? self.SOLVER_FLAGS.beamMin : baseBeamMin; self.SOLVER_FLAGS.beamMin = Math.max(2, Math.min(baseBeamMin, curBeamMin - 1)); beamScheduleIdx = 0; onProgress?.({ phase:'scheduler_reset', beamWidth: self.SOLVER_FLAGS.beamWidth, lbImproveMin: self.SOLVER_FLAGS.lbImproveMin, beamMin: self.SOLVER_FLAGS.beamMin }) } catch {} } }
+        if (Number.isFinite(stepLimitLocal) && res.minSteps <= stepLimitLocal) {
+          break
+        }
+        if (res.timedOut) timedOut = true
       }
-      if (res.timedOut) timedOut = true
+    } // end startCandidates loop
     }
+
+    if(best.minSteps!==Infinity) break
+    if (Date.now() - startTime > TIME_BUDGET_MS) { timedOut = true; break }
+
+    // 未找到合格解：降级策略并重试（不设次数上限，直到 3 分钟）
+    retry++
+    // 若用户设置了过低的步数上限，允许在深度重试时逐步放宽（默认开启，可通过 flags.allowStepLimitRelax=false 关闭）
+    if (ALLOW_STEP_LIMIT_RELAX && Number.isFinite(stepLimitLocal)) {
+      if (retry >= 2) stepLimitLocal = Math.min(9999, stepLimitLocal + 5)
+      if (retry >= 4) stepLimitLocal = Infinity
+    }
+    const cur = self.SOLVER_FLAGS || {}
+    const next = { ...cur }
+    next.workerTimeBudgetMs = TIME_BUDGET_MS
+    next.preprocessTimeBudgetMs = TIME_BUDGET_MS
+    next.maxNodes = Infinity
+
+    // 逐步放开剪枝与截断，确保“被剪除的分支”也会被计算
+    if (retry >= 1) {
+      next.enableZeroExpandFilter = false
+      next.minDeltaRatio = 0
+      next.rareFreqRatio = 0
+      next.rareFreqAbs = 0
+      next.lbImproveMin = 0
+      // 让调度器可以把束宽抬上去
+      next.enableBeam = true
+      next.beamWidth = Math.min(8192, Math.max(Number.isFinite(cur.beamWidth) ? cur.beamWidth : baseBeamWidth, baseBeamWidth) * 2)
+      next.beamMin = Math.min(64, Math.max(Number.isFinite(cur.beamMin) ? cur.beamMin : baseBeamMin, baseBeamMin))
+    }
+    if (retry >= 2) {
+      next.fullExpand = true
+      next.disableStartPrune = true
+      // 打破确定性：换不同顺序重新扫
+      components.sort(() => Math.random() - 0.5)
+    }
+    if (retry >= 3) {
+      // 彻底禁用 LB 剪枝（避免任何可能的过剪导致“无解”错判）
+      next.enableLB = false
+    }
+    if (retry >= 4) {
+      // 最终兜底：禁用束搜索（只保留排序，不再截断分支）
+      next.enableBeam = false
+    }
+
+    try { self.SOLVER_FLAGS = { ...baseFlagsSnapshot, ...next } } catch {}
+    try { onProgress?.({ phase:'retry_degrade', retry, elapsedMs: Date.now() - startTime, flags: { fullExpand: !!self.SOLVER_FLAGS?.fullExpand, enableLB: !!self.SOLVER_FLAGS?.enableLB, enableBeam: !!self.SOLVER_FLAGS?.enableBeam, beamWidth: self.SOLVER_FLAGS?.beamWidth, lbImproveMin: self.SOLVER_FLAGS?.lbImproveMin } }) } catch {}
+    await new Promise(r=>setTimeout(r,0))
   }
-  if(best.minSteps===Infinity) return { bestStartId: null, paths: [], minSteps: 0, timedOut }
+
+  // 最终兜底：再次严格校验步数上限（requiredStepLimit），不满足则视为无合格解
+  if (best.minSteps!==Infinity && Number.isFinite(requiredStepLimit) && best.minSteps > requiredStepLimit) {
+    return { bestStartId: null, paths: [], minSteps: 0, timedOut: true }
+  }
+  if(best.minSteps===Infinity) return { bestStartId: null, paths: [], minSteps: 0, timedOut: true }
   return { bestStartId: best.startId, paths: best.paths, minSteps: best.minSteps, timedOut }
 }
 
