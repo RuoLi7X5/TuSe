@@ -215,6 +215,7 @@ a.small-btn:hover { border-color: var(--accent); }
   overflow: auto; /* 恢复滚动条 */
   display: flex; /* 使用 Flex 布局 */
   /* 不设置 align-items/justify-content，让子元素的 margin: auto 处理居中与溢出 */
+  touch-action: pan-x pan-y; /* 允许浏览器处理单指平移，JS 处理双指缩放 */
 }
 
 canvas {
@@ -269,6 +270,7 @@ canvas {
 .toolbar {
   display: flex;
   gap: .5rem;
+  flex-wrap: wrap; /* 允许按钮换行 */
 }
 
 .toolbar button {
@@ -331,4 +333,64 @@ canvas {
 }
 .panel.steps {
   grid-column: 1 / -1; /* 底部跨所有列，横向放在画布与控制区域下方 */
+}
+
+/* 移动端自适应适配 */
+@media (max-width: 768px) {
+  #root {
+    padding: 1rem;
+    overflow-x: hidden; /* 防止水平滚动 */
+  }
+
+  .app {
+    display: flex;
+    flex-direction: column;
+    grid-template-columns: 1fr; /* 覆盖 grid 列定义 */
+    gap: 1rem;
+  }
+
+  .upload {
+    flex-direction: column;
+    align-items: stretch;
+  }
+  
+  .upload h2 {
+    text-align: center;
+    margin-bottom: 0.5rem;
+  }
+
+  .canvas-wrap {
+    height: 50vh; /* 移动端减小画布高度 */
+    min-height: 300px;
+  }
+
+  .panel {
+    width: 100%;
+    box-sizing: border-box; /* 确保 padding 不会撑大宽度 */
+  }
+
+  .controls {
+    order: 2; /* 确保控制面板在画布下方 */
+  }
+
+  /* 调整按钮大小以适应触摸 */
+  button, .panel button, .controls button {
+    padding: 0.75rem 1rem; 
+    min-height: 44px; /* 最小触摸区域 */
+  }
+  
+  .palette {
+    grid-template-columns: repeat(6, 1fr); /* 减少一行显示的颜色数 */
+  }
+
+  /* 工具栏按钮自适应 */
+  .toolbar {
+    justify-content: flex-start;
+  }
+  
+  /* 强制步数上限输入框容器换行或优化布局 */
+  .toolbar > span {
+    margin-left: 0 !important; /* 移除左边距，在换行时更好看 */
+    margin-top: 0.25rem;
+  }
 }

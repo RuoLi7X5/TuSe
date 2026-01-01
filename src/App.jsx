@@ -196,6 +196,36 @@ const [triangleSize, setTriangleSize] = useState(30)
 
   useEffect(() => { scaleRef.current = canvasScale }, [canvasScale])
   
+  const touchRef = useRef({ lastDist: 0, startScale: 1, isPinching: false })
+  const handleTouchStart = useCallback((e) => {
+    if (e.touches.length === 2) {
+      const t1 = e.touches[0]
+      const t2 = e.touches[1]
+      const dist = Math.hypot(t2.clientX - t1.clientX, t2.clientY - t1.clientY)
+      touchRef.current.lastDist = dist
+      touchRef.current.startScale = scaleRef.current
+      touchRef.current.isPinching = true
+    }
+  }, [])
+
+  const handleTouchMove = useCallback((e) => {
+    if (e.touches.length === 2 && touchRef.current.isPinching) {
+      e.preventDefault() // 阻止浏览器缩放
+      const t1 = e.touches[0]
+      const t2 = e.touches[1]
+      const dist = Math.hypot(t2.clientX - t1.clientX, t2.clientY - t1.clientY)
+      const scale = touchRef.current.startScale * (dist / touchRef.current.lastDist)
+      const clamped = Math.min(5, Math.max(0.1, scale))
+      setCanvasScale(clamped)
+    }
+  }, [])
+
+  const handleTouchEnd = useCallback((e) => {
+    if (e.touches.length < 2) {
+      touchRef.current.isPinching = false
+    }
+  }, [])
+
   // 监听缩放变化，应用锚定滚动位置
   useEffect(() => {
     if (pendingScrollRef.current && canvasWrapRef.current) {
@@ -2524,7 +2554,13 @@ const contribRef = useRef({ branch_pruned: 0, enqueued: 0, expanded: 0, critical
 
       <div className="panel">
         <h2>画布</h2>
-        <div className="canvas-wrap" ref={canvasWrapRef}>
+        <div
+          className="canvas-wrap"
+          ref={canvasWrapRef}
+          onTouchStart={handleTouchStart}
+          onTouchMove={handleTouchMove}
+          onTouchEnd={handleTouchEnd}
+        >
           {/* 
              缩放容器：
              1. 显式设置宽高，撑开父容器的滚动条

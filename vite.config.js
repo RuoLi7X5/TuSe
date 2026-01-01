@@ -5,6 +5,7 @@ import react from '@vitejs/plugin-react'
 export default defineConfig({
   plugins: [react()],
   server: {
+    host: true,
     proxy: {
       // 开发代理：前端请求 /api/deepseek 将被转发到 DeepSeek Chat Completions
       '/api/deepseek': {
