@@ -4,7 +4,11 @@
 
 export function detectGrid(imageData, config = {}) {
   const { width, height, data } = imageData
-  const { threshold = 50 } = config
+  // threshold 允许外部覆盖；未提供时走自适应阈值（对不同分辨率/对比度/压缩伪影更稳）
+  const { threshold: thresholdInput } = config
+
+  const clamp = (v, lo, hi) => Math.max(lo, Math.min(hi, v))
+  const isFiniteNum = (v) => typeof v === 'number' && Number.isFinite(v)
 
   // 1. 灰度化与 Sobel 边缘检测
   const grayData = new Uint8Array(width * height)
@@ -16,6 +20,11 @@ export function detectGrid(imageData, config = {}) {
   }
 
   const gradients = new Float32Array(width * height)
+  // 直方图（用于自适应阈值）：对 Sobel magnitude 做粗分桶即可
+  const BINS = 256
+  const hist = new Uint32Array(BINS)
+  let magMax = 0
+  let magCount = 0
   // Gx = [-1 0 1; -2 0 2; -1 0 1]
   // Gy = [-1 -2 -1; 0 0 0; 1 2 1]
   for (let y = 1; y < height - 1; y++) {
@@ -34,8 +43,43 @@ export function detectGrid(imageData, config = {}) {
       const gy = -tl - 2 * tm - tr + bl + 2 * bm + br
 
       const mag = Math.sqrt(gx * gx + gy * gy)
-      gradients[idx] = mag > threshold ? mag : 0
+      gradients[idx] = mag
+      if (mag > 0) {
+        magCount++
+        if (mag > magMax) magMax = mag
+      }
     }
+  }
+
+  // 1.5 自适应阈值：取较高分位数（默认 92%），避免噪声也避免“无边缘”
+  const autoThreshold = (() => {
+    if (!(magCount > 0) || !(magMax > 0)) return 50
+    const maxBinVal = Math.max(1, magMax)
+    for (let i = 0; i < gradients.length; i++) {
+      const m = gradients[i]
+      if (m <= 0) continue
+      const bi = clamp(Math.floor((m / maxBinVal) * (BINS - 1)), 0, BINS - 1)
+      hist[bi]++
+    }
+    const targetQ = 0.92
+    const target = Math.floor(magCount * targetQ)
+    let cum = 0
+    let bi = BINS - 1
+    for (let i = 0; i < BINS; i++) {
+      cum += hist[i]
+      if (cum >= target) { bi = i; break }
+    }
+    const thr = (bi / (BINS - 1)) * maxBinVal
+    // 给一个合理区间，避免极端图把阈值打爆
+    return clamp(thr, 18, 140)
+  })()
+
+  const threshold = isFiniteNum(thresholdInput) ? thresholdInput : autoThreshold
+
+  // 应用阈值：把 gradients 变成“阈值化后的边缘强度”（后续流程用这个即可）
+  for (let i = 0; i < gradients.length; i++) {
+    const m = gradients[i]
+    gradients[i] = (m > threshold) ? m : 0
   }
 
   // 2. 自动检测网格模式 (Horizontal vs Vertical)
@@ -311,6 +355,64 @@ export function detectGrid(imageData, config = {}) {
     anchors.push(anchorRho + bestOffset)
   }
 
+  // 6.5 anchors 一致性校正（关键）：三组 anchors 必须对应同一套网格相位。
+  // 否则会出现“首帧看起来对，重建后整体错位”的现象（相位跳了一个 spacing）。
+  const harmonizeAnchors = (mode, anchors, spacing) => {
+    if (!Array.isArray(anchors) || anchors.length !== 3 || !(spacing > 0)) return anchors
+    const a0 = anchors[0]
+    const denom = (Math.sqrt(3) / 2)
+    const kRange = 3
+    let best = anchors.slice()
+    let bestErr = Infinity
+    let bestCenterDist = Infinity
+
+    if (mode === 'horizontal') {
+      // 90°, 30°, 150°
+      for (let k1 = -kRange; k1 <= kRange; k1++) {
+        for (let k2 = -kRange; k2 <= kRange; k2++) {
+          const a1 = anchors[1] + k1 * spacing
+          const a2 = anchors[2] + k2 * spacing
+          const vx1 = (a1 - 0.5 * a0) / denom
+          const vx2 = (0.5 * a0 - a2) / denom
+          const vx = (vx1 + vx2) / 2
+          const err = Math.abs(vx1 - vx2)
+          // 约束：交点 x 不要飞出太远
+          const ok = vx > -width * 0.25 && vx < width * 1.25
+          if (!ok) continue
+          const centerDist = Math.abs(vx - width / 2)
+          if (err < bestErr - 1e-6 || (Math.abs(err - bestErr) <= 1e-6 && centerDist < bestCenterDist)) {
+            bestErr = err
+            bestCenterDist = centerDist
+            best = [a0, a1, a2]
+          }
+        }
+      }
+    } else {
+      // vertical: 0°, 60°, 120°
+      for (let k1 = -kRange; k1 <= kRange; k1++) {
+        for (let k2 = -kRange; k2 <= kRange; k2++) {
+          const a1 = anchors[1] + k1 * spacing
+          const a2 = anchors[2] + k2 * spacing
+          const vy1 = (a1 - 0.5 * a0) / denom
+          const vy2 = (a2 + 0.5 * a0) / denom
+          const vy = (vy1 + vy2) / 2
+          const err = Math.abs(vy1 - vy2)
+          const ok = vy > -height * 0.25 && vy < height * 1.25
+          if (!ok) continue
+          const centerDist = Math.abs(vy - height / 2)
+          if (err < bestErr - 1e-6 || (Math.abs(err - bestErr) <= 1e-6 && centerDist < bestCenterDist)) {
+            bestErr = err
+            bestCenterDist = centerDist
+            best = [a0, a1, a2]
+          }
+        }
+      }
+    }
+    return best
+  }
+
+  const anchorsH = harmonizeAnchors(mode, anchors, bestSpacing)
+
   // 计算每条网格线在画布内的线段（Start/End/Length）
   // 这对于网格对齐和可视化非常重要
   const getGridLineSegment = (angle, rho, w, h) => {
@@ -353,7 +455,7 @@ export function detectGrid(imageData, config = {}) {
   const finalSide = inferredSide
 
   targetAngles.forEach((angle, i) => {
-     const anchor = anchors[i]
+     const anchor = anchorsH[i]
      // Spacing calculation must be consistent with finalSide/bestSpacing decision
      // i=0 is horizontal lines (spacing = bestSpacing)
      // i=1,2 are diagonal lines
@@ -483,10 +585,29 @@ export function detectGrid(imageData, config = {}) {
     mode,
     spacing: bestSpacing, 
     side: finalSide,      
-    anchors, 
+    anchors: anchorsH,
     angles: targetAngles,
     gridLines,
     activeSegments, // 调试用：实际检测到的线段
-    bounds          // 新增：推断出的网格边界 {x, y, width, height}
+    bounds,         // 新增：推断出的网格边界 {x, y, width, height}
+    debug: {
+      thresholdUsed: threshold,
+      thresholdAuto: autoThreshold,
+      scoreH,
+      scoreV,
+      anchorConsistencyErr: (function(){
+        // 返回“对角 anchor 的交点一致性误差（像素）”，便于上层决定是否信任自动对齐
+        const denom = (Math.sqrt(3) / 2)
+        if (mode === 'horizontal') {
+          const vx1 = (anchorsH[1] - 0.5 * anchorsH[0]) / denom
+          const vx2 = (0.5 * anchorsH[0] - anchorsH[2]) / denom
+          return Math.abs(vx1 - vx2)
+        } else {
+          const vy1 = (anchorsH[1] - 0.5 * anchorsH[0]) / denom
+          const vy2 = (anchorsH[2] + 0.5 * anchorsH[0]) / denom
+          return Math.abs(vy1 - vy2)
+        }
+      })()
+    }
   }
 }

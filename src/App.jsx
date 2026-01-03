@@ -728,39 +728,22 @@ const [triangleSize, setTriangleSize] = useState(30)
   // 监听 targetColorCount 变化，实时重新识别
   useEffect(() => {
     if (imgBitmap && targetColorCount !== '') {
-      let cancelled = false
-      const tc = parseInt(targetColorCount)
-      if (!Number.isFinite(tc) || tc < 2) return
-      const timer = setTimeout(() => {
-        ;(async () => {
-          try {
-            setStatus(`正在重新识别为 ${tc} 种颜色...`)
-            const { palette } = await quantizeImage(imgBitmap, tc)
-            if (cancelled) return
-            setPalette(palette)
-            setInitialPalette(palette)
-            if (grid) {
-              const mapped = await mapImageToGrid(imgBitmap, grid, palette)
-              if (cancelled) return
-              // 若存在检测到的网格参数，额外做一次“同格子多数投票”收尾校准（减少残留错色）
-              try { if (detectedGrid && detectedGrid.success) rectifyColorsByGrid(mapped, detectedGrid) } catch {}
-              setTriangles(mapped)
-              setUndoStack([mapped.map(t => t.color)])
-              setRedoStack([])
-              setStartId(null)
-              setSelectedIds([])
-              setSteps([])
-              setStatus(`已重新生成（强制 ${palette.length} 色）`)
-            }
-          } catch (e) {
-            if (cancelled) return
-            setStatus(`强制颜色数识别失败：${String(e?.message || e).slice(0, 120)}`)
-          }
-        })()
-      }, 220)
-      return () => { cancelled = true; try { clearTimeout(timer) } catch {} }
+      const run = async () => {
+        setStatus(`正在重新识别为 ${targetColorCount} 种颜色...`)
+        const { palette } = await quantizeImage(imgBitmap, parseInt(targetColorCount))
+        setPalette(palette)
+        setInitialPalette(palette)
+        if (grid) {
+          const mapped = await mapImageToGrid(imgBitmap, grid, palette)
+          setTriangles(mapped)
+          setUndoStack([mapped.map(t => t.color)])
+          setRedoStack([])
+          setStatus(`已重新生成（强制 ${palette.length} 色）`)
+        }
+      }
+      run()
     }
-  }, [targetColorCount, imgBitmap, grid, detectedGrid])
+  }, [targetColorCount, imgBitmap])
 
   // 点击“添加颜色”始终进入色带选择；选择后由 onAddColorFromPicker 进行泼涂或加入集合
   const onStartAddColorPick = useCallback(() => {
@@ -909,22 +892,10 @@ const [triangleSize, setTriangleSize] = useState(30)
           rectifyMode: true, // 新增标志，指示这是强力纠正
           applyDenoise: false // 禁止同化逻辑，确保涂色不被“平滑”掉
       })
-      // 若我们有网格检测信息（anchors/spacing/angles），则做一次“同格子多数投票”的收尾校准
-      // 这能修复少量残留错色（通常是边界/压缩噪点导致的单点误判）
-      try {
-        if (detectedGrid && detectedGrid.success) {
-          const changed = rectifyColorsByGrid(mapped, detectedGrid)
-          if (changed) {
-            // 不打扰用户，只在状态里轻提示
-            setStatus('几何校准已完成：已根据色块边界优化网格，并修复残留错色。')
-          }
-        }
-      } catch {}
       
       setTriangles(mapped)
       setUndoStack(prev => [...prev, mapped.map(t => t.color)])
-      // 若上面的“残留错色修复”已更新 status，这里不要覆盖
-      setStatus(prev => (String(prev||'').includes('残留错色') ? prev : '几何校准已完成：已根据色块边界优化网格。'))
+      setStatus('几何校准已完成：已根据色块边界优化网格。')
       
     } catch (err) {
       console.error('Rectify Apply Error:', err)
@@ -1123,12 +1094,12 @@ const contribRef = useRef({ branch_pruned: 0, enqueued: 0, expanded: 0, critical
     const bitmap = await createImageBitmap(file, { imageOrientation: 'from-image' })
     setImgBitmap(bitmap)
     
-    // 不重置用户的“强制颜色数”：上传新图片也应尊重当前输入
+    // 重置状态，确保每次上传新图片都使用自动模式
+    setTargetColorCount('')
     setLoadedProject(false)
 
-    // 初次识别：若用户指定了强制颜色数，则直接按该数量量化
-    const tc0 = parseInt(targetColorCount)
-    const { palette } = await quantizeImage(bitmap, (Number.isFinite(tc0) && tc0 >= 2) ? tc0 : undefined)
+    // 强制使用自动颜色数量进行初次识别
+    const { palette } = await quantizeImage(bitmap)
     setPalette(palette)
     setInitialPalette(palette)
     setSelectedColor(palette[0] ?? null)
@@ -1264,13 +1235,13 @@ const contribRef = useRef({ branch_pruned: 0, enqueued: 0, expanded: 0, critical
            setGridOffsetY(autoOffsetY)
 
            // 保存精确参数，供后续 rebuild 使用（绕过 UI 的整数限制）
-           // 重要：网格必须是等边三角形，因此不保存/不使用 customH（高度只由 side 推导）
            setPreciseGridParams({
              side: detectedSide, // 原始检测值
+             height: gridSpec.spacing, // 新增：精确高度 (H)
              offsetX: autoOffsetX,
              offsetY: autoOffsetY,
              arrangement: finalArrangement,
-             bounds: gridSpec.bounds // 仅用于可视化/裁剪参考
+             bounds: gridSpec.bounds // 保存检测到的边界
            })
 
            setStatus(`已自动对齐网格 (精确边长: ${detectedSide.toFixed(2)})`)
@@ -1380,11 +1351,25 @@ const contribRef = useRef({ branch_pruned: 0, enqueued: 0, expanded: 0, critical
              offX = preciseGridParams.offsetX
              offY = preciseGridParams.offsetY
              arr = preciseGridParams.arrangement
-             // 等边网格：不使用 customH（避免三角形被拉伸成非等边）
-             customH = null
+             customH = preciseGridParams.height 
              
-             // 注意：detectedGrid.bounds 是“可见网格线段的外包矩形”，用于裁剪/可视化更合适，
-             // 不应直接覆盖周期性 offset（offset 是取模意义上的相位），否则会导致网格整体漂移。
+             // 应用检测到的边界 (Bounds)
+             // 如果 detectedGrid 中包含 bounds 信息，我们使用它来进一步校准 offX/offY
+             // 使得网格尽可能贴合边界
+             if (detectedGrid && detectedGrid.bounds) {
+                const b = detectedGrid.bounds
+                // 这里的策略是：让网格的某个原点 (0,0) 对应到 bounds 的左上角 (b.x, b.y)
+                // 但 buildTriangleGrid 的 offsetX 是相对于画布 (0,0) 的
+                // 所以我们将 offsetX 设置为 b.x, offsetY 设置为 b.y
+                // 注意：这可能会覆盖掉 detectGrid 中计算出的 anchor based offset
+                // 但理论上 anchor based offset 应该和 boundary 是自洽的
+                // 我们可以选择信任 boundary 作为“绝对位置”
+                
+                // 为了保险，我们只在自动检测刚完成时应用这个，或者如果用户没有手动拖动过
+                // 这里简单起见，直接应用
+                offX = b.x
+                offY = b.y
+             }
              
              // 保持 UI 状态一致
              if (arr !== gridArrangement) setGridArrangement(arr)
@@ -2251,23 +2236,36 @@ const contribRef = useRef({ branch_pruned: 0, enqueued: 0, expanded: 0, critical
             }, HARD_BUDGET_MS + 25000)
 
             const half = Math.max(1, Math.floor(PAR_N / 2))
-            // 严格组：按用户要求在 B 组中分出一半线程长期跑 strict（IDA*/A*）证明型搜索，其余线程继续 multiAnchor 覆盖搜索空间。
-            const strictN = (function(){
+            // 严格组：按用户要求在“每组内部”各分出一半线程长期跑 strict（IDA*/A*）证明型搜索。
+            // A 组严格线程：同 B 组严格线程一样执行 strict 搜索（禁用 multiAnchor / 内部 DFS 分工）。
+            // 其余线程继续 multiAnchor 覆盖搜索空间。
+            const strictN_A = (function(){
+              const ui = (window.SOLVER_FLAGS||{})
+              if (!ui.strictMode) return 0
+              // A 组默认：一半线程（24线程 -> A=12 -> strictA=6）
+              return Math.max(0, Math.floor(half / 2))
+            })()
+            const strictN_B = (function(){
               const ui = (window.SOLVER_FLAGS||{})
               if (!ui.strictMode) return 0
               const bCount = Math.max(0, PAR_N - half)
               const raw = Number(ui.strictParallelWorkers)
+              // 兼容旧配置：strictParallelWorkers 仍表示“B 组严格线程数”
               if (Number.isFinite(raw)) return Math.max(0, Math.min(bCount, Math.floor(raw)))
-              // 默认：B 组的一半（24线程 -> B=12 -> strict=6）
+              // 默认：B 组的一半（24线程 -> B=12 -> strictB=6）
               return Math.max(0, Math.floor(bCount / 2))
             })()
             const strictWorkerSet = (function(){
               const set = new Set()
-              // 仅从 B 组选取，且优先选 B 组“前半”：
-              // 1) 避免与 near-miss（通常在末尾 1/4 线程）重叠
-              // 2) 让严格组更稳定地长期跑
-              for (let ii = half; ii < PAR_N && set.size < strictN; ii++){
+              // A 组严格：从 A 组头部开始挑
+              for (let ii = 0; ii < half && set.size < strictN_A; ii++){
                 set.add(ii)
+              }
+              // B 组严格：从 B 组头部开始挑（避免与 near-miss（通常在末尾 1/4）重叠）
+              let pickedB = 0
+              for (let ii = half; ii < PAR_N && pickedB < strictN_B; ii++){
+                set.add(ii)
+                pickedB++
               }
               return set
             })()
@@ -2392,10 +2390,17 @@ const contribRef = useRef({ branch_pruned: 0, enqueued: 0, expanded: 0, critical
                 internalDfsLaneCount: (groupTag === 'A') ? aLaneCount : undefined,
                 internalDfsLockAnchorDepth: (groupTag === 'A') ? 3 : undefined,
               })
-              // 严格组分工：在 B 组前半的 strictN 个线程上，使用不同的 preferredStartId / IDA* vs A* / 轻微排序权重差异，减少重复工作量
-              const strictLocal = (i >= half) ? (i - half) : -1
-              const strictIdx = (strictLocal >= 0) ? strictLocal : -1
-              const strictPreferred = (bPool && bPool.length && strictIdx >= 0) ? bPool[Math.min(bPool.length-1, strictIdx % bPool.length)] : primary
+              // 严格组分工：在严格线程上，使用不同的 preferredStartId / IDA* vs A* / 轻微排序权重差异，减少重复工作量
+              // B 组严格优先从 bPool 取；A 组严格优先从 A 组起点池取。
+              const strictLocal = (i >= half) ? (i - half) : i
+              const strictIdx = Math.max(0, strictLocal)
+              const strictPreferred = (function(){
+                if (groupTag === 'B') {
+                  return (bPool && bPool.length) ? bPool[Math.min(bPool.length-1, strictIdx % bPool.length)] : primary
+                }
+                // A 组严格：优先用两跳池/或 hubs（aPoolFull）分散起点
+                return (aPoolFull && aPoolFull.length) ? aPoolFull[Math.min(aPoolFull.length-1, strictIdx % aPoolFull.length)] : primary
+              })()
               const strictHeuristicName = (pdbPayload?.key === 'pdb_6x6') ? 'layered_pdb_6x6_max' : 'dynamic_rag_max'
               const strictUseIDA = (strictIdx % 6 === 0) ? false : true // 1 条线程用 A*（补位），其余默认 IDA*
               const strictDispW = [0.45, 0.55, 0.65, 0.75, 0.85, 0.95][Math.max(0, strictIdx % 6)]
@@ -2408,6 +2413,13 @@ const contribRef = useRef({ branch_pruned: 0, enqueued: 0, expanded: 0, critical
                     heuristicName: strictHeuristicName,
                     skipSeedPhase: true,
                     multiAnchor: false,
+                    // A 组严格线程也不做内部 DFS 分工/桥接子池（与 B 组严格保持同类工作）
+                    internalSearchMode: undefined,
+                    internalDfsSplitDepth: undefined,
+                    internalDfsLane: undefined,
+                    internalDfsLaneCount: undefined,
+                    internalDfsLockAnchorDepth: undefined,
+                    internalBridgeIds: undefined,
                     internalBridgeOnly: false,
                     allowNearMissStep: false,
                     nearMissExtraSteps: 0,

@@ -529,7 +529,9 @@ function smoothBoundaries(triangles) {
 }
 
 export async function mapImageToGrid(bitmap, grid, palette, options = {}) {
-  const { aiSegmentation, aiScale, rectifyMode, applyDenoise = true } = options
+  // edgeInsetPx：把采样点夹紧到“内缩后的有效区域”，避免截图/压缩在边缘产生的脏像素影响识别。
+  // 默认 2px（用户需求），小图会自动降到 0。
+  const { aiSegmentation, aiScale, rectifyMode, applyDenoise = true, edgeInsetPx = 2 } = options
   const canvas = document.createElement('canvas')
   canvas.width = bitmap.width; canvas.height = bitmap.height
   const ctx = canvas.getContext('2d')
@@ -540,9 +542,17 @@ export async function mapImageToGrid(bitmap, grid, palette, options = {}) {
   ctx.filter = 'none' // 恢复
   const img = ctx.getImageData(0, 0, canvas.width, canvas.height)
   const data = img.data
+  const inset = (function(){
+    const m = Math.min(img.width, img.height)
+    if (!(m > 2)) return 0
+    const maxInset = Math.floor((m - 1) / 2)
+    const want = Number.isFinite(edgeInsetPx) ? Math.max(0, Math.floor(edgeInsetPx)) : 0
+    return Math.max(0, Math.min(maxInset, want))
+  })()
   const labAt = (x, y) => {
-    const ix = Math.max(0, Math.min(img.width - 1, Math.round(x)))
-    const iy = Math.max(0, Math.min(img.height - 1, Math.round(y)))
+    // 向内收敛一点点：避免边界不干净导致错色/错分割
+    const ix = Math.max(inset, Math.min(img.width - 1 - inset, Math.round(x)))
+    const iy = Math.max(inset, Math.min(img.height - 1 - inset, Math.round(y)))
     const i = (iy * img.width + ix) * 4
     const r = data[i], g = data[i + 1], b = data[i + 2]
     return rgb2lab(r, g, b)

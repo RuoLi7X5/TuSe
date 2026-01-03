@@ -215,7 +215,9 @@ a.small-btn:hover { border-color: var(--accent); }
   overflow: auto; /* 恢复滚动条 */
   display: flex; /* 使用 Flex 布局 */
   /* 不设置 align-items/justify-content，让子元素的 margin: auto 处理居中与溢出 */
-  touch-action: pan-x pan-y; /* 允许浏览器处理单指平移，JS 处理双指缩放 */
+  /* 关键：移动端默认的页面缩放/回弹会与画布缩放打架，造成“抖动/缩放后自动复位/不持续保持” */
+  touch-action: none; /* 交给 JS 完整接管：单指平移 + 双指捏合缩放 */
+  overscroll-behavior: contain; /* 避免滚动链传递导致页面跟着抖/回弹 */
 }
 
 canvas {

@@ -1,0 +1,7 @@
+*
+!.gitignore
+!package.json
+!solver_wasm.js
+!solver_wasm_bg.wasm
+!solver_wasm_bg.wasm.d.ts
+!solver_wasm.d.ts
