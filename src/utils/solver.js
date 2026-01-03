@@ -17,36 +17,39 @@ const checkUnified = (triangles, startId, path) => {
   const idToIndex = new Map(triangles.map((t, i) => [t.id, i]));
   const neighbors = triangles.map(t => t.neighbors);
   let colors = triangles.map(t => t.color);
-  
-  // Fast region grow and apply
-  const startIdx = idToIndex.get(startId);
-  if (startIdx === undefined) return false;
-  
-  for (const stepColor of path) {
-    const rc = colors[startIdx];
-    if (stepColor === rc) continue;
-    
+
+  const applyOne = (sid, stepColor) => {
+    const sIdx = idToIndex.get(sid)
+    if (sIdx === undefined) return false
+    const rc = colors[sIdx]
+    if (stepColor === rc) return true
     // Find connected component of start color
-    const q = [startIdx];
-    const visited = new Uint8Array(triangles.length);
-    visited[startIdx] = 1;
-    const regionIndices = [startIdx];
-    
-    let head = 0;
-    while(head < q.length){
-        const u = q[head++];
-        for(const nid of neighbors[u]){
-           const v = idToIndex.get(nid);
-           if(v !== undefined && !visited[v] && colors[v] === rc && !triangles[v].deleted){
-               visited[v] = 1;
-               q.push(v);
-               regionIndices.push(v);
-           }
+    const q = [sIdx]
+    const visited = new Uint8Array(triangles.length)
+    visited[sIdx] = 1
+    const regionIndices = [sIdx]
+    let head = 0
+    while (head < q.length) {
+      const u = q[head++]
+      for (const nid of neighbors[u]) {
+        const v = idToIndex.get(nid)
+        if (v !== undefined && !visited[v] && colors[v] === rc && !triangles[v].deleted) {
+          visited[v] = 1
+          q.push(v)
+          regionIndices.push(v)
         }
+      }
     }
-    
-    // Apply color
-    for(const idx of regionIndices) colors[idx] = stepColor;
+    for (const idx of regionIndices) colors[idx] = stepColor
+    return true
+  }
+
+  for (const step of path) {
+    const isObj = step && typeof step === 'object'
+    const sid = isObj ? step.startId : startId
+    const stepColor = isObj ? step.color : step
+    if (sid == null || !stepColor) return false
+    if (!applyOne(sid, stepColor)) return false
   }
   
   // 检查统一性
@@ -95,7 +98,9 @@ export function floodFillRegion(triangles, startId, targetColor) {
       if (!visited.has(nb)) { visited.add(nb); queue.push(nb) }
     }
   }
-  const newColors = triangles.map(t => region.includes(t.id) ? targetColor : t.color)
+  // region.includes 在大盘面时会退化为 O(n^2)；改用 Set 做 O(1) 判断
+  const regionSet = new Set(region)
+  const newColors = triangles.map(t => regionSet.has(t.id) ? targetColor : t.color)
   return { newColors, changedIds: region }
 }
 
@@ -117,42 +122,34 @@ export function captureCanvasPNG(triangles, width, height, startId=null, steps=n
     // Simple simulation (inefficient but works for snapshots)
     const idToIndex = new Map(triangles.map((t,i)=>[t.id,i]))
     const neighbors = triangles.map(t=>t.neighbors)
-    let region = new Set([startId])
-    // expand initial region
-    const startC = currentColors.get(startId)
-    const q=[startId]; const visited=new Set([startId])
-    while(q.length){
-      const u=q.shift(); const idx=idToIndex.get(u)
-      if(idx!=null){
-        for(const v of neighbors[idx]){
-          if(!visited.has(v)){
-            visited.add(v)
-            if(currentColors.get(v)===startC){
-              region.add(v); q.push(v)
+    const applyOne = (sid, color) => {
+      const startC = currentColors.get(sid)
+      if (!startC || startC === 'transparent') return
+      const region = new Set([sid])
+      const q=[sid]; const visited=new Set([sid])
+      while(q.length){
+        const u=q.shift(); const idx=idToIndex.get(u)
+        if(idx!=null){
+          for(const v of neighbors[idx]){
+            if(!visited.has(v)){
+              visited.add(v)
+              if(currentColors.get(v)===startC){
+                region.add(v); q.push(v)
+              }
             }
           }
         }
       }
+      for(const id of region) currentColors.set(id, color)
     }
-    
-    // apply steps
-    for(const color of steps){
-       for(const id of region) currentColors.set(id, color)
-       // expand
-       const q2=[...region]; const visited2=new Set([...region])
-       while(q2.length){
-         const u=q2.shift(); const idx=idToIndex.get(u)
-         if(idx!=null){
-           for(const v of neighbors[idx]){
-             if(!visited2.has(v)){
-                visited2.add(v)
-                if(currentColors.get(v)===color){
-                   region.add(v); q2.push(v)
-                }
-             }
-           }
-         }
-       }
+
+    // apply steps (support both legacy color array and {startId,color})
+    for(const step of steps){
+      const isObj = step && typeof step === 'object'
+      const sid = isObj ? step.startId : startId
+      const color = isObj ? step.color : step
+      if (sid==null || !color) continue
+      applyOne(sid, color)
     }
   }
 
@@ -431,9 +428,11 @@ export function attachSolverToWindow(){
       } catch { return { bridgePotential: 0, gateScore: 0 } }
     }
 
+    // lowerBound 是热路径：旧实现用 colors.join(',') 作为 key，会产生大量字符串分配。
+    // 本求解器已维护 Zobrist hash（cur.hash / nextHash），用 hashKey 作为缓存键更便宜。
     const lbCache = new Map()
-    function lowerBound(colors){
-      const key = colors.join(',')
+    function lowerBoundByHashKey(hashKey, colors){
+      const key = (hashKey != null) ? String(hashKey) : colors.join(',')
       const cached = lbCache.get(key)
       if (cached!=null) return cached
       const s = new Set()
@@ -511,7 +510,8 @@ export function attachSolverToWindow(){
       const curColors = cur.colors
       if (cur.steps.length >= (Number.isFinite(stepLimit) ? stepLimit : Infinity)) continue
       if (ENABLE_LB && Number.isFinite(stepLimit)){
-        const lb = USE_STRICT_LB_BF ? lowerBoundStrictLocal(curColors, cur.region) : lowerBound(curColors)
+        const curKey = (cur.hash != null) ? cur.hash.toString() : null
+        const lb = USE_STRICT_LB_BF ? lowerBoundStrictLocal(curColors, cur.region) : lowerBoundByHashKey(curKey, curColors)
         if (cur.steps.length + lb > stepLimit) continue
       }
       
@@ -565,9 +565,10 @@ export function attachSolverToWindow(){
         })
       }
       
+      // 注意：这里应统计“当前状态”的颜色分布（curColors），而不是 triangles[i].color（初始颜色）
       const colorCount = new Map()
       for(let i=0; i<nTris; i++){
-         const t=triangles[i]; const c=t.color
+         const t=triangles[i]; const c=curColors[i]
          if(!t.deleted && c && c!=='transparent') colorCount.set(c, (colorCount.get(c)||0)+1)
       }
       
@@ -590,13 +591,20 @@ export function attachSolverToWindow(){
       }).sort((a,b)=> b.score0 - a.score0).slice(0, preK)
       
       // Enlarge & Saddle Potential (Simplified for BitSet)
-      const regionBoundaryNeighbors = [] // indices
-      regionForEach(regionBS, idx => {
-         const nbs = neighborIndices[idx]
-         for(const nidx of nbs){
-            if(curColors[nidx] !== regionColor) regionBoundaryNeighbors.push(nidx)
-         }
-      })
+      // 旧实现会把同一个边界邻居重复 push 多次，后续 seeds 扫描/连通分量计算会被放大。
+      // 若已有增量边界（cur.boundaryNeighbors），优先复用；否则去重构建。
+      const regionBoundaryNeighbors = (ENABLE_INCREMENTAL && Array.isArray(cur.boundaryNeighbors))
+        ? cur.boundaryNeighbors
+        : (function(){
+          const set = new Set()
+          regionForEach(regionBS, idx => {
+            const nbs = neighborIndices[idx]
+            for(const nidx of nbs){
+              if(curColors[nidx] !== regionColor) set.add(nidx)
+            }
+          })
+          return Array.from(set)
+        })()
       
       const enlargePotential = new Map()
       for(const {c} of prelim){
@@ -654,7 +662,11 @@ export function attachSolverToWindow(){
 
       const baseLimitTry = Math.max(6, Math.min(10, 6 + Math.floor((adjColors.size||0)/3) + (boundaryBefore>6?2:0)))
       let limitTry = ENABLE_BEAM ? Math.min(dynamicWidth, baseLimitTry) : baseLimitTry
-      const prevLB = ENABLE_LB ? (USE_STRICT_LB_BF ? lowerBoundStrictLocal(curColors, regionBS) : lowerBound(curColors)) : 0
+      const prevLB = ENABLE_LB
+        ? (USE_STRICT_LB_BF
+            ? lowerBoundStrictLocal(curColors, regionBS)
+            : lowerBoundByHashKey((cur.hash != null) ? cur.hash.toString() : null, curColors))
+        : 0
       const BF_W = Number.isFinite(G?.SOLVER_FLAGS?.bifrontWeight) ? G.SOLVER_FLAGS.bifrontWeight : 2.0
       
       const scored = prelim.map(({c, gain})=>{
@@ -746,7 +758,11 @@ export function attachSolverToWindow(){
          }
          
          let baseScore = (gain.get(color)||0)*3
-         const childLB = ENABLE_LB ? (USE_STRICT_LB_BF ? lowerBoundStrictLocal(nextColors, newRegion) : lowerBound(nextColors)) : 0
+         const childLB = ENABLE_LB
+           ? (USE_STRICT_LB_BF
+              ? lowerBoundStrictLocal(nextColors, newRegion)
+              : lowerBoundByHashKey(key, nextColors))
+           : 0
          if (ENABLE_LB && (prevLB - childLB) < LB_IMPROVE_MIN) continue
          
          const fNext = gNext + childLB
@@ -1438,7 +1454,7 @@ export function attachSolverToWindow(){
                     solved = true;
                     cleanup();
                     if(onProgress) onProgress({ phase:'parallel_solved', source, minSteps: res.minSteps, elapsedMs: Date.now() - startTime });
-                    saveCachedSolution(problemHash, { startId: res.bestStartId, paths: res.paths, minSteps: res.minSteps });
+                    // 缓存由上层（App/solutionCache）负责；solver 内部不要写缓存，避免 problemHash 未定义导致崩溃、以及重复写入。
                     resolve({ bestStartId: res.bestStartId, paths: res.paths, minSteps: res.minSteps, timedOut: false });
                  }
               };
@@ -1875,8 +1891,7 @@ export function attachSolverToWindow(){
 
     if(best.minSteps===Infinity) return { bestStartId: null, paths: [], minSteps: 0, timedOut }
     
-    // Save to Cache
-    saveCachedSolution(problemHash, { startId: best.startId, paths: best.paths, minSteps: best.minSteps })
+    // 缓存由上层（App/solutionCache）负责；solver 内部不要写缓存，避免重复写入/不一致。
 
     return { bestStartId: best.startId, paths: best.paths, minSteps: best.minSteps, timedOut }
   }

@@ -10,7 +10,7 @@ export default function PerformanceTuner({ onClose }) {
     // 基本搜索策略（更偏向“尽快拿到可行解”）
     enableLB: true,
     enableLookahead: true,
-    enableLookaheadDepth2: false,
+    enableLookaheadDepth2: true,
     enableIncremental: true,
     enableBeam: true,
     beamWidth: 32,
@@ -27,19 +27,22 @@ export default function PerformanceTuner({ onClose }) {
     useDFSFirst: true,
     returnFirstFeasible: true,
     // 严格模式（A* 最短路）
-    strictMode: false,
-    useIDAStar: false,
+    // 说明：并行求解时，App 会把严格模式默认分配给少量线程长期跑（1-2个），而不是让全部线程进入 strict IDA*
+    strictMode: true,
+    useIDAStar: true,
     enableTTMinFReuse: true,
     // 学习驱动优先级（UCB Bandit）与 SAT 宏规划
     enableLearningPrioritizer: true,
-    enableSATPlanner: false,
+    enableSATPlanner: true,
     // 严格下界增强启发式（插件）：none / pdb6x6_max 等
-    heuristicName: 'none',
+    heuristicName: 'pdb6x6_max',
     logPerf: true,
     // 进度与时间预算
     workerTimeBudgetMs: 300000,
-    // 并行 worker 数量（自动并行最短路）
-    parallelWorkers: 3,
+    // 并行线程（自动求解并行 Worker 数量；会按 4 个一组分策略）
+    parallelWorkers: 24,
+    // 超核（允许并行线程数超过 CPU 逻辑核心数；可能更快，也可能更卡）
+    parallelOvercommit: true,
     // 预处理（components）阶段时间预算
     preprocessTimeBudgetMs: 20000,
     progressComponentsIntervalMs: 0,
@@ -68,7 +71,7 @@ export default function PerformanceTuner({ onClose }) {
     dispersionThreshold: 0.2,
     bridgeEdgeDensityThreshold: 0.4,
     // 分块与宏规划（试验性）
-    enableRAGMacro: false,
+    enableRAGMacro: true,
     // 质量上报采样
     qualitySampleRate: 0.15,
     gainDropWarnRatio: 0.01,
@@ -84,6 +87,35 @@ export default function PerformanceTuner({ onClose }) {
     // 后端与遥测（发布相关）：保持与 App.jsx 默认一致（生产同域 / 开发 localhost:3001）
     enableTelemetry: true,
     serverBaseUrl: '',
+
+    // 多锚点桥接（每一步允许切换起点/区域，优先桥接联通）
+    multiAnchor: true,
+    // 多锚点：束宽 / 锚点数 / 每锚尝试颜色数
+    multiAnchorBeamWidth: 24,
+    multiAnchorAnchors: 10,
+    multiAnchorColorsPerAnchor: 5,
+    // 多锚点评分权重（越大越偏向该因素）
+    // 默认更偏“桥接主导”（避免退化为一层层扩张）
+    multiAnchorConnectW: 12.0, // 桥接连通片数
+    multiAnchorCutW: 6.0,      // 边界收缩
+    multiAnchorDeltaW: 0.7,    // 扩张增益
+    multiAnchorDispW: 0.2,     // 分散度（优先处理更散的颜色）
+    // 主色合并倾向（用于“先两步连通两大块”的题型）
+    multiAnchorDomW: 5.0,
+    // 边界复杂度惩罚（边界颜色种类越多越不利）
+    multiAnchorBdVarW: 1.2,
+    // 解锁口袋（一步前瞻）：奖励“这一步之后下一步会出现更强桥接机会”的动作
+    multiAnchorUnlockW: 1.4,
+    // 解锁深：最多前瞻多少步（建议 1；2 会更慢）
+    multiAnchorUnlockDepth: 1,
+    // 解锁锚：前瞻时评估的锚点数
+    multiAnchorUnlockAnchors: 4,
+    // 解锁色：前瞻时每个锚点尝试的颜色数
+    multiAnchorUnlockColors: 3,
+    // 锚点权：让“高桥接价值色块”更容易被选为起点
+    multiAnchorAnchorW: 1.0,
+    // 成本权：越小越桥接优先（越不怕多走一步去桥接）；越大越偏收束下界
+    multiAnchorCostW: 2.2,
   }), [])
 
   // 初始化：若本地已保存，则合并；否则使用现有 window.SOLVER_FLAGS 与默认值
@@ -190,13 +222,13 @@ export default function PerformanceTuner({ onClose }) {
     </select>
   )
 
-  const BoolInput = ({ value, onChange }) => (
-    <label style={{ display:'inline-flex', alignItems:'center', gap:'.5rem', cursor:'pointer' }}>
-      <input type="checkbox" checked={!!value} onChange={e=>onChange(e.target.checked)} />
+  const BoolInput = ({ value, onChange, disabled=false }) => (
+    <label style={{ display:'inline-flex', alignItems:'center', gap:'.5rem', cursor: disabled ? 'not-allowed' : 'pointer', opacity: disabled ? 0.55 : 1 }}>
+      <input type="checkbox" checked={!!value} disabled={disabled} onChange={e=>onChange(e.target.checked)} />
       <span style={{ color:'#cbd3e1' }}>{value? '开启' : '关闭'}</span>
     </label>
   )
-  const NumInput = ({ value, onChange, step=1, min, max }) => {
+  const NumInput = ({ value, onChange, step=1, min, max, disabled=false }) => {
     const [draft, setDraft] = useState(() => String(value ?? ''))
     useEffect(() => { setDraft(String(value ?? '')) }, [value])
     const commit = () => {
@@ -208,9 +240,9 @@ export default function PerformanceTuner({ onClose }) {
       if (e.key === 'Enter') { e.preventDefault(); commit() }
     }
     return (
-      <input type="number" value={draft} step={step} min={min} max={max}
+      <input type="number" value={draft} step={step} min={min} max={max} disabled={disabled}
         onChange={e=>setDraft(e.target.value)} onBlur={commit} onKeyDown={onKeyDown}
-        style={{ width:'100%', padding:'6px', borderRadius:'6px', border:'1px solid var(--border)', background:'#1a1f2b', color:'var(--text)' }} />
+        style={{ width:'100%', padding:'6px', borderRadius:'6px', border:'1px solid var(--border)', background: disabled ? '#121826' : '#1a1f2b', color:'var(--text)', opacity: disabled ? 0.6 : 1 }} />
     )
   }
 
@@ -420,7 +452,7 @@ export default function PerformanceTuner({ onClose }) {
             <BoolInput value={flags.enableBeam} onChange={v=>setFlag('enableBeam', v)} />
           </Field>
           <Field label="束宽（Beam Width）" tooltip="效果：控制每层保留的分支数量，越大越保守、越小越激进。\n建议：<300 三角形用 8~16，300~800 用 16~24，>800 用 24~40。\n提示：若发现错过好方案，可适当增大；若速度仍慢，可减小。">
-            <NumInput value={flags.beamWidth} onChange={v=>setFlag('beamWidth', v)} min={1} step={1} />
+            <NumInput value={flags.beamWidth} onChange={v=>setFlag('beamWidth', v)} min={1} step={1} disabled={!flags.enableBeam} />
           </Field>
           <Field label="束宽衰减系数（Beam Decay）" tooltip="效果：随搜索深度按系数衰减束宽（0~1），更深层更窄以控复杂度。\n建议：0.80~0.92。越小越激进，越大越保守。">
             <NumInput value={flags.beamDecay} onChange={v=>setFlag('beamDecay', v)} step={0.01} min={0} max={1} />
@@ -539,8 +571,11 @@ export default function PerformanceTuner({ onClose }) {
 提示：值越小越早看到阶段切换和搜索节点进度。">
             <NumInput value={flags.workerTimeBudgetMs} onChange={v=>setFlag('workerTimeBudgetMs', v)} step={1000} min={1000} />
           </Field>
-          <Field label="并行 worker 数量" tooltip="效果：自动并行最短路时并发 worker 数量（每个起点一个）。\n建议：2~4；机器性能高或图较大可适当增大。">
-            <NumInput value={flags.parallelWorkers} onChange={v=>setFlag('parallelWorkers', v)} step={1} min={1} />
+          <Field label="并行线程" tooltip="效果：自动求解并行 Worker 数量（会按 4 个一组分策略并行）。\n建议：8 起；复杂图可 12/16；最高 24。\n说明：默认会按 CPU 核心数做保护上限；可用“超核”强制放开（可能更卡）。">
+            <NumInput value={flags.parallelWorkers} onChange={v=>setFlag('parallelWorkers', v)} step={1} min={1} max={24} />
+          </Field>
+          <Field label="超核" tooltip="效果：允许并行线程数超过 CPU 逻辑核心数。\n风险：可能导致浏览器卡顿/风扇转、甚至更慢（上下文切换开销）。\n建议：先关闭；若你机器强且图很难，可开启试试。">
+            <BoolInput value={flags.parallelOvercommit} onChange={v=>setFlag('parallelOvercommit', v)} />
           </Field>
           <Field label="预处理阶段时间预算（ms）" tooltip="效果：控制连通分量识别（components 阶段）的最长耗时，超过该时间会提前结束预处理并进入搜索。
 默认：300,000（5 分钟）。可根据图大小与性能调节。">
@@ -556,6 +591,60 @@ export default function PerformanceTuner({ onClose }) {
           </Field>
           <Field label="A* 进度节流（ms）" tooltip="效果：控制严格 A* 阶段进度打点的最小间隔（毫秒）。\n建议：60~120。设为 0 可更频繁上报，用于密集调试。">
             <NumInput value={flags.progressAStarIntervalMs} onChange={v=>setFlag('progressAStarIntervalMs', v)} step={20} min={0} />
+          </Field>
+        </Section>
+
+        <Section title="多锚点桥接（推荐：散乱/断裂图）">
+          <div style={{ gridColumn:'1 / -1', fontSize:'12px', color:'#93a0b7', marginTop:'-2px' }}>
+            提示：多锚点开启后，会在 A 组/强多锚组优先生效；下方“评分权重/稀有过滤”等更偏经典固定起点策略，主要影响激进组与兜底阶段。
+          </div>
+          <Field label="多锚点" tooltip="效果：每一步允许切换起点（startId），动态挑选桥接价值高的区域进行泼涂；更适合颜色块分散、需要先联通再扩张的题。">
+            <BoolInput value={flags.multiAnchor} onChange={v=>setFlag('multiAnchor', v)} />
+          </Field>
+          <Field label="束宽" tooltip="效果：保留的候选状态数量。越大越保守（覆盖更广）但更耗时。\n建议：16~48。">
+            <NumInput value={flags.multiAnchorBeamWidth} onChange={v=>setFlag('multiAnchorBeamWidth', v)} step={1} min={2} max={256} disabled={!flags.multiAnchor} />
+          </Field>
+          <Field label="锚点数" tooltip="效果：每一步从多少个“桥接价值高”的起点候选中尝试。\n建议：8~16。">
+            <NumInput value={flags.multiAnchorAnchors} onChange={v=>setFlag('multiAnchorAnchors', v)} step={1} min={2} max={64} disabled={!flags.multiAnchor} />
+          </Field>
+          <Field label="每锚颜色" tooltip="效果：每个锚点尝试的候选颜色数量（只看边界相邻色优先）。\n建议：3~8。">
+            <NumInput value={flags.multiAnchorColorsPerAnchor} onChange={v=>setFlag('multiAnchorColorsPerAnchor', v)} step={1} min={2} max={32} disabled={!flags.multiAnchor} />
+          </Field>
+          <Field label="连通权" tooltip="越大越偏向“桥接连通”（把同色大块连起来）。">
+            <NumInput value={flags.multiAnchorConnectW} onChange={v=>setFlag('multiAnchorConnectW', v)} step={0.1} min={0} max={20} disabled={!flags.multiAnchor} />
+          </Field>
+          <Field label="边界权" tooltip="越大越偏向减少边界复杂度（更快收束）。">
+            <NumInput value={flags.multiAnchorCutW} onChange={v=>setFlag('multiAnchorCutW', v)} step={0.1} min={0} max={20} disabled={!flags.multiAnchor} />
+          </Field>
+          <Field label="扩张权" tooltip="越大越偏向纯扩张（区域变大）。">
+            <NumInput value={flags.multiAnchorDeltaW} onChange={v=>setFlag('multiAnchorDeltaW', v)} step={0.1} min={0} max={10} disabled={!flags.multiAnchor} />
+          </Field>
+          <Field label="分散权" tooltip="越大越偏向优先处理更“散乱”的颜色（分量多）。">
+            <NumInput value={flags.multiAnchorDispW} onChange={v=>setFlag('multiAnchorDispW', v)} step={0.1} min={0} max={10} disabled={!flags.multiAnchor} />
+          </Field>
+          <Field label="主色权" tooltip="越大越偏向“先连通主色大块”的两步桥接思路（例如两条黑色先连起来）。">
+            <NumInput value={flags.multiAnchorDomW} onChange={v=>setFlag('multiAnchorDomW', v)} step={0.1} min={0} max={10} disabled={!flags.multiAnchor} />
+          </Field>
+          <Field label="边界惩罚" tooltip="边界颜色种类越多越不利；该值越大惩罚越强（更偏向走简洁边界）。">
+            <NumInput value={flags.multiAnchorBdVarW} onChange={v=>setFlag('multiAnchorBdVarW', v)} step={0.1} min={0} max={10} disabled={!flags.multiAnchor} />
+          </Field>
+          <Field label="解锁权" tooltip="效果：加入一步前瞻，奖励“当前选择会解锁下一步更强桥接/联通机会”的动作（对应顺序关键：先橙后蓝）。\n建议：0.6~2.5；过大会过度前瞻变慢。">
+            <NumInput value={flags.multiAnchorUnlockW} onChange={v=>setFlag('multiAnchorUnlockW', v)} step={0.1} min={0} max={10} disabled={!flags.multiAnchor} />
+          </Field>
+          <Field label="解锁深" tooltip="效果：前瞻步数（1=只看下一步；2=看两步，明显更慢）。\n建议：1。">
+            <NumInput value={flags.multiAnchorUnlockDepth} onChange={v=>setFlag('multiAnchorUnlockDepth', v)} step={1} min={0} max={2} disabled={!flags.multiAnchor || !(flags.multiAnchorUnlockW>0)} />
+          </Field>
+          <Field label="解锁锚" tooltip="效果：前瞻时评估的锚点数。\n建议：3~6。">
+            <NumInput value={flags.multiAnchorUnlockAnchors} onChange={v=>setFlag('multiAnchorUnlockAnchors', v)} step={1} min={1} max={16} disabled={!flags.multiAnchor || !(flags.multiAnchorUnlockW>0) || !(flags.multiAnchorUnlockDepth>0)} />
+          </Field>
+          <Field label="解锁色" tooltip="效果：前瞻时每个锚点尝试的颜色数。\n建议：2~5。">
+            <NumInput value={flags.multiAnchorUnlockColors} onChange={v=>setFlag('multiAnchorUnlockColors', v)} step={1} min={1} max={12} disabled={!flags.multiAnchor || !(flags.multiAnchorUnlockW>0) || !(flags.multiAnchorUnlockDepth>0)} />
+          </Field>
+          <Field label="锚点权" tooltip="效果：把“锚点色块本身的桥接价值”直接计入每步评分，避免从角落低价值块开局。\n建议：0.5~2.0。">
+            <NumInput value={flags.multiAnchorAnchorW} onChange={v=>setFlag('multiAnchorAnchorW', v)} step={0.1} min={0} max={5} disabled={!flags.multiAnchor} />
+          </Field>
+          <Field label="成本权" tooltip="效果：对 (已走步数 + 颜色下界) 的惩罚系数。\n值越小越愿意“先多走一步去桥接”；值越大越偏尽快收束。\n建议：1.6~2.6。">
+            <NumInput value={flags.multiAnchorCostW} onChange={v=>setFlag('multiAnchorCostW', v)} step={0.1} min={0.5} max={6} disabled={!flags.multiAnchor} />
           </Field>
         </Section>
 

@@ -1,5 +1,6 @@
 import { buildRAG, colorFrequency } from './grid-utils'
 import { getHeuristic } from './heuristics'
+import { loadPDBObject } from './pdb'
 import { mctsSolve } from './mcts'
 import { localRepair } from './local-repair'
 import { satMacroColorPlan } from './sat'
@@ -761,10 +762,23 @@ async function Solver_minSteps(triangles, startId, palette, maxBranches=3, onPro
         }
         const tryColors = orderColors(colors, regionSet)
         for(const color of tryColors){
+          // 禁止短周期振荡：A -> B -> A（极容易出现“黄↔橙”空转）
+          if (steps.length >= 2 && color === steps[steps.length - 2]) continue
           const nextColors = colors.slice(); for(const id of regionSet) nextColors[idToIndex.get(id)] = color
           const key = keyFromColors(nextColors); if(seen.has(key)) continue; seen.add(key)
           const q=[...regionSet]; const newRegion=new Set([...regionSet]); const visited2 = new Uint8Array(triangles.length); for(const id of regionSet){ const ii=idToIndex.get(id); if(ii!=null) visited2[ii]=1 }
           while(q.length){ const tid=q.shift(); const idx=idToIndex.get(tid); for(const nb of neighbors[idx]){ const nidx=idToIndex.get(nb); const tri=triangles[nidx]; if(!visited2[nidx] && !tri.deleted && tri.color!=='transparent' && nextColors[nidx]===color){ visited2[nidx]=1; newRegion.add(nb); q.push(nb) } } }
+          // 关键剪枝：禁止“零扩张/几乎不扩张”的步（否则会浪费步数做无意义换色）
+          const delta = newRegion.size - regionSet.size
+          if (delta <= 0) {
+            try { onProgress?.({ phase:'branch_pruned', reason:'zero_expand_dfs', step: steps.length + 1, color, delta, regionSize: regionSet.size }) } catch {}
+            continue
+          }
+          const deltaRatio = delta / Math.max(1, regionSet.size)
+          if (Number.isFinite(MIN_DELTA_RATIO) && deltaRatio < MIN_DELTA_RATIO) {
+            try { onProgress?.({ phase:'branch_pruned', reason:'delta_small_dfs', step: steps.length + 1, color, delta, deltaRatio, regionSize: regionSet.size }) } catch {}
+            continue
+          }
           dfsNodes++
           if(onProgress && PROGRESS_DFS_INTERVAL_MS>0){
             const now = Date.now()
@@ -1251,7 +1265,15 @@ async function Solver_minStepsAuto(triangles, palette, maxBranches=3, onProgress
   // 用户指定步数上限时，必须严格满足；默认不允许自动放宽（否则会产生“上限5却返回6步”的不合格解）
   const ALLOW_STEP_LIMIT_RELAX = (FLAGS?.allowStepLimitRelax === true)
   const requiredStepLimit = stepLimit
-  let stepLimitLocal = stepLimit
+  // 允许“超一步”用于更容易先找到一个解，再尝试优化压回步数上限（但绝不作为合格解直接返回）
+  // 默认关闭：仅由前端分配的 1/4 “近似组”线程开启
+  const ALLOW_NEAR_MISS = (FLAGS?.allowNearMissStep === true)
+  const NEAR_MISS_EXTRA = Number.isFinite(FLAGS?.nearMissExtraSteps) ? Math.max(0, Math.min(2, FLAGS.nearMissExtraSteps)) : 1
+  const acceptStepLimit = requiredStepLimit
+  const exploreStepLimit = (Number.isFinite(requiredStepLimit) && ALLOW_NEAR_MISS) ? (requiredStepLimit + NEAR_MISS_EXTRA) : requiredStepLimit
+  let stepLimitLocal = exploreStepLimit
+  let bestNearMiss = null // 优先：len = acceptStepLimit+1
+  let bestNearMiss2 = null // 备选：len = acceptStepLimit+2（尽量压回 +1）
   // 动态束�?阈值调度参�?
   const SCHED_INTERVAL_MS = Number.isFinite(FLAGS?.dynamicScheduleIntervalMs) ? Math.max(500, FLAGS.dynamicScheduleIntervalMs) : 2500
   const ADJUST_ON_NO_PROGRESS = (FLAGS?.dynamicBeamAdjustOnNoBestUpdate !== false)
@@ -1502,26 +1524,40 @@ async function Solver_minStepsAuto(triangles, palette, maxBranches=3, onProgress
   let retry = 0
 
   // Phase A: 快速种子阶段（MCTS / SAT 宏规划）——目标：尽快拿到任何“统一颜色”的合格解
+  // 注：严格线程可以通过 flags.skipSeedPhase 跳过该阶段，把预算全部留给严格证明搜索。
   try {
-    const remaining0 = TIME_BUDGET_MS - (Date.now() - startTime)
-    const seedBudget = Math.max(0, Math.min(25000, Math.floor(remaining0 * 0.25)))
-    if (seedBudget >= 3000) {
-      const seedStartTs = Date.now()
-      const TOP_COMPS = Math.min(4, components.length)
-      for (let ci=0; ci<TOP_COMPS; ci++){
-        if (Date.now() - seedStartTs > seedBudget) break
-        const comp = components[ci]
-        const candList = (comp?.startCandidates || [comp?.startId]).slice(0, 2)
-        for (const sid of candList){
-          if (sid==null) continue
+    if (FLAGS?.skipSeedPhase) {
+      try { onProgress?.({ phase:'seed_skipped', reason:'skipSeedPhase', elapsedMs: Date.now() - startTime }) } catch {}
+    } else {
+      const remaining0 = TIME_BUDGET_MS - (Date.now() - startTime)
+      const seedBudget = Math.max(0, Math.min(25000, Math.floor(remaining0 * 0.25)))
+      if (seedBudget >= 3000) {
+        const seedStartTs = Date.now()
+        const TOP_COMPS = Math.min(4, components.length)
+        for (let ci=0; ci<TOP_COMPS; ci++){
           if (Date.now() - seedStartTs > seedBudget) break
-          try { onProgress?.({ phase:'seed_start', algo:'mcts/sat', startId: sid, elapsedMs: Date.now() - startTime }) } catch {}
+          const comp = components[ci]
+          const candList = (comp?.startCandidates || [comp?.startId]).slice(0, 2)
+          for (const sid of candList){
+            if (sid==null) continue
+            if (Date.now() - seedStartTs > seedBudget) break
+            try { onProgress?.({ phase:'seed_start', algo:'mcts/sat', startId: sid, elapsedMs: Date.now() - startTime }) } catch {}
 
           // SAT 宏规划（可选）：依赖后端服务，失败则忽略
           if (FLAGS?.enableSATPlanner) {
             try {
               const plan = await satMacroColorPlan(triangles, sid, palette)
               const order = Array.isArray(plan?.order) ? plan.order.filter(Boolean) : []
+              if (!order.length) {
+                try {
+                  onProgress?.({
+                    phase: 'sat_empty',
+                    startId: sid,
+                    note: 'no_macro_order (check SAT backend /api/sat/set-cover)',
+                    elapsedMs: Date.now() - startTime
+                  })
+                } catch {}
+              }
               if (order.length) {
                 // 直接验证宏序列是否能统一（很快）
                 const baseColors = triangles.map(t=>t.color)
@@ -1546,14 +1582,30 @@ async function Solver_minStepsAuto(triangles, palette, maxBranches=3, onProgress
                   // 压缩修复（安全）
                   const repaired = await localRepair(triangles, palette, sid, path, (p)=>{ try{ onProgress?.({ ...p, phase: p?.phase || 'local_repair' }) } catch {} })
                   const finalPath = repaired?.path || path
-                  if (Number.isFinite(requiredStepLimit) && finalPath.length > requiredStepLimit) {
-                    try { onProgress?.({ phase:'seed_reject', reason:'step_limit', startId: sid, len: finalPath.length, stepLimit: requiredStepLimit }) } catch {}
+                  if (Number.isFinite(acceptStepLimit)) {
+                    if (finalPath.length <= acceptStepLimit) {
+                      return { bestStartId: sid, paths: [finalPath], minSteps: finalPath.length, timedOut: false }
+                    }
+                    if (ALLOW_NEAR_MISS && finalPath.length === acceptStepLimit + 1) {
+                      try { onProgress?.({ phase:'near_miss', source:'seed', startId: sid, len: finalPath.length, stepLimit: acceptStepLimit }) } catch {}
+                    } else if (finalPath.length > (ALLOW_NEAR_MISS ? (acceptStepLimit + 1) : acceptStepLimit)) {
+                      try { onProgress?.({ phase:'seed_reject', reason:'step_limit', startId: sid, len: finalPath.length, stepLimit: acceptStepLimit }) } catch {}
+                    }
                   } else {
-                  return { bestStartId: sid, paths: [finalPath], minSteps: finalPath.length, timedOut: false }
+                    return { bestStartId: sid, paths: [finalPath], minSteps: finalPath.length, timedOut: false }
                   }
                 }
               }
-            } catch {}
+            } catch (e) {
+              try {
+                onProgress?.({
+                  phase: 'sat_error',
+                  startId: sid,
+                  error: String(e?.message || e),
+                  elapsedMs: Date.now() - startTime
+                })
+              } catch {}
+            }
           }
 
           // MCTS rollout：时间切片
@@ -1583,19 +1635,1254 @@ async function Solver_minStepsAuto(triangles, palette, maxBranches=3, onProgress
             if (ok && first!==null) {
               const repaired = await localRepair(triangles, palette, sid, path0, (p)=>{ try{ onProgress?.({ ...p, phase: p?.phase || 'local_repair' }) } catch {} })
               const finalPath = repaired?.path || path0
-              if (Number.isFinite(requiredStepLimit) && finalPath.length > requiredStepLimit) {
-                try { onProgress?.({ phase:'seed_reject', reason:'step_limit', startId: sid, len: finalPath.length, stepLimit: requiredStepLimit }) } catch {}
+              if (Number.isFinite(acceptStepLimit)) {
+                if (finalPath.length <= acceptStepLimit) {
+                  return { bestStartId: sid, paths: [finalPath], minSteps: finalPath.length, timedOut: false }
+                }
+                if (ALLOW_NEAR_MISS && finalPath.length === acceptStepLimit + 1) {
+                  try { onProgress?.({ phase:'near_miss', source:'seed', startId: sid, len: finalPath.length, stepLimit: acceptStepLimit }) } catch {}
+                } else if (finalPath.length > (ALLOW_NEAR_MISS ? (acceptStepLimit + 1) : acceptStepLimit)) {
+                  try { onProgress?.({ phase:'seed_reject', reason:'step_limit', startId: sid, len: finalPath.length, stepLimit: acceptStepLimit }) } catch {}
+                }
               } else {
-              return { bestStartId: sid, paths: [finalPath], minSteps: finalPath.length, timedOut: false }
+                return { bestStartId: sid, paths: [finalPath], minSteps: finalPath.length, timedOut: false }
               }
             }
+          }
           }
         }
       }
     }
   } catch {}
 
+  // Phase A2: 多锚点桥接优先（multiAnchor）——每一步允许换 startId，并在每一步后重新评估桥接/扩张价值
+  // 目的：针对“颜色分量很散/需要桥接”的局面，比“固定起点逐层扩张”更有效。
+  if (FLAGS?.multiAnchor) {
+    try {
+      // 让不同 worker 的探索更“分工”，减少重复：对 anchor/palette 的 tie-break 做轻量可复现打散
+      const variantSeed = Number.isFinite(FLAGS?.workerVariant) ? (FLAGS.workerVariant|0) : 0
+      const rand = (function(){
+        let s = (variantSeed ^ 0x9e3779b9) >>> 0
+        return () => {
+          // xorshift32
+          s ^= (s << 13) >>> 0
+          s ^= (s >>> 17) >>> 0
+          s ^= (s << 5) >>> 0
+          return (s >>> 0) / 4294967296
+        }
+      })()
+      const shuffleInPlace = (arr)=>{
+        for (let i=arr.length-1;i>0;i--){
+          const j = Math.floor(rand() * (i+1))
+          const tmp = arr[i]; arr[i]=arr[j]; arr[j]=tmp
+        }
+        return arr
+      }
+      const isUniformColors = (colorsArr)=>{
+        let first = null
+        for(let i=0;i<triangles.length;i++){
+          const t = triangles[i]; const c = colorsArr[i]
+          if (t.deleted || !c || c==='transparent') continue
+          if (first===null) first = c
+          else if (c !== first) return false
+        }
+        return first!==null
+      }
+      const lowerBoundColors = (colorsArr)=>{
+        const s = new Set()
+        for(let i=0;i<triangles.length;i++){
+          const t=triangles[i]; const c=colorsArr[i]
+          if (t.deleted || !c || c==='transparent') continue
+          s.add(c)
+        }
+        return Math.max(0, s.size - 1)
+      }
+      const hashColors = (colorsArr)=>{
+        // 轻量 hash：stride 采样 + DJB2，避免 join 的巨额开销
+        let h = 5381
+        const n = colorsArr.length
+        const stride = Math.max(1, Math.floor(n / 128))
+        for(let i=0;i<n;i+=stride){
+          const c = colorsArr[i] || ''
+          // 只取前两字符减少开销（颜色为 '#rrggbb'）
+          const a = c.charCodeAt(0) || 0
+          const b = c.charCodeAt(1) || 0
+          h = ((h<<5)+h) + a; h|=0
+          h = ((h<<5)+h) + b; h|=0
+        }
+        h = ((h<<5)+h) + (lowerBoundColors(colorsArr)|0); h|=0
+        return String(h>>>0)
+      }
+      const buildRegion = (colorsArr, sid)=>{
+        const idxS = idToIndex.get(sid)
+        if (idxS==null) return null
+        const rc = colorsArr[idxS]
+        if (!rc || rc==='transparent' || triangles[idxS].deleted) return null
+        const rs = new Set()
+        const q=[sid]; const visited=new Set([sid])
+        while(q.length){
+          const id=q.shift(); const idx=idToIndex.get(id)
+          if (idx==null) continue
+          if (triangles[idx].deleted) continue
+          if (colorsArr[idx]!==rc) continue
+          rs.add(id)
+          for(const nb of neighbors[idx] || []){
+            if(!visited.has(nb)){ visited.add(nb); q.push(nb) }
+          }
+        }
+        return rs.size ? rs : null
+      }
+      const boundaryScoreDynamic = (colorsArr, sid)=>{
+        const idxS = idToIndex.get(sid)
+        if (idxS==null) return -Infinity
+        const t0 = triangles[idxS]
+        if (!t0 || t0.deleted) return -Infinity
+        const c0 = colorsArr[idxS]
+        if (!c0 || c0==='transparent') return -Infinity
+        let s = 0
+        for (const nb of (neighbors[idxS] || [])) {
+          const nidx = idToIndex.get(nb)
+          if (nidx==null) continue
+          const tn = triangles[nidx]
+          if (!tn || tn.deleted) continue
+          const cn = colorsArr[nidx]
+          if (!cn || cn==='transparent') continue
+          if (cn !== c0) s++
+        }
+        return s
+      }
+
+      // 到边缘距离（用于惩罚“角落/贴边等待被吞没”的色块作为起点）
+      let distToBorder = null
+
+      // region 级桥接价值：对“具体连通色块”打分，而不是对颜色整体打分。
+      // 目标：优先选择“接触面广/可桥接多处/不在死角”的色块作为锚点；
+      //      角落里等待被吞没的色块会因“边缘惩罚 + 接触单一”而降分。
+      const regionBridgeValue = (colorsArr, sid)=>{
+        const idxS = idToIndex.get(sid)
+        if (idxS==null) return -Infinity
+        const rc = colorsArr[idxS]
+        if (!rc || rc==='transparent' || triangles[idxS].deleted) return -Infinity
+
+        const region = buildRegion(colorsArr, sid)
+        if (!region) return -Infinity
+
+        let boundaryEdges = 0
+        const adjColors = new Set()
+        const boundaryNodes = [] // {id,c}
+        let borderish = 0
+        let distSum = 0
+        let distCnt = 0
+
+        for (const id of region) {
+          const idx = idToIndex.get(id)
+          const nbs = neighbors[idx] || []
+          if (nbs.length < 3) borderish++
+          if (distToBorder && Number.isFinite(distToBorder[idx])) { distSum += distToBorder[idx]; distCnt++ }
+          for (const nb of nbs) {
+            const j = idToIndex.get(nb)
+            if (j==null) continue
+            const t2 = triangles[j]
+            if (!t2 || t2.deleted) continue
+            const c2 = colorsArr[j]
+            if (!c2 || c2==='transparent') continue
+            if (c2 !== rc) {
+              boundaryEdges++
+              adjColors.add(c2)
+              boundaryNodes.push({ id: nb, c: c2 })
+            }
+          }
+        }
+
+        if (boundaryEdges <= 0) return -Infinity
+
+        // 近似“碎片度”：只在 boundaryNodes 子图中按颜色分组做连通片计数（轻量）
+        let fragSum = 0
+        try {
+          const byColor = new Map() // c -> Set(ids)
+          for (const bn of boundaryNodes) {
+            let set = byColor.get(bn.c)
+            if (!set) { set = new Set(); byColor.set(bn.c, set) }
+            set.add(bn.id)
+          }
+          const MAX_BN = 600
+          let processed = 0
+          for (const [c, set] of byColor.entries()) {
+            if (processed >= MAX_BN) break
+            const ids = Array.from(set)
+            processed += ids.length
+            const inSet = set
+            const seen = new Set()
+            let comps = 0
+            for (const id of ids) {
+              if (seen.has(id)) continue
+              comps++
+              const q = [id]; seen.add(id)
+              while (q.length) {
+                const u = q.shift()
+                const uidx = idToIndex.get(u)
+                for (const v of neighbors[uidx] || []) {
+                  if (!inSet.has(v) || seen.has(v)) continue
+                  seen.add(v); q.push(v)
+                }
+              }
+              if (comps >= 12) break
+            }
+            fragSum += comps
+          }
+        } catch {}
+
+        const regionSize = region.size
+        const adjD = adjColors.size
+        const compsHint = (COLOR_COMP_COUNT?.get && COLOR_COMP_COUNT.get(rc)) ? (COLOR_COMP_COUNT.get(rc)||1) : 1
+        const avgDist = distCnt > 0 ? (distSum / distCnt) : 0
+
+        // 评分策略（按你的要求）：桥接/联通扩张价值主导。
+        // - adjD：接触“多少种不同色块/颜色”（越多越像枢纽）
+        // - fragSum：边界附近越碎，越容易通过一两步桥接撬动更多区域
+        // - boundaryEdges：边界长度越强，潜在可操作面越大
+        // 面积/贴边/中心只做非常弱的 tie-break，不允许盖过桥接收益。
+        let score = (adjD * 22) + (fragSum * 6.0) + (boundaryEdges * 0.12)
+        score *= (1 + 0.12 * Math.max(0, compsHint - 1))
+
+        // 极弱的“边缘/面积”惩罚：只在桥接收益很低时才略降分
+        if (adjD <= 2 && fragSum <= 2) {
+          score -= borderish * 0.8
+          // 大块可能是背景，但不强惩罚（避免误伤“贴边但高桥接”的关键块）
+          score -= Math.pow(regionSize, 0.35) * 0.15
+          if (avgDist < 0.9) score -= 2.0
+        }
+        return score
+      }
+      // 计算“主色”（全局最重要的颜色，通常是面积最大/最值得先联通的颜色）
+      // 注意：此处使用 baseColors（初始局面）做主色判定，足够支撑“先两步连通主色”的启发式。
+      let dominantColor = null
+
+      const applyAction = (colorsArr, sid, targetColor)=>{
+        const idxS = idToIndex.get(sid)
+        if (idxS==null) return null
+        const curColor = colorsArr[idxS]
+        if (!curColor || curColor==='transparent' || triangles[idxS].deleted) return null
+        if (!targetColor || targetColor==='transparent') return null
+        if (targetColor === curColor) return { colors: colorsArr, delta: 0, newRegionSize: 0, boundaryCut: 0, touched: 0 }
+
+        const region = buildRegion(colorsArr, sid)
+        if (!region) return null
+
+        const next = colorsArr.slice()
+        for (const id of region) {
+          const ii = idToIndex.get(id); if (ii!=null) next[ii] = targetColor
+        }
+
+        // 计算“扩张后区域”（与游戏逻辑一致：涂色后会连上同色块）
+        const reg2 = buildRegion(next, sid)
+        const newRegionSize = reg2 ? reg2.size : region.size
+        const delta = Math.max(0, newRegionSize - region.size)
+
+        // boundaryCut：边界颜色种类减少（桥接/消除隔离更重要）
+        const boundaryDistinct = (colorsX, regSet)=>{
+          const set = new Set()
+          const rc = colorsX[idxS]
+          for (const id of regSet){
+            const idx = idToIndex.get(id)
+            for (const nb of neighbors[idx] || []){
+              const nidx = idToIndex.get(nb)
+              if (nidx==null) continue
+              const tn = triangles[nidx]
+              if (!tn || tn.deleted) continue
+              const c = colorsX[nidx]
+              if (!c || c==='transparent') continue
+              if (c !== rc) set.add(c)
+            }
+          }
+          return set.size
+        }
+        const bdBefore = boundaryDistinct(colorsArr, region)
+        const bdAfter = reg2 ? boundaryDistinct(next, reg2) : bdBefore
+        const boundaryCut = Math.max(0, bdBefore - bdAfter)
+
+        // 主色接触度：如果本次把区域染成某色后，其边界能同时接触更多主色边缘，下一步更容易“合并主色大块”
+        let domContact = 0
+        if (dominantColor) {
+          try {
+            const regX = reg2 || region
+            for (const id of regX){
+              const idx = idToIndex.get(id)
+              for (const nb of neighbors[idx] || []){
+                const nidx = idToIndex.get(nb)
+                if (nidx==null) continue
+                const tn = triangles[nidx]
+                if (!tn || tn.deleted) continue
+                if (next[nidx] === dominantColor) domContact++
+              }
+            }
+            // 压缩一下，避免数值过大
+            domContact = Math.min(80, domContact)
+          } catch {}
+        }
+
+        // touched：本次选择的颜色在边界接触的“不同连通片段”数量近似（桥接到多片更好）
+        let touched = 0
+        try {
+          const seeds = []
+          const regSet = region
+          const rc = colorsArr[idxS]
+          for (const id of regSet){
+            const idx = idToIndex.get(id)
+            for (const nb of neighbors[idx] || []){
+              const nidx = idToIndex.get(nb)
+              if (nidx==null) continue
+              const tn = triangles[nidx]
+              if (!tn || tn.deleted) continue
+              const cn = colorsArr[nidx]
+              if (cn === targetColor && cn !== rc) seeds.push(nb)
+            }
+          }
+          const seen = new Set()
+          for (const s of seeds){
+            if (seen.has(s)) continue
+            // BFS 在“原图颜色”为 targetColor 的连通片上计数
+            touched++
+            const q=[s]; seen.add(s)
+            while(q.length){
+              const u=q.shift(); const uidx=idToIndex.get(u)
+              for (const v of neighbors[uidx] || []){
+                const vidx=idToIndex.get(v)
+                if (vidx==null) continue
+                const tv = triangles[vidx]
+                if (!tv || tv.deleted) continue
+                if (!seen.has(v) && colorsArr[vidx]===targetColor){
+                  seen.add(v); q.push(v)
+                }
+              }
+            }
+            if (touched >= 6) break // 上限，防止太慢
+          }
+        } catch {}
+
+        return { colors: next, delta, newRegionSize, boundaryCut, touched, bdAfter, domContact }
+      }
+
+      // 把“超一步可行解”压回 acceptStepLimit：做局部搜索（swap/insert/window reorder）并尝试删一步得到 acceptStepLimit。
+      // 注意：仅在 1/4 “近似组”线程启用 ALLOW_NEAR_MISS 时触发；且带时间预算，避免拖慢主搜索。
+      const tryReduceActionsByOne = (actions)=>{
+        try {
+          if (!Number.isFinite(acceptStepLimit)) return null
+          if (!Array.isArray(actions)) return null
+          if (actions.length !== acceptStepLimit + 1) return null
+
+          const baseColors0 = triangles.map(t=>t.color)
+          const budgetMs = Number.isFinite(FLAGS?.nearMissOptimizeBudgetMs) ? Math.max(20, Math.min(400, FLAGS.nearMissOptimizeBudgetMs)) : 120
+          const t0 = Date.now()
+          const simulate = (acts)=>{
+            let cur = baseColors0.slice()
+            for (const a of acts){
+              const sid = a?.startId
+              const color = a?.color
+              if (sid==null || !color) return null
+              const r = applyAction(cur, sid, color)
+              if (!r || !r.colors) return null
+              cur = r.colors
+            }
+            return cur
+          }
+
+          const isUniformEnd = (end)=>{
+            if (!end) return false
+            let first=null
+            for(let k=0;k<triangles.length;k++){
+              const t=triangles[k]; const c=end[k]
+              if(t.deleted || !c || c==='transparent') continue
+              if(first===null) first=c
+              else if(c!==first) return false
+            }
+            return first!==null
+          }
+
+          const tryDeleteAny = (seq)=>{
+            for (let i=0;i<seq.length;i++){
+              if (Date.now() - t0 > budgetMs) return null
+              const tryPath = seq.slice(0,i).concat(seq.slice(i+1))
+              if (isUniformEnd(simulate(tryPath))) return tryPath
+            }
+            return null
+          }
+
+          // 0) 先直接删一步（最快）
+          {
+            const r = tryDeleteAny(actions)
+            if (r) return r
+          }
+
+          // 1) 生成少量“邻域序列”（仍为 8 步），对每个序列尝试删一步 -> 7
+          const variants = []
+          const pushVar = (seq)=>{
+            if (!seq) return
+            // 去重：用 startId+color 的短串
+            const key = seq.map(s=>`${s.startId}|${s.color}`).join(',')
+            if (!seenKeys.has(key)) { seenKeys.add(key); variants.push(seq) }
+          }
+          const seenKeys = new Set()
+          pushVar(actions)
+
+          // 1.1) 相邻交换（全尝试）
+          for (let i=0;i+1<actions.length;i++){
+            const s = actions.slice()
+            const tmp = s[i]; s[i]=s[i+1]; s[i+1]=tmp
+            pushVar(s)
+          }
+
+          // 1.2) 任意交换（抽样，避免爆炸）
+          {
+            const maxPairs = 18
+            let cnt = 0
+            for (let a=0;a<actions.length && cnt<maxPairs;a++){
+              for (let b=a+2;b<actions.length && cnt<maxPairs;b++){
+                // 采样：只挑部分 pair（近似随机）
+                if (((a*13 + b*7 + actions.length) % 3) !== 0) continue
+                const s = actions.slice()
+                const tmp = s[a]; s[a]=s[b]; s[b]=tmp
+                pushVar(s); cnt++
+              }
+            }
+          }
+
+          // 1.3) 插入移动（把一步挪到别处，抽样）
+          {
+            const maxMoves = 18
+            let cnt = 0
+            for (let from=0; from<actions.length && cnt<maxMoves; from++){
+              for (let to=0; to<actions.length && cnt<maxMoves; to++){
+                if (from===to) continue
+                if (((from*11 + to*5) % 4) !== 0) continue
+                const s = actions.slice()
+                const [x] = s.splice(from,1)
+                s.splice(to,0,x)
+                pushVar(s); cnt++
+              }
+            }
+          }
+
+          // 1.4) 小窗口重排（长度4）：reverse / rotate / swap-inside（覆盖“关键次序没走好”）
+          for (let i=0;i+3<actions.length;i++){
+            const w = actions.slice(i,i+4)
+            // reverse
+            pushVar(actions.slice(0,i).concat([...w].reverse(), actions.slice(i+4)))
+            // rotate left
+            pushVar(actions.slice(0,i).concat([w[1],w[2],w[3],w[0]], actions.slice(i+4)))
+            // rotate right
+            pushVar(actions.slice(0,i).concat([w[3],w[0],w[1],w[2]], actions.slice(i+4)))
+            // swap 0<->2
+            pushVar(actions.slice(0,i).concat([w[2],w[1],w[0],w[3]], actions.slice(i+4)))
+          }
+
+          // 2) 对每个 8 步变体尝试删一步得到 7 步
+          for (const v of variants){
+            if (Date.now() - t0 > budgetMs) break
+            const r = tryDeleteAny(v)
+            if (r) return r
+          }
+        } catch {}
+        return null
+      }
+
+      // 候选锚点集合：来自 top components 的候选起点 + 随机采样少量边界点
+      const baseColors = triangles.map(t=>t.color)
+      // 主色：不是“面积最大”，而是“边界接触多 + 相邻色种类多 + 分量多”的颜色
+      // 目标：更贴近“像针一样扎进去/边界接触非常多”的主推色（例如你的黑色）。
+      // 评分： (邻接色种类 * 8 + 跨边界边数 * 0.04) * (1 + 0.25*(分量数-1)) / area^0.68
+      // - 邻接色种类：更能反映“接触面广/扩张潜力大”
+      // - 分量数：更偏向需要桥接联通的颜色
+      // - area^0.68：对超大背景色做抑制，避免误选背景
+      const domMeta = { top: [] }
+      dominantColor = (function(){
+        const area = new Map()
+        const bEdges = new Map()
+        const bNei = new Map() // color -> Set(adjacent colors)
+        for(let i=0;i<triangles.length;i++){
+          const t=triangles[i]; const c=baseColors[i]
+          if (t.deleted || !c || c==='transparent') continue
+          area.set(c, (area.get(c)||0) + 1)
+        }
+        for(let i=0;i<triangles.length;i++){
+          const t=triangles[i]; const c=baseColors[i]
+          if (t.deleted || !c || c==='transparent') continue
+          const nbs = neighbors[i] || []
+          for (const nb of nbs) {
+            const j = idToIndex.get(nb)
+            if (j==null) continue
+            const t2 = triangles[j]
+            if (!t2 || t2.deleted) continue
+            const c2 = baseColors[j]
+            if (!c2 || c2==='transparent') continue
+            if (c2 === c) continue
+            bEdges.set(c, (bEdges.get(c)||0) + 1)
+            let set = bNei.get(c)
+            if (!set) { set = new Set(); bNei.set(c, set) }
+            set.add(c2)
+          }
+        }
+        let bestC = null, bestS = -Infinity
+        for (const [c, a0] of area.entries()){
+          const a = a0 || 1
+          const e = bEdges.get(c) || 0
+          const d = (bNei.get(c)?.size) || 0
+          const comps = (typeof COLOR_COMP_COUNT !== 'undefined' && COLOR_COMP_COUNT?.get) ? (COLOR_COMP_COUNT.get(c)||1) : 1
+          const s = ((d * 8) + (e * 0.04)) * (1 + 0.25 * Math.max(0, comps - 1)) / Math.pow(a, 0.68)
+          domMeta.top.push({ c, s, d, e, a, comps })
+          if (s > bestS) { bestS = s; bestC = c }
+        }
+        domMeta.top.sort((x,y)=> y.s - x.s)
+        domMeta.top = domMeta.top.slice(0, 5)
+        return bestC
+      })()
+      try {
+        onProgress?.({ phase:'multi_anchor_setup', dominantColor, domTop: domMeta.top })
+      } catch {}
+      const preferred = (typeof self !== 'undefined' && self.SOLVER_FLAGS) ? self.SOLVER_FLAGS.preferredStartId : null
+      const focusAnchorIds = (typeof self !== 'undefined' && self.SOLVER_FLAGS && Array.isArray(self.SOLVER_FLAGS.focusAnchorIds)) ? self.SOLVER_FLAGS.focusAnchorIds.filter(x=>x!=null) : null
+      const focusPrimaryAnchorId = (typeof self !== 'undefined' && self.SOLVER_FLAGS) ? (self.SOLVER_FLAGS.focusPrimaryAnchorId ?? null) : null
+      const internalBridgeIds = (typeof self !== 'undefined' && self.SOLVER_FLAGS && Array.isArray(self.SOLVER_FLAGS.internalBridgeIds)) ? self.SOLVER_FLAGS.internalBridgeIds.filter(x=>x!=null) : null
+      const internalBridgeOnly = (typeof self !== 'undefined' && self.SOLVER_FLAGS && self.SOLVER_FLAGS.internalBridgeOnly === true)
+      const internalSearchMode = (typeof self !== 'undefined' && self.SOLVER_FLAGS) ? (self.SOLVER_FLAGS.internalSearchMode || null) : null
+      const internalDfsSplitDepth = (typeof self !== 'undefined' && self.SOLVER_FLAGS && Number.isFinite(self.SOLVER_FLAGS.internalDfsSplitDepth)) ? Math.max(0, Math.floor(self.SOLVER_FLAGS.internalDfsSplitDepth)) : 2
+      const internalDfsLane = (typeof self !== 'undefined' && self.SOLVER_FLAGS && Number.isFinite(self.SOLVER_FLAGS.internalDfsLane)) ? Math.max(0, Math.floor(self.SOLVER_FLAGS.internalDfsLane)) : 0
+      const internalDfsLaneCount = (typeof self !== 'undefined' && self.SOLVER_FLAGS && Number.isFinite(self.SOLVER_FLAGS.internalDfsLaneCount)) ? Math.max(1, Math.floor(self.SOLVER_FLAGS.internalDfsLaneCount)) : 1
+      const internalDfsLockAnchorDepth = (typeof self !== 'undefined' && self.SOLVER_FLAGS && Number.isFinite(self.SOLVER_FLAGS.internalDfsLockAnchorDepth)) ? Math.max(0, Math.floor(self.SOLVER_FLAGS.internalDfsLockAnchorDepth)) : 3
+      const anchorPool = new Set()
+      // 强制聚焦：若前端下发 focusAnchorIds，则 anchorPool 以这些“高桥接色块代表点”为核心，避免落到低分角落。
+      if (internalBridgeOnly && Array.isArray(internalBridgeIds) && internalBridgeIds.length) {
+        for (const sid of internalBridgeIds) anchorPool.add(sid)
+        if (focusPrimaryAnchorId!=null) anchorPool.add(focusPrimaryAnchorId)
+        if (preferred!=null) anchorPool.add(preferred)
+      } else if (Array.isArray(focusAnchorIds) && focusAnchorIds.length) {
+        for (const sid of focusAnchorIds) anchorPool.add(sid)
+        if (focusPrimaryAnchorId!=null) anchorPool.add(focusPrimaryAnchorId)
+        if (preferred!=null) anchorPool.add(preferred)
+      } else {
+        if (preferred!=null) anchorPool.add(preferred)
+        for (const comp of components.slice(0, Math.min(8, components.length))){
+          for (const sid of (comp.startCandidates || [])) anchorPool.add(sid)
+        }
+        // 补充：从全图采样边界高的点（避免只在同一片区域打转）
+        {
+          const activeIds = []
+          for (let i=0;i<triangles.length;i++){
+            const t=triangles[i]
+            if (!t || t.deleted || !t.color || t.color==='transparent') continue
+            activeIds.push(t.id)
+          }
+          const sampleN = Math.min(900, activeIds.length)
+          for (let i=0;i<sampleN;i++){
+            const rid = activeIds[Math.floor(Math.random()*activeIds.length)]
+            if (rid!=null) anchorPool.add(rid)
+          }
+        }
+      }
+      // anchor/palette 做一次轻量打散，避免多线程重复排序结果完全一致
+      const anchorListRaw = shuffleInPlace(Array.from(anchorPool).filter(x=>x!=null))
+
+      // 预计算到边缘距离：边缘点定义为 neighbors.length<3（在三角网格中是外边界）
+      // 用于 regionBridgeValue 的中心性惩罚/奖励，避免从角落色块开局。
+      try {
+        const n = triangles.length
+        distToBorder = new Array(n).fill(Infinity)
+        const q = []
+        for (let i=0;i<n;i++){
+          const t = triangles[i]
+          const c = baseColors[i]
+          if (!t || t.deleted || !c || c==='transparent') continue
+          const deg = (neighbors[i] || []).length
+          if (deg < 3) { distToBorder[i] = 0; q.push(i) }
+        }
+        let qi = 0
+        while (qi < q.length) {
+          const u = q[qi++]
+          const du = distToBorder[u]
+          for (const nb of neighbors[u] || []) {
+            const v = idToIndex.get(nb)
+            if (v==null) continue
+            const t = triangles[v]
+            const c = baseColors[v]
+            if (!t || t.deleted || !c || c==='transparent') continue
+            if (distToBorder[v] > du + 1) {
+              distToBorder[v] = du + 1
+              q.push(v)
+            }
+          }
+        }
+      } catch { distToBorder = null }
+      // 多锚点 beam：每个状态动态挑 top anchor
+      const BEAM_W = Number.isFinite(FLAGS?.multiAnchorBeamWidth) ? Math.max(2, FLAGS.multiAnchorBeamWidth) : 24
+      const ANCHOR_K = Number.isFinite(FLAGS?.multiAnchorAnchors) ? Math.max(2, FLAGS.multiAnchorAnchors) : 10
+      const COLOR_K = Number.isFinite(FLAGS?.multiAnchorColorsPerAnchor) ? Math.max(2, FLAGS.multiAnchorColorsPerAnchor) : 5
+      const paletteLocal = Array.isArray(palette) ? shuffleInPlace([...palette]) : palette
+      // 默认更“桥接主导”：连通/边界收缩权重大于扩张，避免退化成一层层扩张。
+      const wConnect = Number.isFinite(FLAGS?.multiAnchorConnectW) ? FLAGS.multiAnchorConnectW : 12.0
+      const wCut = Number.isFinite(FLAGS?.multiAnchorCutW) ? FLAGS.multiAnchorCutW : 6.0
+      const wDelta = Number.isFinite(FLAGS?.multiAnchorDeltaW) ? FLAGS.multiAnchorDeltaW : 0.7
+      const wDisp = Number.isFinite(FLAGS?.multiAnchorDispW) ? FLAGS.multiAnchorDispW : 0.2
+      const wDom = Number.isFinite(FLAGS?.multiAnchorDomW) ? FLAGS.multiAnchorDomW : 5.0
+      const wBdVar = Number.isFinite(FLAGS?.multiAnchorBdVarW) ? FLAGS.multiAnchorBdVarW : 1.2
+      const wUnlock = Number.isFinite(FLAGS?.multiAnchorUnlockW) ? FLAGS.multiAnchorUnlockW : 1.2
+      // region 锚点价值权重：让“高桥接价值色块”天然更容易被反复选作起点
+      const wAnchor = Number.isFinite(FLAGS?.multiAnchorAnchorW) ? FLAGS.multiAnchorAnchorW : 1.0
+      // -------------------- A组内部DFS：同起点、前几步一致；到分叉点按 lane 分区深度优先到底 --------------------
+      // 触发：internalBridgeOnly + internalSearchMode==='dfs' + internalBridgeIds(单一起点)
+      // 说明：
+      // - splitDepth 前：所有 lane 走同一条“最优”前缀
+      // - splitDepth 后：每个 lane 只探索 (childIndex % laneCount)==lane 的分支，天然避免重复
+      // - 失败就回溯继续，直到时间/步数耗尽
+      if (internalBridgeOnly && internalSearchMode === 'dfs' && Array.isArray(internalBridgeIds) && internalBridgeIds.length) {
+        const primarySid = internalBridgeIds[0]
+        const deadlineDfs = startTime + TIME_BUDGET_MS
+        const splitD = internalDfsSplitDepth
+        const lane = internalDfsLane
+        const laneCount = internalDfsLaneCount
+        const lockDepth = internalDfsLockAnchorDepth
+        const stack = [{ colors: baseColors, path: [], hash: hashColors(baseColors) }]
+        const seenBest = new Map([[hashColors(baseColors), 0]])
+        let dfsNodesLocal = 0
+        while (stack.length && Date.now() < deadlineDfs) {
+          const st = stack.pop()
+          const depthNow = st.path.length
+          if (Number.isFinite(stepLimitLocal) && depthNow >= stepLimitLocal) continue
+          // 统一性检查（快速）
+          if (isUniformSimple(st.colors.map((c,i)=>({ color:c,id:i,neighbors:neighbors[i],deleted:triangles[i]?.deleted })))) {
+            try { onProgress?.({ phase:'solution', minSteps: depthNow, solutions: 1, elapsedMs: Date.now() - startTime, internalDfs: true }) } catch {}
+            return { paths: [st.path], minSteps: depthNow, timedOut: false }
+          }
+          dfsNodesLocal++
+          if (onProgress && PROGRESS_DFS_INTERVAL_MS>0 && (dfsNodesLocal % 240 === 0)) {
+            try { onProgress({ phase:'dfs', nodes: dfsNodesLocal, depth: depthNow, elapsedMs: Date.now() - startTime, maxDepth: stepLimitLocal, internalDfs: true, lane, laneCount }) } catch {}
+          }
+          // 选锚点：前 lockDepth 步固定 primarySid；后续允许动态挑 top anchor（但仍只围绕 anchorPool）
+          let anchors = [{ sid: primarySid, s: 1e9 }]
+          if (depthNow >= lockDepth) {
+            try {
+              const preK = Math.min(140, Math.max(ANCHOR_K * 10, 60))
+              const fast = anchorListRaw.map(sid=>({ sid, s: boundaryScoreDynamic(st.colors, sid) }))
+                .filter(x=>Number.isFinite(x.s) && x.s>0)
+                .sort((a,b)=>b.s-a.s)
+                .slice(0, preK)
+              anchors = fast
+                .map(x=>({ sid: x.sid, s: regionBridgeValue(st.colors, x.sid) }))
+                .filter(x=>Number.isFinite(x.s))
+                .sort((a,b)=>b.s-a.s)
+                .slice(0, ANCHOR_K)
+              if (!anchors.length) anchors = [{ sid: primarySid, s: 1 }]
+            } catch { anchors = [{ sid: primarySid, s: 1 }] }
+          }
+          // 生成下一步候选（按评分排序）
+          const children = []
+          for (const a of anchors) {
+            const sid = a.sid
+            const region = buildRegion(st.colors, sid)
+            if (!region) continue
+            const idxS = idToIndex.get(sid)
+            const rc = st.colors[idxS]
+            const adj = new Set()
+            for (const id of region){
+              const idx = idToIndex.get(id)
+              for (const nb of neighbors[idx] || []){
+                const nidx = idToIndex.get(nb)
+                if (nidx==null) continue
+                const tn = triangles[nidx]
+                if (!tn || tn.deleted) continue
+                const c = st.colors[nidx]
+                if (!c || c==='transparent') continue
+                if (c !== rc) adj.add(c)
+              }
+            }
+            const candColors = (adj.size ? Array.from(adj) : paletteLocal).filter(c=>c && c!=='transparent' && c!==rc)
+            candColors.sort((c1,c2)=> (COLOR_COMP_COUNT.get(c2)||1) - (COLOR_COMP_COUNT.get(c1)||1))
+            const pickColors = candColors.slice(0, Math.max(COLOR_K, 10))
+            for (const color of pickColors){
+              const r = applyAction(st.colors, sid, color)
+              if (!r) continue
+              const g = depthNow + 1
+              if (Number.isFinite(stepLimitLocal) && g > stepLimitLocal) continue
+              const h = hashColors(r.colors)
+              const prev = seenBest.get(h)
+              if (prev != null && prev <= g) continue
+              seenBest.set(h, g)
+              // 评分：尽量复用已有的桥接主导指标（不引入“一跳分”概念）
+              const compCount = (COLOR_COMP_COUNT.get(color)||1)
+              const bridgeScore = (r.touched||0) * wConnect + (r.boundaryCut||0) * wCut + (r.delta||0) * wDelta + compCount * wDisp + (r.domContact||0) * wDom + (a.s||0) * wAnchor
+              const bdVarPenalty = (Number.isFinite(r.bdAfter) ? r.bdAfter : 0) * wBdVar
+              const scoreChild = bridgeScore - bdVarPenalty
+              const path = [...st.path, { startId: sid, color }]
+              children.push({ colors: r.colors, path, hash: h, score: scoreChild })
+            }
+          }
+          if (!children.length) continue
+          children.sort((x,y)=> (y.score||0)-(x.score||0))
+          // splitDepth：按 lane 分区，避免不同线程重复走同一分支
+          let picked = children
+          if (depthNow >= splitD) {
+            picked = []
+            for (let bi=0; bi<children.length; bi++){
+              if ((bi % laneCount) === (lane % laneCount)) picked.push(children[bi])
+            }
+            if (!picked.length) picked = [children[lane % children.length]]
+          }
+          // DFS：反向 push，保证更高分先出栈
+          for (let k=picked.length-1; k>=0; k--) stack.push(picked[k])
+        }
+        // DFS 未找到：让后续正常策略继续（不算错误）
+      }
+      // hubs 直连奖励：前几步优先用最少步把高评分色块“打通在一起”
+      const wHub = Number.isFinite(FLAGS?.multiAnchorHubW) ? FLAGS.multiAnchorHubW : 24.0
+      const hubDepth = Number.isFinite(FLAGS?.multiAnchorHubDepth) ? Math.max(0, Math.min(3, FLAGS.multiAnchorHubDepth)) : 2
+      const wHub2 = Number.isFinite(FLAGS?.multiAnchorHub2W) ? FLAGS.multiAnchorHub2W : 14.0
+      // 成本惩罚系数：越小越偏“优先桥接”，越大越偏“尽快收束下界”
+      const wCost = Number.isFinite(FLAGS?.multiAnchorCostW) ? FLAGS.multiAnchorCostW : 2.2
+      const unlockDepth = Number.isFinite(FLAGS?.multiAnchorUnlockDepth) ? Math.max(0, Math.min(2, FLAGS.multiAnchorUnlockDepth)) : 1
+      const unlockAnchors = Number.isFinite(FLAGS?.multiAnchorUnlockAnchors) ? Math.max(1, Math.min(16, FLAGS.multiAnchorUnlockAnchors)) : 4
+      const unlockColors = Number.isFinite(FLAGS?.multiAnchorUnlockColors) ? Math.max(1, Math.min(12, FLAGS.multiAnchorUnlockColors)) : 3
+
+      // 轻量一步前瞻：估计“这一步之后下一步可获得的最大桥接分”，用于“解除包裹/解锁口袋”
+      const evalOneStepPotential = (colorsArr, depthNow)=>{
+        if (unlockDepth <= 0 || wUnlock <= 0) return 0
+        if (depthNow >= unlockDepth) return 0
+        if (Date.now() >= deadline) return 0
+        // 挑 top-N anchors
+        const preK = Math.min(90, Math.max(unlockAnchors * 10, 40))
+        const fast = anchorListRaw
+          .map(sid=>({ sid, s: boundaryScoreDynamic(colorsArr, sid) }))
+          .filter(x=>Number.isFinite(x.s) && x.s>0)
+          .sort((a,b)=>b.s-a.s)
+          .slice(0, preK)
+        const anchors = fast
+          .map(x=>({ sid: x.sid, s: regionBridgeValue(colorsArr, x.sid) }))
+          .filter(x=>Number.isFinite(x.s))
+          .sort((a,b)=>b.s-a.s)
+          .slice(0, unlockAnchors)
+        let best = 0
+        for (const a of anchors) {
+          if (Date.now() >= deadline) break
+          const sid = a.sid
+          const anchorScore = a.s || 0
+          const region = buildRegion(colorsArr, sid)
+          if (!region) continue
+          const idxS = idToIndex.get(sid)
+          const rc = colorsArr[idxS]
+          const adj = new Set()
+          for (const id of region){
+            const idx = idToIndex.get(id)
+            for (const nb of neighbors[idx] || []){
+              const nidx = idToIndex.get(nb)
+              if (nidx==null) continue
+              const tn = triangles[nidx]
+              if (!tn || tn.deleted) continue
+              const c = colorsArr[nidx]
+              if (!c || c==='transparent') continue
+              if (c !== rc) adj.add(c)
+            }
+          }
+          const candColors = (adj.size ? Array.from(adj) : palette).filter(c=>c && c!=='transparent' && c!==rc)
+          candColors.sort((c1,c2)=> (COLOR_COMP_COUNT.get(c2)||1) - (COLOR_COMP_COUNT.get(c1)||1))
+          const cap = (anchorScore > 22) ? Math.max(unlockColors, 8) : unlockColors
+          const pick = candColors.length > cap ? candColors.slice(0, cap) : candColors
+          for (const color of pick) {
+            const r = applyAction(colorsArr, sid, color)
+            if (!r) continue
+            const compCount = (COLOR_COMP_COUNT.get(color)||1)
+            const base = (r.touched||0) * wConnect + (r.boundaryCut||0) * wCut + (r.delta||0) * wDelta + compCount * wDisp + (r.domContact||0) * wDom + anchorScore * wAnchor
+            const pen = (Number.isFinite(r.bdAfter) ? r.bdAfter : 0) * wBdVar
+            const v = Math.max(0, base - pen)
+            if (v > best) best = v
+          }
+        }
+        return best
+      }
+
+      // 取一小撮“真实目标 hubs”：优先使用前端下发的 hubAnchorIds（只包含 top hubs）。
+      // 注意：focusAnchorIds 是“锚点池”（hubs+过渡+内部），不能再被当作 hub 目标集合，否则会误判“两步桥接”。
+      const hubAnchorIds = (typeof self !== 'undefined' && self.SOLVER_FLAGS && Array.isArray(self.SOLVER_FLAGS.hubAnchorIds))
+        ? self.SOLVER_FLAGS.hubAnchorIds.filter(x=>x!=null)
+        : null
+      const hubIds = (Array.isArray(hubAnchorIds) && hubAnchorIds.length)
+        ? Array.from(new Set(hubAnchorIds)).slice(0, 10)
+        : ((Array.isArray(focusAnchorIds) && focusAnchorIds.length)
+          ? Array.from(new Set([...(focusPrimaryAnchorId!=null?[focusPrimaryAnchorId]:[]), ...focusAnchorIds])).slice(0, 8)
+          : (focusPrimaryAnchorId!=null ? [focusPrimaryAnchorId] : []))
+      const hubIdSet = new Set(hubIds)
+      const connectedHubCount = (colorsArr, sid)=>{
+        try {
+          if (!hubIds.length) return 0
+          const idxS = idToIndex.get(sid)
+          if (idxS==null) return 0
+          const c0 = colorsArr[idxS]
+          if (!c0 || c0==='transparent' || triangles[idxS].deleted) return 0
+          let cnt = 0
+          const q=[sid]
+          const vis=new Set([sid])
+          const LIMIT = 9000
+          while(q.length && vis.size < LIMIT){
+            const id=q.shift()
+            if (hubIdSet.has(id)) {
+              cnt++
+              if (cnt >= hubIds.length) break
+            }
+            const idx=idToIndex.get(id)
+            if (idx==null) continue
+            for(const nb of neighbors[idx] || []){
+              if (vis.has(nb)) continue
+              const nidx=idToIndex.get(nb)
+              if (nidx==null) continue
+              const t=triangles[nidx]
+              if (!t || t.deleted) continue
+              if (colorsArr[nidx]!==c0) continue
+              vis.add(nb); q.push(nb)
+            }
+          }
+          return cnt
+        } catch { return 0 }
+      }
+
+      const estimateBestHubConnectNext = (colorsArr, sid)=>{
+        try {
+          if (!hubIds.length || wHub2 <= 0) return 0
+          // 从 sid 当前连通块边界收集候选颜色（限制规模）
+          const region = buildRegion(colorsArr, sid)
+          if (!region) return 0
+          const adjColors = new Set()
+          for (const id of region) {
+            const idx = idToIndex.get(id)
+            for (const nb of neighbors[idx] || []) {
+              const j = idToIndex.get(nb)
+              if (j==null) continue
+              const t = triangles[j]
+              if (!t || t.deleted) continue
+              const c2 = colorsArr[j]
+              if (!c2 || c2==='transparent') continue
+              if (c2 !== colorsArr[idToIndex.get(id)]) adjColors.add(c2)
+              if (adjColors.size >= 10) break
+            }
+            if (adjColors.size >= 10) break
+          }
+          const cand = Array.from(adjColors)
+          if (!cand.length) return 0
+          let best = 0
+          for (let i=0;i<cand.length;i++){
+            const c = cand[i]
+            const r2 = applyAction(colorsArr, sid, c)
+            if (!r2) continue
+            const cnt = connectedHubCount(r2.colors, sid)
+            if (cnt > best) best = cnt
+            if (best >= hubIds.length) break
+          }
+          return best
+        } catch { return 0 }
+      }
+
+      // 从指定锚点的当前连通块边界提取相邻颜色（用于 internal 2-step 破局枚举，避免 palette 采样漏掉关键中间色）
+      const getBoundaryAdjColors = (colorsArr, sid, cap=10)=>{
+        try {
+          const region = buildRegion(colorsArr, sid)
+          if (!region) return []
+          const idxS = idToIndex.get(sid)
+          const rc = colorsArr[idxS]
+          const set = new Set()
+          for (const id of region) {
+            const idx = idToIndex.get(id)
+            for (const nb of neighbors[idx] || []) {
+              const j = idToIndex.get(nb)
+              if (j==null) continue
+              const t = triangles[j]
+              if (!t || t.deleted) continue
+              const c2 = colorsArr[j]
+              if (!c2 || c2==='transparent' || c2===rc) continue
+              set.add(c2)
+              if (set.size >= cap) break
+            }
+            if (set.size >= cap) break
+          }
+          return Array.from(set)
+        } catch { return [] }
+      }
+
+      // beam state
+      let beam = [{ colors: baseColors, path: [], score: 0, hash: hashColors(baseColors) }]
+      const seenBestDepth = new Map([[beam[0].hash, 0]])
+
+      // 破局分工：部分线程直接从“内部桥梁”发起 2 步桥接（而不是从 A 慢慢扩张到 B）。
+      // 触发条件：有 focusAnchorIds（含内部桥梁候选）且存在多个 hub；仅让部分 workerVariant 执行，避免所有线程做同一件事。
+      try {
+        const doInternal = internalBridgeOnly && (hubIds && hubIds.length >= 2) && Array.isArray(internalBridgeIds) && internalBridgeIds.length
+        if (doInternal && (!Number.isFinite(stepLimitLocal) || stepLimitLocal >= 2)) {
+          const maxAnchors = Math.min(24, internalBridgeIds.length)
+          const basePalette = (Array.isArray(paletteLocal) ? paletteLocal : palette).filter(c=>c && c!=='transparent')
+          const seeds = []
+          for (let ai=0; ai<maxAnchors; ai++){
+            const sid = internalBridgeIds[ai]
+            const idxS = idToIndex.get(sid)
+            if (idxS==null) continue
+            const curC = baseColors[idxS]
+            if (!curC || curC==='transparent' || triangles[idxS].deleted) continue
+            const c1Pick = (()=>{
+              const adj = getBoundaryAdjColors(baseColors, sid, 10)
+              // 兜底：若边界色不足，再补 palette 前几项
+              const merged = [...adj, ...basePalette]
+              const out = []
+              for (const c of merged){ if (c && c!=='transparent' && c!==curC && !out.includes(c)) out.push(c); if (out.length>=12) break }
+              return out
+            })()
+            for (const c1 of c1Pick){
+              if (c1===curC) continue
+              const r1 = applyAction(baseColors, sid, c1)
+              if (!r1) continue
+              const c2Pick = (()=>{
+                const adj2 = getBoundaryAdjColors(r1.colors, sid, 10)
+                const merged2 = [...adj2, ...basePalette]
+                const out2 = []
+                for (const c of merged2){ if (c && c!=='transparent' && c!==c1 && !out2.includes(c)) out2.push(c); if (out2.length>=12) break }
+                return out2
+              })()
+              for (const c2 of c2Pick){
+                if (!c2 || c2===c1) continue
+                const r2 = applyAction(r1.colors, sid, c2)
+                if (!r2) continue
+                const hub2 = connectedHubCount(r2.colors, sid)
+                if (hub2 < 2) continue
+                const score2 = hub2 * 120 + (r1.boundaryCut||0) * 10 + (r2.boundaryCut||0) * 10 + (r1.touched||0) * 6 + (r2.touched||0) * 6
+                seeds.push({ sid, c1, c2, score2, colors: r2.colors })
+              }
+            }
+          }
+          seeds.sort((a,b)=>b.score2-a.score2)
+          const topSeeds = seeds.slice(0, 6)
+          for (const s of topSeeds){
+            const path = [{ startId: s.sid, color: s.c1 }, { startId: s.sid, color: s.c2 }]
+            const h = hashColors(s.colors)
+            if (!seenBestDepth.has(h) || seenBestDepth.get(h) > 2) {
+              seenBestDepth.set(h, 2)
+              beam.push({ colors: s.colors, path, score: s.score2, hash: h })
+            }
+          }
+        }
+      } catch {}
+
+      // 保持 beam 有序：让“2 步桥接种子”优先扩展
+      try { beam.sort((a,b)=>(b.score||0)-(a.score||0)); beam = beam.slice(0, Math.max(BEAM_W, 12)) } catch {}
+      let expanded = 0
+      let lastReport = Date.now()
+      const deadline = startTime + TIME_BUDGET_MS
+
+      const maxDepth = Number.isFinite(stepLimitLocal) ? stepLimitLocal : Math.min(30, lowerBoundColors(baseColors) + 10)
+      while(Date.now() < deadline && beam.length){
+        const depth = beam[0].path.length
+        if (Number.isFinite(stepLimitLocal) && depth >= stepLimitLocal) break
+        if (depth >= maxDepth) break
+
+        const nextStates = []
+        for (const st of beam){
+          if (Date.now() >= deadline) break
+          const depthNow = st.path.length
+          // 选 top anchor（动态）：先快筛（单点边界分），再 region 级桥接价值精算。
+          const preK = Math.min(140, Math.max(ANCHOR_K * 10, 60))
+          const fast = anchorListRaw.map(sid=>({ sid, s: boundaryScoreDynamic(st.colors, sid) }))
+            .filter(x=>Number.isFinite(x.s) && x.s>0)
+            .sort((a,b)=>b.s-a.s)
+            .slice(0, preK)
+          let anchorsScored = fast
+            .map(x=>({ sid: x.sid, s: regionBridgeValue(st.colors, x.sid) }))
+            .filter(x=>Number.isFinite(x.s))
+            .sort((a,b)=>b.s-a.s)
+            .slice(0, ANCHOR_K)
+
+          // 强制“内部动手”（A组两跳线程）：前两步只允许从 internalBridgeIds（按两跳分降序）里选锚点。
+          // 组内分工：优先以 focusPrimaryAnchorId 为第一候选，并顺延取后继两个，减少线程间重复。
+          // 注意：不再按 regionBridgeValue 重排（会引入“一跳/当前颜色状态”干扰）。
+          if (internalBridgeOnly && depthNow < 2 && Array.isArray(internalBridgeIds) && internalBridgeIds.length) {
+            const ids = internalBridgeIds
+            const head = (focusPrimaryAnchorId != null) ? focusPrimaryAnchorId : ids[0]
+            const idx0 = Math.max(0, ids.findIndex(x=>x===head))
+            const pick = [
+              ids[idx0],
+              ids[(idx0 + 1) % ids.length],
+              ids[(idx0 + 2) % ids.length],
+            ].filter(x=>x!=null)
+            const cand = pick.map((sid, idx)=>({ sid, s: (3 - idx) * 100 }))
+            if (cand.length) anchorsScored = cand
+          }
+
+          // 策略硬纠偏：前几步强制聚焦“桥接价值最高的色块”及其边界邻居色块，优先用少步打通。
+          const focusDepth = Number.isFinite(FLAGS?.multiAnchorFocusDepth) ? Math.max(0, Math.min(6, FLAGS.multiAnchorFocusDepth)) : 3
+          const focusK = Number.isFinite(FLAGS?.multiAnchorFocusK) ? Math.max(1, Math.min(8, FLAGS.multiAnchorFocusK)) : 3
+          if (focusDepth > 0 && depthNow < focusDepth && anchorsScored.length) {
+            const hubs = anchorsScored.slice(0, Math.min(focusK, anchorsScored.length))
+            // 扩展：加入 hub 边界上的邻居色块作为候选锚点（桥接往往需要先动“桥梁色块”，而不是 hub 本身）
+            const candMap = new Map() // sid -> score
+            const add = (sid, score)=>{
+              if (sid==null) return
+              const prev = candMap.get(sid)
+              if (prev==null || score > prev) candMap.set(sid, score)
+            }
+            const boundaryNeighborSeeds = (colorsArr, hubSid, hubScore)=>{
+              const reg = buildRegion(colorsArr, hubSid)
+              if (!reg) return
+              const picked = new Set()
+              let added = 0
+              for (const id of reg) {
+                const idx = idToIndex.get(id)
+                for (const nb of neighbors[idx] || []){
+                  const nidx = idToIndex.get(nb)
+                  if (nidx==null) continue
+                  const tn = triangles[nidx]
+                  if (!tn || tn.deleted) continue
+                  const c2 = colorsArr[nidx]
+                  if (!c2 || c2==='transparent') continue
+                  if (c2 === colorsArr[idToIndex.get(hubSid)]) continue
+                  if (!picked.has(nb)) {
+                    picked.add(nb)
+                    // 边界邻居本身可能 region 分数不高，但它“靠近高价值 hub”，给它带一个 hubScore 的加成
+                    add(nb, hubScore * 0.9)
+                    added++
+                    if (added >= 14) return
+                  }
+                }
+              }
+            }
+            // 若前端指定 primary hub，则优先把它放到 hub 列表首位（所有线程同一焦点，但每线程 primary 不同）
+            const hubsOrdered = (()=>{
+              if (focusPrimaryAnchorId==null) return hubs
+              const idx = hubs.findIndex(x=>x.sid===focusPrimaryAnchorId)
+              if (idx<=0) return hubs
+              const copy = hubs.slice()
+              const it = copy.splice(idx,1)[0]
+              copy.unshift(it)
+              return copy
+            })()
+            for (const h of hubsOrdered) {
+              add(h.sid, h.s * 1.2)
+              boundaryNeighborSeeds(st.colors, h.sid, h.s)
+            }
+            // 前端下发的 focusAnchorIds（含“内部桥梁/过渡区”）强制加入候选，避免只从 hub 本身慢慢扩张
+            try {
+              const boost = (hubsOrdered[0]?.s || 1) * 1.15
+              if (Array.isArray(focusAnchorIds) && focusAnchorIds.length) {
+                for (const sid of focusAnchorIds) add(sid, boost)
+              }
+              if (focusPrimaryAnchorId != null) add(focusPrimaryAnchorId, boost * 1.08)
+            } catch {}
+            // 对候选做一次精算（可选），并与 hub 传递分取 max
+            const cand = Array.from(candMap.entries()).map(([sid, bonus])=>{
+              const s0 = regionBridgeValue(st.colors, sid)
+              const s = Math.max(Number.isFinite(s0) ? s0 : -Infinity, bonus)
+              return { sid, s }
+            }).filter(x=>Number.isFinite(x.s))
+              .sort((a,b)=>b.s-a.s)
+              .slice(0, Math.max(ANCHOR_K, focusK * 6))
+            anchorsScored = cand.length ? cand : anchorsScored
+
+            // 低频打印一次 hub 信息，方便核验是否围绕高价值色块在跑
+            if (depthNow === 0 && expanded < 2) {
+              try {
+                onProgress?.({ phase:'multi_anchor_hubs', depth: depthNow, hubs: hubs.map(x=>({ startId:x.sid, score: Number(x.s.toFixed(2)) })) })
+              } catch {}
+            }
+          }
+
+          for (const a of anchorsScored){
+            const sid = a.sid
+            const anchorScore = a.s || 0
+            const region = buildRegion(st.colors, sid)
+            if (!region) continue
+            const idxS = idToIndex.get(sid)
+            const rc = st.colors[idxS]
+            // 只考虑边界上出现的颜色（桥接更有效），fullExpand 时允许全 palette
+            const adj = new Set()
+            for (const id of region){
+              const idx = idToIndex.get(id)
+              for (const nb of neighbors[idx] || []){
+                const nidx = idToIndex.get(nb)
+                if (nidx==null) continue
+                const tn = triangles[nidx]
+                if (!tn || tn.deleted) continue
+                const c = st.colors[nidx]
+                if (!c || c==='transparent') continue
+                if (c !== rc) adj.add(c)
+              }
+            }
+            const candColors = (adj.size ? Array.from(adj) : paletteLocal).filter(c=>c && c!=='transparent' && c!==rc)
+            // 粗排：优先分量多（更散乱）的颜色，提升桥接导向
+            candColors.sort((c1,c2)=> (COLOR_COMP_COUNT.get(c2)||1) - (COLOR_COMP_COUNT.get(c1)||1))
+            // 桥接主导：对高价值锚点，扩大颜色尝试数，避免错过关键桥接颜色导致“层层扩张”
+            const cap = (anchorScore > 22) ? Math.max(COLOR_K, 12) : COLOR_K
+            const pickColors = (candColors.length > cap) ? candColors.slice(0, cap) : candColors
+
+            for (const color of pickColors){
+              const r = applyAction(st.colors, sid, color)
+              if (!r) continue
+              const lb = lowerBoundColors(r.colors)
+              const g = st.path.length + 1
+              const compCount = (COLOR_COMP_COUNT.get(color)||1)
+              // 核心：桥接/联通优先 + 主色合并倾向 + 边界复杂度惩罚
+              const bridgeScore = (r.touched||0) * wConnect + (r.boundaryCut||0) * wCut + (r.delta||0) * wDelta + compCount * wDisp + (r.domContact||0) * wDom + anchorScore * wAnchor
+              const bdVarPenalty = (Number.isFinite(r.bdAfter) ? r.bdAfter : 0) * wBdVar
+              // 解锁口袋：看一步后“下一步最大可得桥接分”提升多少
+              const curBase = Math.max(0, bridgeScore - bdVarPenalty)
+              const nextBest = evalOneStepPotential(r.colors, depthNow)
+              const unlockBonus = Math.max(0, nextBest - curBase) * wUnlock
+              // 计算一次 hub 连通与两步前瞻，供奖励/惩罚/硬剪枝复用（避免重复 compute）
+              const hubCntNow = (hubIds.length && hubDepth > 0 && depthNow < hubDepth) ? connectedHubCount(r.colors, sid) : 0
+              const hubBest2 = (hubIds.length && hubDepth > 0 && depthNow < hubDepth) ? estimateBestHubConnectNext(r.colors, sid) : hubCntNow
+              // hubs 直连奖励：若一步把多个高价值 hub/过渡区打通在同一连通块，强力加分（优先前2步）
+              const hubBonus = (wHub > 0 && hubDepth > 0 && depthNow < hubDepth && hubIds.length)
+                ? Math.max(0, (hubCntNow - 1)) * wHub
+                : 0
+              // 2步桥接：奖励“这一步之后下一步能显著把多个 hub 打通”的动作（内部向外破局）
+              const hubUnlock = (wHub2 > 0 && hubDepth > 0 && depthNow < hubDepth && hubIds.length)
+                ? Math.max(0, (hubBest2 - hubCntNow)) * wHub2
+                : 0
+              // 第一层优化（硬剪枝，仅 internalBridgeOnly 线程启用）：
+              // - 第一步：若两步内仍无法连到 >=2 hub，直接剪掉
+              // - 第二步：若仍未连到 >=2 hub，直接剪掉
+              if (internalBridgeOnly && hubIds.length >= 2 && hubDepth > 0 && depthNow < hubDepth) {
+                if (depthNow === 0 && hubBest2 < 2) continue
+                if (depthNow === 1 && hubCntNow < 2) continue
+              }
+              // 慢扩张惩罚（所有线程）：若到了第3步仍没把 >=2 个 hub 打通，递增惩罚。
+              // 目的：即使“吞没零散区域收益高”，也要让“桥接高评分hub”成为第一优先级。
+              let slowBridgePenalty = 0
+              if (hubIds.length >= 2) {
+                const d2 = depthNow + 1
+                if (d2 >= 3 && hubCntNow < 2) slowBridgePenalty = (d2 - 2) * 18
+                if (d2 >= 4 && hubCntNow < 3) slowBridgePenalty += (d2 - 3) * 10
+              }
+              // 强约束倾向：如果前两步内无法达成“至少连接两个高价值 hub”，则强惩罚（迫使从内部桥梁破局，而非 A->B 慢扩张）
+              let hubPenalty = 0
+              if (hubDepth > 0 && hubIds.length >= 2 && depthNow < hubDepth) {
+                const cntNow = hubCntNow
+                const best2 = hubBest2
+                if (depthNow === 0 && best2 < 2) hubPenalty += 38
+                if (depthNow === 1 && cntNow < 2 && best2 < 2) hubPenalty += 28
+                if (depthNow === 0 && hubBonus === 0 && hubUnlock === 0) hubPenalty += 18
+                // 把两步前瞻再放大一点（更贴近你说的“2 步桥接优先级最高”）
+                if (depthNow === 0) { /* no-op, via penalty */ }
+              }
+              // 非桥接动作强惩罚：压制“纯扩张/一层层扩张”
+              const weakBridgePenalty = ((r.touched||0) === 0 && (r.boundaryCut||0) === 0) ? 10 : 0
+              // 前几步更愿意“先桥接打通”：降低成本惩罚，让桥接主导
+              const focusDepth = Number.isFinite(FLAGS?.multiAnchorFocusDepth) ? Math.max(0, Math.min(6, FLAGS.multiAnchorFocusDepth)) : 3
+              const costW = (focusDepth > 0 && depthNow < focusDepth) ? (wCost * 0.72) : wCost
+              const score = bridgeScore - bdVarPenalty + unlockBonus + hubBonus + hubUnlock - hubPenalty - slowBridgePenalty - weakBridgePenalty - (g + lb) * costW
+              const path2 = st.path.concat([{ startId: sid, color }])
+              if (Number.isFinite(stepLimitLocal) && path2.length > stepLimitLocal) continue
+              const h = hashColors(r.colors)
+              const prevD = seenBestDepth.get(h)
+              if (prevD!=null && prevD <= path2.length) continue
+              seenBestDepth.set(h, path2.length)
+
+              if (isUniformColors(r.colors)) {
+                if (!Number.isFinite(acceptStepLimit) || path2.length <= acceptStepLimit) {
+                  return { bestStartId: sid, paths: [path2], minSteps: path2.length, timedOut: false }
+                }
+                if (ALLOW_NEAR_MISS && Number.isFinite(acceptStepLimit) && path2.length > acceptStepLimit) {
+                  // +1：尝试压回 stepLimit；失败则记录 bestNearMiss
+                  if (path2.length === acceptStepLimit + 1) {
+                    const reduced = tryReduceActionsByOne(path2)
+                    if (reduced && reduced.length <= acceptStepLimit) {
+                      return { bestStartId: reduced[0]?.startId ?? sid, paths: [reduced], minSteps: reduced.length, timedOut: false }
+                    }
+                    try {
+                      const nmScore = score
+                      if (!bestNearMiss || nmScore > (bestNearMiss.score||-Infinity)) bestNearMiss = { startId: sid, path: path2, score: nmScore }
+                    } catch {}
+                    try { onProgress?.({ phase:'near_miss', source:'multi_anchor', len: path2.length, stepLimit: acceptStepLimit }) } catch {}
+                  }
+                  // +2：先尝试压回到 +1（满足“至少返回 +1”要求）；再尝试压回 stepLimit
+                  if (path2.length === acceptStepLimit + 2) {
+                    const reduced1 = tryReduceActionsByOne(path2)
+                    if (reduced1 && reduced1.length <= acceptStepLimit) {
+                      return { bestStartId: reduced1[0]?.startId ?? sid, paths: [reduced1], minSteps: reduced1.length, timedOut: false }
+                    }
+                    if (reduced1 && reduced1.length === acceptStepLimit + 1) {
+                      // 记录 +1 近似解（优先）
+                      try {
+                        const nmScore = score
+                        if (!bestNearMiss || nmScore > (bestNearMiss.score||-Infinity)) bestNearMiss = { startId: reduced1[0]?.startId ?? sid, path: reduced1, score: nmScore }
+                      } catch {}
+                      // 再试一次压回 stepLimit（两次删除/重排）
+                      const reduced2 = tryReduceActionsByOne(reduced1)
+                      if (reduced2 && reduced2.length <= acceptStepLimit) {
+                        return { bestStartId: reduced2[0]?.startId ?? sid, paths: [reduced2], minSteps: reduced2.length, timedOut: false }
+                      }
+                    } else {
+                      // 实在压不回 +1：仍记录一个 +2 备选（前端会标注 +2）
+                      try {
+                        const nmScore = score
+                        if (!bestNearMiss2 || nmScore > (bestNearMiss2.score||-Infinity)) bestNearMiss2 = { startId: sid, path: path2, score: nmScore }
+                      } catch {}
+                    }
+                    try { onProgress?.({ phase:'near_miss', source:'multi_anchor', len: path2.length, stepLimit: acceptStepLimit }) } catch {}
+                  }
+                }
+              }
+
+              nextStates.push({ colors: r.colors, path: path2, score, hash: h })
+            }
+          }
+          expanded++
+          const now = Date.now()
+          if (now - lastReport > 120) {
+            lastReport = now
+            try { onProgress?.({ phase:'multi_anchor', nodes: expanded, queue: beam.length, elapsedMs: now - startTime, depth: depth, anchors: ANCHOR_K, beam: BEAM_W }) } catch {}
+            await new Promise(r=>setTimeout(r,0))
+          }
+        }
+
+        if (!nextStates.length) break
+        nextStates.sort((a,b)=> b.score - a.score)
+        beam = nextStates.slice(0, BEAM_W)
+      }
+    } catch {}
+  }
+
+  // Auto-upgrade: when stepLimit exists and normal search makes no progress,
+  // run a single strict IDA* probe with a stronger heuristic (dynamic_rag_max by default).
+  // Purpose: either find a guaranteed <=stepLimit solution, or quickly reject that startId.
+  let didStrictProbe = false
+
   while (Date.now() - startTime < TIME_BUDGET_MS) {
+    if (!didStrictProbe && Number.isFinite(acceptStepLimit) && retry >= 1) {
+      const remainingStrict = TIME_BUDGET_MS - (Date.now() - startTime)
+      if (remainingStrict > 20000) {
+        didStrictProbe = true
+        const comp0 = components[0]
+        const sid0 = (comp0?.startCandidates && comp0.startCandidates.length) ? comp0.startCandidates[0] : comp0?.startId
+        if (sid0 != null) {
+          const oldFlags = { ...(self.SOLVER_FLAGS || {}) }
+          const heurName = oldFlags.heuristicName || 'dynamic_rag_max'
+          try {
+            try {
+              self.SOLVER_FLAGS = { ...oldFlags, strictMode: true, useIDAStar: true, heuristicName: heurName }
+            } catch {}
+            try { onProgress?.({ phase:'auto_upgrade', to:'strict_ida_probe', startId: sid0, stepLimit: acceptStepLimit, heuristicName: heurName, elapsedMs: Date.now() - startTime }) } catch {}
+            const resStrictProbe = await StrictIDAStarMinSteps(
+              triangles,
+              sid0,
+              palette,
+              (p)=>{ try { onProgress?.({ phase:'strict_probe', startId: sid0, ...p }) } catch {} },
+              acceptStepLimit
+            )
+            if (resStrictProbe && Array.isArray(resStrictProbe.paths) && resStrictProbe.paths.length > 0) {
+              const ms = resStrictProbe.minSteps
+              if (Number.isFinite(ms) && ms <= acceptStepLimit) {
+                return { bestStartId: sid0, paths: resStrictProbe.paths, minSteps: ms, timedOut: false }
+              }
+            }
+          } catch {}
+          finally {
+            try { self.SOLVER_FLAGS = oldFlags } catch {}
+          }
+          await new Promise(r=>setTimeout(r,0))
+        }
+      }
+    }
+
     for(const comp of components){
       if (Date.now() - startTime > TIME_BUDGET_MS) { timedOut = true; break }
       await new Promise(r=>setTimeout(r,0))
@@ -1800,20 +3087,36 @@ async function Solver_minStepsAuto(triangles, palette, maxBranches=3, onProgress
     await new Promise(r=>setTimeout(r,0))
   }
 
-  // 最终兜底：再次严格校验步数上限（requiredStepLimit），不满足则视为无合格解
-  if (best.minSteps!==Infinity && Number.isFinite(requiredStepLimit) && best.minSteps > requiredStepLimit) {
+  // 最终兜底：再次严格校验步数上限（acceptStepLimit），不满足则视为无合格解。
+  // 但若启用了 near-miss 且找到了 +1 的近似解，则返回 nearMissPath 供前端展示（不算合格解）。
+  if (best.minSteps!==Infinity && Number.isFinite(acceptStepLimit) && best.minSteps > acceptStepLimit) {
+    if (ALLOW_NEAR_MISS && (bestNearMiss?.path || bestNearMiss2?.path)) {
+      const nm = bestNearMiss?.path ? bestNearMiss : bestNearMiss2
+      return { bestStartId: null, paths: [], minSteps: 0, timedOut: true, nearMiss: { bestStartId: nm.startId, path: nm.path, len: nm.path.length } }
+    }
     return { bestStartId: null, paths: [], minSteps: 0, timedOut: true }
   }
-  if(best.minSteps===Infinity) return { bestStartId: null, paths: [], minSteps: 0, timedOut: true }
+  if(best.minSteps===Infinity) {
+    if (ALLOW_NEAR_MISS && (bestNearMiss?.path || bestNearMiss2?.path)) {
+      const nm = bestNearMiss?.path ? bestNearMiss : bestNearMiss2
+      return { bestStartId: null, paths: [], minSteps: 0, timedOut: true, nearMiss: { bestStartId: nm.startId, path: nm.path, len: nm.path.length } }
+    }
+    return { bestStartId: null, paths: [], minSteps: 0, timedOut: true }
+  }
   return { bestStartId: best.startId, paths: best.paths, minSteps: best.minSteps, timedOut }
 }
 
 // 方案后处理优化：对已统一颜色的路径进行反思、拆解与压缩
 async function OptimizeSolution(triangles, palette, startId, path, onProgress){
-  const TIME_BUDGET_MS = 120000
+  const OPT_FLAGS = (typeof self !== 'undefined' && self.SOLVER_FLAGS) ? self.SOLVER_FLAGS : {}
+  const TIME_BUDGET_MS = Number.isFinite(OPT_FLAGS?.optimizeTimeBudgetMs) ? Math.max(500, Math.min(180000, OPT_FLAGS.optimizeTimeBudgetMs)) : 120000
+  const ENABLE_GLOBAL_SEARCH = (OPT_FLAGS?.optimizeEnableGlobalSearch !== false)
+  const startTs = Date.now()
+  const deadline = startTs + TIME_BUDGET_MS
   const idToIndex = new Map(triangles.map((t,i)=>[t.id,i]))
   const neighbors = triangles.map(t=>t.neighbors)
   const originalPath = Array.isArray(path) ? path.slice() : []
+  const isActionSteps = !!(originalPath && originalPath.length && originalPath[0] && typeof originalPath[0] === 'object')
   // 早停：路径超�?0，直接跳过优化，仅返回关键信�?
   if (Array.isArray(path) && path.length > 50) {
     onProgress?.({ phase:'optimize_skipped', reason:'path_too_long', length: path.length })
@@ -1837,15 +3140,260 @@ async function OptimizeSolution(triangles, palette, startId, path, onProgress){
     return rs
   }
 
+  const applyActionLocal = (colorsLocal, sid, color)=>{
+    if (sid == null || !color) return null
+    const idxS = idToIndex.get(sid)
+    if (idxS==null) return null
+    const triS = triangles[idxS]
+    if (!triS || triS.deleted) return null
+    const region = buildRegion(colorsLocal, sid)
+    const next = colorsLocal.slice()
+    for (const id of region) next[idToIndex.get(id)] = color
+    // 扩张：并入相邻同色
+    const q=[...region]
+    const visited = new Uint8Array(triangles.length)
+    for (const id of region){ const ii=idToIndex.get(id); if(ii!=null) visited[ii]=1 }
+    while(q.length){
+      const tid=q.shift()
+      const idx=idToIndex.get(tid)
+      for(const nb of neighbors[idx]){
+        const nidx=idToIndex.get(nb)
+        if(nidx==null) continue
+        const tri=triangles[nidx]
+        if(!visited[nidx] && !tri.deleted && tri.color!=='transparent' && next[nidx]===color){
+          visited[nidx]=1
+          q.push(nb)
+        }
+      }
+    }
+    // 注意：为了性能这里不重新构建 newRegion（后续 hub 计数会再次 buildRegion）
+    return { colors: next }
+  }
+
+  const hubIds = (Array.isArray(OPT_FLAGS?.hubAnchorIds) && OPT_FLAGS.hubAnchorIds.length)
+    ? Array.from(new Set(OPT_FLAGS.hubAnchorIds)).slice(0, 10)
+    : ((Array.isArray(OPT_FLAGS?.focusAnchorIds) && OPT_FLAGS.focusAnchorIds.length)
+      ? Array.from(new Set(OPT_FLAGS.focusAnchorIds)).slice(0, 10)
+      : [])
+  const internalIds = (Array.isArray(OPT_FLAGS?.internalBridgeIds) && OPT_FLAGS.internalBridgeIds.length)
+    ? Array.from(new Set(OPT_FLAGS.internalBridgeIds)).slice(0, 24)
+    : []
+
+  const connectedHubCountLocal = (colorsLocal, sid)=>{
+    if (!hubIds.length || sid==null) return 0
+    let cnt = 0
+    const region = buildRegion(colorsLocal, sid)
+    for (const h of hubIds) { if (region.has(h)) cnt++ }
+    return cnt
+  }
+
+  const globalBestHubCountLocal = (colorsLocal)=>{
+    if (!hubIds.length) return 0
+    let best = 0
+    for (const h of hubIds) {
+      if (h==null) continue
+      const c = connectedHubCountLocal(colorsLocal, h)
+      if (c > best) best = c
+      if (best >= hubIds.length) break
+    }
+    return best
+  }
+
+  const getBoundaryAdjColorsLocal = (colorsArr, sid, cap=12)=>{
+    try {
+      const region = buildRegion(colorsArr, sid)
+      if (!region || region.size===0) return []
+      const idxS = idToIndex.get(sid)
+      const curC = colorsArr[idxS]
+      const set = new Set()
+      for (const id of region) {
+        const idx = idToIndex.get(id)
+        for (const nb of neighbors[idx] || []) {
+          const j = idToIndex.get(nb)
+          if (j==null) continue
+          const t = triangles[j]
+          if (!t || t.deleted) continue
+          const c2 = colorsArr[j]
+          if (!c2 || c2==='transparent' || c2===curC) continue
+          set.add(c2)
+          if (set.size >= cap) break
+        }
+        if (set.size >= cap) break
+      }
+      return Array.from(set)
+    } catch { return [] }
+  }
+
+  const isUniformAfterPath = (p)=>{
+    let cc = triangles.map(t=>t.color)
+    const act = !!(p && p.length && p[0] && typeof p[0] === 'object')
+    for (const step of (p||[])) {
+      const sid = act ? (step?.startId ?? startId) : startId
+      const col = act ? step?.color : step
+      if (sid==null || !col) continue
+      const region = buildRegion(cc, sid)
+      for (const id of region) cc[idToIndex.get(id)] = col
+    }
+    return isUniformFast(cc)
+  }
+
   // 若当前路径不统一：不再早退，记录后跳过局部优化，直接进入全局重算阶段
   let tmpColors = colors.slice()
-  for(const stepColor of path){
-    const region = buildRegion(tmpColors, startId)
+  for(const step of originalPath){
+    const sid = (isActionSteps ? (step?.startId ?? startId) : startId)
+    const stepColor = (isActionSteps ? step?.color : step)
+    if (sid == null || !stepColor) continue
+    const region = buildRegion(tmpColors, sid)
     for(const id of region){ tmpColors[idToIndex.get(id)] = stepColor }
   }
   const initiallyUniform = isUniformFast(tmpColors)
   if(!initiallyUniform){
     onProgress?.({ phase:'analysis', ok:false, reason:'path_not_unified' })
+  }
+
+  // 桥接段局部优化（专门为 action steps）：识别“桥接 hub 用了 >=3 步”的片段，强制尝试 2 步替代。
+  // 目标：避免优化只在“慢扩张到另一侧 hub”的路线里微调，错过“从内部破局，两步打通”的更优桥接。
+  const optimizeBridgeSegmentsActionSteps = (p)=>{
+    if (!Array.isArray(p) || p.length < 4) return p
+    if (!hubIds.length) return p
+    const budgetMs = Number.isFinite(OPT_FLAGS?.optimizeBridgeBudgetMs) ? Math.max(20, Math.min(2000, OPT_FLAGS.optimizeBridgeBudgetMs)) : 220
+    const startT = Date.now()
+    const deadlineT = Math.min(deadline - 1200, startT + budgetMs)
+    if (Date.now() > deadlineT) return p
+
+    const paletteLocal = Array.isArray(palette) ? palette.filter(c=>c && c!=='transparent') : []
+    const anchorPoolBase = Array.from(new Set([...(internalIds||[]), ...hubIds])).slice(0, 28)
+
+    const simulatePrefix = (arr, uptoExclusive)=>{
+      let cc = triangles.map(t=>t.color)
+      for (let i=0;i<uptoExclusive;i++){
+        const st = arr[i]
+        const sid = st?.startId ?? startId
+        const col = st?.color
+        if (sid==null || !col) continue
+        const r = applyActionLocal(cc, sid, col)
+        if (!r) continue
+        cc = r.colors
+      }
+      return cc
+    }
+
+    const findInefficientSegment = (arr)=>{
+      // 用“全局最佳 hub 连通度”识别慢桥接：避免依赖某一步的 startId 造成漏判。
+      let cc = triangles.map(t=>t.color)
+      let lastBelow2 = 0
+      let prevBest = globalBestHubCountLocal(cc)
+      for (let i=0;i<arr.length;i++){
+        const st = arr[i]
+        const sid = st?.startId ?? startId
+        const col = st?.color
+        if (sid==null || !col) continue
+        const r = applyActionLocal(cc, sid, col)
+        if (!r) continue
+        cc = r.colors
+        const bestNow = globalBestHubCountLocal(cc)
+        if (prevBest < 2) lastBelow2 = i
+        if (prevBest < 2 && bestNow >= 2) {
+          const segLen = i - lastBelow2 + 1
+          if (segLen >= 3) return { j: lastBelow2, i, segLen }
+        }
+        prevBest = bestNow
+      }
+      return null
+    }
+
+    const tryReplaceWith2Steps = (cc0, windowAnchors)=>{
+      // 穷举少量候选：anchor+边界相邻色优先
+      let best = null
+      const anchors = windowAnchors.slice(0, 24)
+      for (const a1 of anchors) {
+        if (Date.now() > deadlineT) break
+        const adj1 = getBoundaryAdjColorsLocal(cc0, a1, 12)
+        const colors1 = []
+        for (const c of [...adj1, ...paletteLocal]) { if (c && c!=='transparent' && !colors1.includes(c)) { colors1.push(c); if (colors1.length>=12) break } }
+        for (const c1 of colors1) {
+          if (Date.now() > deadlineT) break
+          const r1 = applyActionLocal(cc0, a1, c1)
+          if (!r1) continue
+          for (const a2 of anchors) {
+            if (Date.now() > deadlineT) break
+            const adj2 = getBoundaryAdjColorsLocal(r1.colors, a2, 12)
+            const colors2 = []
+            for (const c of [...adj2, ...paletteLocal]) { if (c && c!=='transparent' && c!==c1 && !colors2.includes(c)) { colors2.push(c); if (colors2.length>=12) break } }
+            for (const c2 of colors2) {
+              if (Date.now() > deadlineT) break
+              const r2 = applyActionLocal(r1.colors, a2, c2)
+              if (!r2) continue
+              const hubNow = globalBestHubCountLocal(r2.colors)
+              if (hubNow < 2) continue
+              // 评分：优先 hubCnt，其次降低颜色种类（近似下界），再考虑“第二步是否仍在内部锚点上”
+              const colorKinds = (()=>{ const s=new Set(); for(let k=0;k<triangles.length;k++){ const t=triangles[k]; const c=r2.colors[k]; if(!t.deleted && c && c!=='transparent') s.add(c) } return s.size })()
+              const score = hubNow * 1000 - colorKinds * 6 - (internalIds.includes(a2) ? 0 : 8)
+              if (!best || score > best.score) best = { score, steps: [{ startId: a1, color: c1 }, { startId: a2, color: c2 }] }
+            }
+          }
+        }
+      }
+      return best
+    }
+
+    let cur = p.slice()
+    let improved = false
+    let passes = 0
+    while (Date.now() <= deadlineT && passes < 3) {
+      passes++
+      const seg = findInefficientSegment(cur)
+      if (!seg) break
+      const { j, i } = seg
+      // 在 j 状态上做 2 步替代搜索（窗口锚点：internal/hub + 原片段内出现过的 startId）
+      const cc0 = simulatePrefix(cur, j)
+      const segAnchors = []
+      for (let k=j; k<=i; k++){ const sid = cur[k]?.startId; if (sid!=null) segAnchors.push(sid) }
+      const windowAnchors = Array.from(new Set([...segAnchors, ...anchorPoolBase]))
+      const best = tryReplaceWith2Steps(cc0, windowAnchors)
+      if (!best) break
+      const newPath = cur.slice(0, j).concat(best.steps, cur.slice(i+1))
+      if (newPath.length >= cur.length) break
+      if (!isUniformAfterPath(newPath)) {
+        // 不破坏可行性：不接受
+        break
+      }
+      cur = newPath
+      improved = true
+      onProgress?.({ phase:'optimize_bridge', improved:true, at:j, oldSegLen:(i-j+1), newSegLen:2, newLen:cur.length })
+    }
+    if (improved) onProgress?.({ phase:'optimize_bridge_done', improved:true, len:cur.length })
+    return cur
+  }
+
+  // 多锚点 action steps：优先跑桥接段局部替代；再进入全局重算兜底。
+  if (isActionSteps) {
+    let p2 = originalPath
+    try {
+      if (initiallyUniform) p2 = optimizeBridgeSegmentsActionSteps(originalPath)
+    } catch {}
+
+    if (Array.isArray(p2) && p2.length < originalPath.length) {
+      onProgress?.({ phase:'optimized', improved:true, reason:'bridge_segment_local', originalLen: originalPath.length, optimizedLen: p2.length })
+      return { bestStartId: startId, optimizedPath: p2, originalLen: originalPath.length, optimizedLen: p2.length, shortened: true, analysis: { ok:true, action_steps:true, localBridge:true } }
+    }
+
+    if (!ENABLE_GLOBAL_SEARCH || (Date.now() > (deadline - 8000))) {
+      onProgress?.({ phase:'optimized', improved: false, skippedGlobalSearch: true, reason:'action_steps_skip_local' })
+      return { bestStartId: startId, optimizedPath: p2, originalLen: originalPath.length, optimizedLen: p2.length, shortened: p2.length < originalPath.length, analysis: { ok: initiallyUniform, skippedGlobalSearch: true, reason:'action_steps_skip_local' } }
+    }
+    const prevUseDFS = OPT_FLAGS.useDFSFirst
+    const prevReturn = OPT_FLAGS.returnFirstFeasible
+    try { self.SOLVER_FLAGS = { ...OPT_FLAGS, useDFSFirst: true, returnFirstFeasible: true } } catch {}
+    const targetLimit = Math.max(0, p2.length - 1)
+    let res = await Solver_minStepsAuto(triangles, palette, 3, (p)=>{ onProgress?.({ ...p, phase: p?.phase || 'optimize_search' }) }, targetLimit)
+    try { self.SOLVER_FLAGS = { ...self.SOLVER_FLAGS, useDFSFirst: prevUseDFS, returnFirstFeasible: prevReturn } } catch {}
+    if (res && res.paths && res.paths.length>0 && res.minSteps < p2.length) {
+      onProgress?.({ phase:'optimized', improved: true, minSteps: res.minSteps })
+      return { bestStartId: res.bestStartId ?? startId, optimizedPath: res.paths[0], originalLen: originalPath.length, optimizedLen: res.minSteps, shortened: true, analysis: { ok:true, action_steps:true } }
+    }
+    onProgress?.({ phase:'optimized', improved: false })
+    return { bestStartId: startId, optimizedPath: p2, originalLen: originalPath.length, optimizedLen: p2.length, shortened: p2.length < originalPath.length, analysis: { ok: initiallyUniform, action_steps:true, localBridge: (p2.length < originalPath.length) } }
   }
   // 计算每一步的增益，识别关键节�?
   const gains=[]
@@ -2095,7 +3643,13 @@ async function OptimizeSolution(triangles, palette, startId, path, onProgress){
     }
   }
   // 尝试全局缩短：在上限为原路径-1的条件下重新求解
-  const FLAGS = (typeof self !== 'undefined' && self.SOLVER_FLAGS) ? self.SOLVER_FLAGS : {}
+  const FLAGS = (typeof self !== 'undefined' && self.SOLVER_FLAGS) ? self.SOLVER_FLAGS : OPT_FLAGS
+  // 全局重算阶段非常耗时：并行优化时允许缩小预算或直接关闭。
+  if (!ENABLE_GLOBAL_SEARCH || (Date.now() > (deadline - 8000))) {
+    onProgress?.({ phase:'optimized', improved: (path.length < originalPath.length), skippedGlobalSearch: true })
+    return { bestStartId: startId, optimizedPath: path, originalLen: originalPath.length, optimizedLen: path.length, shortened: path.length < originalPath.length, analysis: { ok:true, skippedGlobalSearch: true } }
+  }
+
   const prevUseDFS = FLAGS.useDFSFirst
   const prevReturn = FLAGS.returnFirstFeasible
   try { self.SOLVER_FLAGS = { ...FLAGS, useDFSFirst: true, returnFirstFeasible: true } } catch {}
@@ -2143,19 +3697,58 @@ async function OptimizeSolution(triangles, palette, startId, path, onProgress){
   }
 }
 
+// 进程内缓存：避免重复解析/重复赋值（但仍允许每次消息带入覆盖）
+let _cachedTriangles = null
+let _cachedPalette = null
+
+// 进度节流：减少 postMessage 频率，降低通信与主线程处理开销
+function createProgressThrottler(post, minIntervalMs = 40) {
+  let lastTs = 0
+  return (p, force = false) => {
+    const now = Date.now()
+    if (!force && (now - lastTs) < minIntervalMs) return
+    lastTs = now
+    try { post({ type: 'progress', payload: p }) } catch {}
+  }
+}
+
 self.onmessage = async (e) => {
   const { type, triangles, palette, maxBranches, stepLimit, ragOptions, flags, preferredStartId } = e.data || {}
+  // One-off PDB payload injection (intended for a small number of workers, e.g. strict threads)
+  if (type === 'load_pdb') {
+    const { key, obj } = e.data || {}
+    try {
+      const ok = !!(key && obj && typeof obj === 'object' && loadPDBObject(key, obj))
+      self.postMessage({ type:'pdb_loaded', payload: { ok, key } })
+    } catch (err) {
+      self.postMessage({ type:'pdb_loaded', payload: { ok: false, key, error: String(err?.message || err) } })
+    }
+    return
+  }
   // 支持在运行前设置或更�?flags（从主线程传入）
   if (type === 'set_flags') {
     try { self.SOLVER_FLAGS = { ...(self.SOLVER_FLAGS||{}), ...(flags||{}) } } catch {}
     self.postMessage({ type:'flags_set', payload: { ok: true } })
     return
   }
+  // 可选初始化：把 puzzle 状态缓存到 worker 内，后续 auto/optimize 可省略 triangles/palette
+  if (type === 'init') {
+    if (Array.isArray(triangles)) _cachedTriangles = triangles
+    if (Array.isArray(palette)) _cachedPalette = palette
+    self.postMessage({ type: 'init_done', payload: { ok: true, triangles: Array.isArray(_cachedTriangles) ? _cachedTriangles.length : 0, palette: Array.isArray(_cachedPalette) ? _cachedPalette.length : 0 } })
+    return
+  }
   if(type==='auto'){
+    const tris = Array.isArray(triangles) ? triangles : _cachedTriangles
+    const pal = Array.isArray(palette) ? palette : _cachedPalette
+    if (!Array.isArray(tris) || !Array.isArray(pal)) {
+      self.postMessage({ type:'result', payload: { bestStartId: null, paths: [], minSteps: 0, timedOut: false, error: 'missing_triangles_or_palette' } })
+      return
+    }
     // 若提供了优先起点，将其所在分量优先处�?
-    if (preferredStartId!=null && Array.isArray(triangles)) {
+    if (preferredStartId!=null && Array.isArray(tris)) {
       try {
-        const idxMap = new Map(triangles.map((t,i)=>[t.id,i]))
+        const idxMap = new Map(tris.map((t,i)=>[t.id,i]))
         const targetIdx = idxMap.get(preferredStartId)
         if (targetIdx!=null) {
           // 轻量标记：通过全局 flags 传递优先起点，供自动解排序阶段使用
@@ -2163,16 +3756,29 @@ self.onmessage = async (e) => {
         }
       } catch {}
     }
-    const result = await Solver_minStepsAuto(triangles, palette, maxBranches, (p)=>{
-      self.postMessage({ type:'progress', payload: p })
+    const postProgress = createProgressThrottler((msg)=> self.postMessage(msg), (self.SOLVER_FLAGS && Number.isFinite(self.SOLVER_FLAGS.progressPostIntervalMs)) ? Math.max(0, self.SOLVER_FLAGS.progressPostIntervalMs) : 40)
+    const forcePhases = new Set(['solution','best_update','components_done','parallel_solved','cache_hit','optimized','optimized_invalid','error'])
+    const result = await Solver_minStepsAuto(tris, pal, maxBranches, (p)=>{
+      const ph = p?.phase
+      const force = forcePhases.has(ph)
+      postProgress(p, force)
     }, stepLimit)
     // 保持向后兼容：仅在存�?ragOptions 时，附带回传，便于调�?
     const payload = ragOptions ? { ...result, ragPlan: { enabled: !!ragOptions?.enable } } : result
     self.postMessage({ type:'result', payload })
   } else if(type==='optimize'){
+    const tris = Array.isArray(triangles) ? triangles : _cachedTriangles
+    const pal = Array.isArray(palette) ? palette : _cachedPalette
+    if (!Array.isArray(tris) || !Array.isArray(pal)) {
+      self.postMessage({ type:'result', payload: { bestStartId: null, optimizedPath: null, originalLen: 0, optimizedLen: 0, shortened: false, analysis: { ok: false, reason: 'missing_triangles_or_palette' } } })
+      return
+    }
     const { startId, path } = e.data || {}
-    const result = await OptimizeSolution(triangles, palette, startId, path, (p)=>{
-      self.postMessage({ type:'progress', payload: p })
+    const postProgress = createProgressThrottler((msg)=> self.postMessage(msg), (self.SOLVER_FLAGS && Number.isFinite(self.SOLVER_FLAGS.progressPostIntervalMs)) ? Math.max(0, self.SOLVER_FLAGS.progressPostIntervalMs) : 40)
+    const forcePhases = new Set(['optimized','optimized_invalid','error'])
+    const result = await OptimizeSolution(tris, pal, startId, path, (p)=>{
+      const ph = p?.phase
+      postProgress(p, forcePhases.has(ph))
     })
     self.postMessage({ type:'result', payload: result })
   }

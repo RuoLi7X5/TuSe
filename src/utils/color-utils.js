@@ -261,10 +261,41 @@ export async function quantizeImage(bitmap, targetCount){
   // 如果用户指定了 targetCount，则使用“相异模式搜索”策略来保证颜色多样性
   const tc = parseInt(targetCount)
   if (Number.isFinite(tc) && tc >= 2) {
-    console.log('[ColorUtils] Force distinct colors:', tc)
-    const distinctColors = findDistinctColors(samples, tc)
-    // 强制返回指定数量的颜色
-    return { palette: distinctColors.map(c => hex(c.rgb[0], c.rgb[1], c.rgb[2])) }
+    // 更稳健：强制 KMeans=tc（按像素频次收敛），避免“极少量噪点”因为更相异而被选入 palette
+    console.log('[ColorUtils] Force KMeans colors:', tc)
+    const K = Math.max(2, Math.min(32, tc))
+    let centers = kmeans(samples, K, 8)
+    // 统计每个中心的样本数（频次）
+    const counts = new Array(centers.length).fill(0)
+    for (let i=0;i<samples.length;i++){
+      let best = 0, bd = 1e9
+      for (let k=0;k<centers.length;k++){
+        const d = distLab(samples[i].lab, centers[k].lab)
+        if (d < bd) { bd = d; best = k }
+      }
+      counts[best]++
+    }
+    const ranked = centers.map((c, i)=>({ lab: c.lab, count: counts[i]||0 }))
+      .sort((a,b)=> b.count - a.count)
+    // 转为 hex 并去重（防止中心非常接近导致同色）
+    const out = []
+    const seen = new Set()
+    for (const r of ranked) {
+      const [rr,gg,bb] = lab2rgb(r.lab[0], r.lab[1], r.lab[2])
+      const hx = hex(rr,gg,bb)
+      if (!seen.has(hx)) { seen.add(hx); out.push(hx) }
+      if (out.length >= tc) break
+    }
+    // 若去重后不足 tc，用“相异补齐”填满（最后兜底）
+    if (out.length < tc) {
+      const extra = findDistinctColors(samples, tc - out.length)
+        .map(c => hex(c.rgb[0], c.rgb[1], c.rgb[2]))
+      for (const hx of extra) {
+        if (!seen.has(hx)) { seen.add(hx); out.push(hx) }
+        if (out.length >= tc) break
+      }
+    }
+    return { palette: out.slice(0, tc) }
   }
 
   // 默认 K-Means 流程，自动推断 K

@@ -89,6 +89,14 @@ REG.set('pdb6x6_max', (env, colors, regionSet)=>{
   } catch { return 0 }
 })
 
+// Always-available heuristic backed by dynamic RAG distance.
+// This is intentionally lightweight and works even when no static PDB is loaded.
+REG.set('dynamic_rag_max', (env, colors, regionSet)=>{
+  try {
+    return estimatePDB('dynamic_rag', env, colors, regionSet) || 0
+  } catch { return 0 }
+})
+
 // Enumerate available heuristic names for UI. Includes 'none', registered names, and dynamic PDB names.
 export function listHeuristicNames(){
   const out = new Set(['none'])

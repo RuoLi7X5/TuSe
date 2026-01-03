@@ -146,7 +146,9 @@ export function computeStrategySummary(triangles, palette, startId, path, flags,
   const idToIndex = new Map(triangles.map((t,i)=>[t.id,i]))
   const colors = triangles.map(t=>t.color)
   const startColor = (startId!=null && idToIndex.has(startId)) ? colors[idToIndex.get(startId)] : null
-  const seq = Array.isArray(path) ? path.slice() : []
+  const seqRaw = Array.isArray(path) ? path.slice() : []
+  // 兼容 action steps：[{startId,color}] 与 legacy steps：[color]
+  const seq = seqRaw.map(x => (x && typeof x === 'object') ? x.color : x).filter(Boolean)
   const color_counts = {}
   let transitions = 0, longest = 0, curStreak = 0, prev = null
   for(const c of seq){
@@ -159,7 +161,7 @@ export function computeStrategySummary(triangles, palette, startId, path, flags,
   const unique_colors_used = Object.keys(color_counts).length
   return {
     mode: mode || 'auto',
-    start_id: startId ?? null,
+    start_id: startId ?? (seqRaw[0] && typeof seqRaw[0] === 'object' ? (seqRaw[0].startId ?? null) : null),
     start_color: startColor ?? null,
     path_len: seq.length,
     transitions_count: transitions,
@@ -168,6 +170,8 @@ export function computeStrategySummary(triangles, palette, startId, path, flags,
     color_counts,
     flags: { ...(flags||{}) },
     features,
+    // 额外：原始步骤（可能含 startId），便于后续分析
+    action_steps: Array.isArray(path) && path.length && (path[0] && typeof path[0] === 'object') ? path : undefined,
   }
 }
 

@@ -187,29 +187,8 @@ export function detectGrid(imageData, config = {}) {
      return { success: false, reason: 'No valid line spacing detected' }
   }
   
-  // 推导 Side Length from Diagonal Spacing
-  // Diagonal lines spacing D corresponds to altitude of the triangle if rotated?
-  // In horizontal mode:
-  // Horizontal lines (0 deg) spacing = H (Altitude)
-  // Diagonal lines (60/120 deg) spacing D.
-  // In equilateral triangle, D = H.
-  // But X-spacing (periodicity of intersections) is D / sin(60) = D / (sqrt(3)/2)? No.
-  // X-spacing of vertices is Side/2.
-  // Intersection geometry: Side/2 = D / sqrt(3) ? No.
-  // Let's rely on D directly.
-  // If the grid is equilateral, D_diag should equal H_horizontal.
-  // If D_diag != H_horizontal, we have non-equilateral.
-  // Side length relates to D_diag as: Side = 2 * D_diag / sqrt(3).
-  // Why? Height of equilateral triangle is Side * sqrt(3)/2.
-  // Distance between parallel lines at 60 deg is also Side * sqrt(3)/2.
-  // So D_diag = H.
-  // So Side = D_diag / (sqrt(3)/2) = 2 * D_diag / sqrt(3).
-  
-  let estimatedSideFromDiag = 0
-  if (diagonals.length > 0) {
-     const avgDiagSpacing = diagonals.reduce((s, d)=>s+d.spacing*d.count, 0) / diagonals.reduce((s,d)=>s+d.count, 0)
-     estimatedSideFromDiag = avgDiagSpacing / (Math.sqrt(3)/2)
-  }
+  // 重要：本项目网格必须由“等边三角形”组成，因此强制采用等边几何关系：
+  // bestSpacing = H（高度），Side = H / (sqrt(3)/2)
   
   // 最终使用的 side 和 height
   // 如果 detectedSideFromDiag 存在且与 inferredSide 差异较大 (>5%)，说明是非等边
@@ -370,14 +349,8 @@ export function detectGrid(imageData, config = {}) {
   // 因此推导出的 side = bestSpacing / (sqrt(3)/2)
   const inferredSide = bestSpacing / (Math.sqrt(3) / 2)
   
-  // 最终决策：
-  // 如果 estimatedSideFromDiag 存在且有效，我们使用它作为 side，而 bestSpacing 作为 height
-  // 这样可以支持非等边三角形（Aspect Ratio Stretch）
-  let finalSide = inferredSide
-  if (estimatedSideFromDiag > 0 && Math.abs(estimatedSideFromDiag - inferredSide) / inferredSide > 0.02) {
-     // 差异大于 2%，认为是显著的非等边
-     finalSide = estimatedSideFromDiag
-  }
+  // 最终决策：严格等边
+  const finalSide = inferredSide
 
   targetAngles.forEach((angle, i) => {
      const anchor = anchors[i]
@@ -385,14 +358,8 @@ export function detectGrid(imageData, config = {}) {
      // i=0 is horizontal lines (spacing = bestSpacing)
      // i=1,2 are diagonal lines
      
-     let lineSpacing = bestSpacing
-     if (i > 0) {
-        // Diagonal spacing for non-equilateral
-        const S = finalSide
-        const H = bestSpacing
-        const diagLen = Math.sqrt(S*S/4 + H*H)
-        lineSpacing = (S * H) / diagLen
-     }
+     // 等边网格：三组平行线的间距一致，均为 bestSpacing（高度）
+     const lineSpacing = bestSpacing
      
      // Generate lines range
      // anchor is one line. We expand k in both directions.

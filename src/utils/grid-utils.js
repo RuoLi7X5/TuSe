@@ -534,7 +534,8 @@ export async function mapImageToGrid(bitmap, grid, palette, options = {}) {
   canvas.width = bitmap.width; canvas.height = bitmap.height
   const ctx = canvas.getContext('2d')
   // 1. 预处理：轻微模糊以平滑噪点和压缩伪影
-  ctx.filter = 'blur(1px)'
+  // 校准模式：不要 blur，否则边界颜色会被混合，导致“该被修正的边界三角形”仍被误判
+  ctx.filter = rectifyMode ? 'none' : 'blur(1px)'
   ctx.drawImage(bitmap, 0, 0)
   ctx.filter = 'none' // 恢复
   const img = ctx.getImageData(0, 0, canvas.width, canvas.height)
@@ -577,17 +578,42 @@ export async function mapImageToGrid(bitmap, grid, palette, options = {}) {
       maskH = aiSegmentation.maskSize || 256
       origW = aiSegmentation.originalSize?.width || bitmap.width
       origH = aiSegmentation.originalSize?.height || bitmap.height
-      
-      // 为每个 Mask 计算其代表颜色（通过采样原图）
-      // 由于 SAM Mask 是 256x256 的 logits，我们需要先解码
-      // 为了性能，我们不在这里做昂贵的全图解码
-      // 而是：只对每个 Mask 的正样本区域进行稀疏采样
-      
+
+      // 为每个 Mask 估计代表色：优先从 mask 内部稀疏采样原图像素（避免“prompt 本身就错色”导致校准无效）
+      // 采样点坐标换算：mask(x,y) -> offCanvas(x/sX, y/sY) -> bitmap((x/sX)/aiScale, (y/sY)/aiScale)
       samResults.forEach((res, idx) => {
-        // res.point 是 prompt 点，包含 color (Hex)
-        // 我们直接信任这个 prompt 点的颜色作为该 mask 的代表色
-        // 因为这些点是基于当前网格的最大连通区域计算出来的，颜色是可靠的
-        if (res.point && res.point.color) {
+        const maskObj = res?.maskRaw
+        const maskData = maskObj?.data
+        const mW = maskObj?.width || maskW
+        const mH = maskObj?.height || maskH
+        const sX = mW / origW
+        const sY = mH / origH
+        const maxSamples = rectifyMode ? 48 : 24
+        let picked = 0
+        let accL = 0, accA = 0, accB = 0, accW = 0
+        if (maskData && mW > 0 && mH > 0 && Number.isFinite(aiScale) && aiScale > 0) {
+          const step = Math.max(3, Math.floor(Math.min(mW, mH) / 32))
+          for (let y = 0; y < mH && picked < maxSamples; y += step) {
+            for (let x = 0; x < mW && picked < maxSamples; x += step) {
+              const v = maskData[y * mW + x]
+              if (v > 0) {
+                const bx = (x / sX) / aiScale
+                const by = (y / sY) / aiScale
+                const lab = labAt(bx, by)
+                const w = (typeof v === 'number' && Number.isFinite(v)) ? Math.min(8, Math.max(1, v)) : 1
+                accL += lab[0] * w
+                accA += lab[1] * w
+                accB += lab[2] * w
+                accW += w
+                picked++
+              }
+            }
+          }
+        }
+        if (picked > 0 && accW > 0) {
+          maskColors.set(idx, [accL/accW, accA/accW, accB/accW])
+        } else if (res?.point?.color) {
+          // 回退：实在取不到样本（mask 空/缺失），才信任 prompt 色
           maskColors.set(idx, hex2lab(res.point.color))
         }
       })
@@ -619,16 +645,27 @@ export async function mapImageToGrid(bitmap, grid, palette, options = {}) {
       const scaleX = maskW / origW
       const scaleY = maskH / origH
       
-      // 采样点：中心点 + 3个顶点 + 中点 (增强采样密度，避免小三角形漏网)
-      const pts = [
-          c, v0, v1, v2,
-          midPoint(v0, v1), midPoint(v1, v2), midPoint(v2, v0)
-      ]
+      // 采样点：尽量取“内侧点”，减少落在边界造成的误命中（mask 分辨率有限）
+      const pts = (function(){
+        const alphaV = rectifyMode ? 0.28 : 0.18
+        const alphaM = rectifyMode ? 0.22 : 0.14
+        const p01 = midPoint(v0, v1), p12 = midPoint(v1, v2), p20 = midPoint(v2, v0)
+        return [
+          c,
+          insidePoint(v0, c, alphaV),
+          insidePoint(v1, c, alphaV),
+          insidePoint(v2, c, alphaV),
+          insidePoint(p01, c, alphaM),
+          insidePoint(p12, c, alphaM),
+          insidePoint(p20, c, alphaM),
+        ]
+      })()
       
-      // 投票：看哪个 Mask 在这些点上的 logit 值最大
+      // 投票：看哪个 Mask 在这些点上的 logit 命中数最多；再按 score 决胜（更稳健）
       // 注意：SAM 返回的是 logits，> 0 表示前景
       let bestMaskIdx = -1
-      let maxVote = -Infinity
+      let bestHit = -1
+      let bestScore = -Infinity
       let totalHit = 0
       
       // 遍历所有 masks (通常只有 4-10 个颜色种类)
@@ -662,17 +699,20 @@ export async function mapImageToGrid(bitmap, grid, palette, options = {}) {
         }
         
         // 记录最佳匹配
-        if (hit > 0 && score > maxVote) {
-          maxVote = score
-          bestMaskIdx = i
-          totalHit = hit
+        if (hit > 0) {
+          if (hit > bestHit || (hit === bestHit && score > bestScore)) {
+            bestHit = hit
+            bestScore = score
+            bestMaskIdx = i
+            totalHit = hit
+          }
         }
       }
       
       // 决策：
-      // 如果处于 rectifyMode (强力纠正)，只要有命中就采纳
-      // 否则，需要较高的置信度（例如至少一半的采样点命中）
-      const threshold = rectifyMode ? 1 : Math.ceil(pts.length * 0.4)
+      // rectifyMode：仍要一定命中数，避免“单点误命中”导致错色没被修复甚至更糟
+      // 非校准：更保守
+      const threshold = rectifyMode ? Math.max(2, Math.ceil(pts.length * 0.25)) : Math.ceil(pts.length * 0.45)
       
       // 核心修正：当 AI 识别出有效 Mask 时，强制信任 AI 的边界。
       // 即便只有部分点命中（例如边界上的三角形），只要命中了高置信度的 Mask，就应该被吸附过去。
@@ -697,19 +737,26 @@ export async function mapImageToGrid(bitmap, grid, palette, options = {}) {
     // 之前使用加权平均 Lab (weightedMeanLab)，但这会导致边界处的颜色混合（如红+白=粉），
     // 如果粉色不在调色板中，最近邻可能映射错误（如映射回红色而不是白色）。
     // 现在改为：对每个采样点分别寻找最近邻颜色，然后进行投票。
-    const pts = [
-      c,
-      insidePoint(v0, c, 0.20),
-      insidePoint(v1, c, 0.20),
-      insidePoint(v2, c, 0.20),
-      insidePoint(midPoint(v0, v1), c, 0.15),
-      insidePoint(midPoint(v1, v2), c, 0.15),
-      insidePoint(midPoint(v2, v0), c, 0.15),
-      // 增加中心区域权重
-      insidePoint(c, v0, 0.05),
-      insidePoint(c, v1, 0.05),
-      insidePoint(c, v2, 0.05)
-    ]
+    const pts = (function(){
+      // 校准模式：更深地往内采样，避免采到边界混色；并去掉“靠近顶点的点”
+      const aV = rectifyMode ? 0.34 : 0.20
+      const aM = rectifyMode ? 0.28 : 0.15
+      const p01 = midPoint(v0, v1), p12 = midPoint(v1, v2), p20 = midPoint(v2, v0)
+      const arr = [
+        c,
+        insidePoint(v0, c, aV),
+        insidePoint(v1, c, aV),
+        insidePoint(v2, c, aV),
+        insidePoint(p01, c, aM),
+        insidePoint(p12, c, aM),
+        insidePoint(p20, c, aM),
+      ]
+      // 非校准：额外加一点轻微扰动点，提升鲁棒性
+      if (!rectifyMode) {
+        arr.push(insidePoint(c, v0, 0.05), insidePoint(c, v1, 0.05), insidePoint(c, v2, 0.05))
+      }
+      return arr
+    })()
     
     const votes = new Map() // hex -> weight
     for (const p of pts) {

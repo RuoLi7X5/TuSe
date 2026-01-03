@@ -12,9 +12,395 @@ import { quantizeImage, setColorTuning } from './utils/color-utils'
 import { buildTriangleGrid, buildTriangleGridVertical, mapImageToGrid, isUniform, colorFrequency, generateAiDebugImage, rectifyColorsByGrid, exportGridOverlay } from './utils/grid-utils'
 import { floodFillRegion, attachSolverToWindow, captureCanvasPNG } from './utils/solver'
 import { detectGrid } from './utils/grid-detector'
+import { computeRegionStats, renderRegionStatsSnapshotPNG } from './utils/region-stats'
 import { hasPDB, loadPDBObject, loadPDBFromJSON, loadPDBFromURL, getPDBBaseURL } from './utils/pdb'
-import { startRun as telemetryStartRun, logEvent as telemetryLogEvent, finishRun as telemetryFinishRun, makeGraphSignature, getRecommendation, getCachePath, putCachePath, uploadStrategyAuto, recordRunScore, postLearnScore } from './utils/telemetry'
+import { startRun as telemetryStartRun, logEvent as telemetryLogEvent, finishRun as telemetryFinishRun, makeGraphSignature, getRecommendation, uploadStrategyAuto, recordRunScore, postLearnScore } from './utils/telemetry'
+import { getCachedSolution, saveCachedSolutionWithPuzzle, makePuzzlePayload, startCacheSyncLoop, deleteCachedSolutionEverywhere, clearAllCachedSolutionsLocal } from './utils/solutionCache'
+import { saveQualifiedSolveLog, listQualifiedSolveLogs, getQualifiedSolveLog, deleteQualifiedSolveLog } from './utils/solveLogStore'
 import AIService from './utils/ai-service'
+
+// 逐步生成快照：返回 images 数组（包含初始状态 + 每一步后的状态）。
+// 注意：StepsPanel 期待 branch.images 是“图片数组”，不要再塞成 [singleImage]。
+async function buildStepSnapshots({ triangles, width, height, startId, path, maxSnap = 200, includeInitial = true }) {
+  const p = Array.isArray(path) ? path : []
+  const take = Math.min(p.length, Math.max(1, Math.floor(maxSnap)))
+  const snaps = []
+  if (includeInitial) snaps.push(await captureCanvasPNG(triangles, width, height, startId, []))
+  const cur = []
+  for (let k = 0; k < take; k++) {
+    cur.push(p[k])
+    snaps.push(await captureCanvasPNG(triangles, width, height, startId, cur))
+    if (k % 5 === 0) await new Promise(r => setTimeout(r, 0))
+  }
+  // 太长时：补一张最终状态，避免只看到前半段
+  if (p.length > take) snaps.push(await captureCanvasPNG(triangles, width, height, startId, p))
+  return snaps
+}
+
+// 校验：给定起点与步骤（兼容 action steps 与 legacy steps），模拟涂色后判断是否统一。
+function verifyUnifiedPath({ triangles, startId, path }) {
+  try {
+    if (startId == null || !Array.isArray(path) || path.length === 0) return false
+    const idToIndex = new Map(triangles.map((t, i) => [t.id, i]))
+    const neighbors = triangles.map(t => t.neighbors)
+    let colorsLocal = triangles.map(t => t.color)
+    const applyOne = (sid, stepColor) => {
+      const idxStart = idToIndex.get(sid)
+      if (idxStart == null) return false
+      const startColorCur = colorsLocal[idxStart]
+      if (stepColor === startColorCur) return true
+      const regionSet = new Set()
+      const q = [sid]
+      const visited = new Set([sid])
+      while (q.length) {
+        const id = q.shift()
+        const idx = idToIndex.get(id)
+        if (idx == null) return false
+        if (colorsLocal[idx] !== startColorCur) continue
+        regionSet.add(id)
+        const nbs = neighbors[idx] || []
+        for (const nb of nbs) {
+          if (!visited.has(nb)) { visited.add(nb); q.push(nb) }
+        }
+      }
+      if (regionSet.size === 0) return false
+      for (const id of regionSet) { colorsLocal[idToIndex.get(id)] = stepColor }
+      return true
+    }
+    for (const step of path) {
+      const isObj = step && typeof step === 'object'
+      const sid = isObj ? step.startId : startId
+      const stepColor = isObj ? step.color : step
+      if (sid == null || !stepColor) return false
+      if (!applyOne(sid, stepColor)) return false
+    }
+    const present = colorsLocal.filter((c, i) => !triangles[i]?.deleted && c && c !== 'transparent')
+    return new Set(present).size <= 1
+  } catch {
+    return false
+  }
+}
+
+// 计算“高价值锚点池”：top hubs + hubs之间的过渡色块（邻接多个top hub）+ hubs邻居。
+// 目的：起点不只盯最顶尖hub，也能选到“夹在高hub之间、对桥接至关重要”的区域。
+function computeFocusAnchorIds(triangles, opts) {
+  const topK = Number.isFinite(opts?.topK) ? Math.max(1, Math.floor(opts.topK)) : 18
+  const betweenK = Number.isFinite(opts?.betweenK) ? Math.max(0, Math.floor(opts.betweenK)) : 10
+  const neighborK = Number.isFinite(opts?.neighborK) ? Math.max(0, Math.floor(opts.neighborK)) : 10
+  const pathK = Number.isFinite(opts?.pathK) ? Math.max(0, Math.floor(opts.pathK)) : 12
+  const pathMaxDepth = Number.isFinite(opts?.pathMaxDepth) ? Math.max(2, Math.min(6, Math.floor(opts.pathMaxDepth))) : 4
+  // “hub-connector”增强：识别像 52 这种内部枢纽（连接多个 hub-adjacent 同色块），以及其周围同色桥梁（如 48/49/56/57）
+  const hubConnectorK = Number.isFinite(opts?.hubConnectorK) ? Math.max(0, Math.floor(opts.hubConnectorK)) : 14
+  try {
+    const stats = computeRegionStats(triangles)
+    const arr = Array.isArray(stats?.regions) ? [...stats.regions] : []
+    if (!arr.length) return []
+    // 先按“基础桥接分”取 top hubs（避免两跳加成喧宾夺主导致 hub 定义漂移）
+    arr.sort((a,b)=> (Number(b.scoreBase ?? b.score ?? 0)) - (Number(a.scoreBase ?? a.score ?? 0)))
+    const top = arr.slice(0, topK)
+    const topSet = new Set(top.map(r=>r.regionId))
+    const regionIdToRep = new Map(arr.map(r=>[r.regionId, r.repId]))
+    const adjMap = new Map(arr.map(r=>[r.regionId, Array.isArray(r.adjacentRegions) ? r.adjacentRegions : []]))
+
+    // hubs 邻居：直接邻接 top hub 的色块也有高价值（作为桥接过渡）
+    const neighborPool = []
+    if (neighborK > 0) {
+      for (const r of top) {
+        for (const rid2 of (r.adjacentRegions || [])) {
+          if (topSet.has(rid2)) continue
+          neighborPool.push(rid2)
+        }
+      }
+    }
+
+    // hubs 之间的“内部桥梁”：在 region 图上找 top hubs 两两之间的短路径（<=pathMaxDepth），把中间节点加入候选。
+    const pathPool = []
+    if (pathK > 0 && top.length >= 2) {
+      const hubRegionIds = top.slice(0, Math.min(6, top.length)).map(r=>r.regionId)
+      const count = new Map() // regionId -> weight
+      const bfsPath = (src, dst) => {
+        const q = [src]
+        const prev = new Map()
+        prev.set(src, -1)
+        let qi = 0
+        while (qi < q.length) {
+          const u = q[qi++]
+          // 深度限制
+          let du = 0
+          let tmp = u
+          while (tmp !== src && prev.has(tmp)) { du++; tmp = prev.get(tmp) }
+          if (du > pathMaxDepth) continue
+          if (u === dst) break
+          for (const v of (adjMap.get(u) || [])) {
+            if (prev.has(v)) continue
+            prev.set(v, u)
+            q.push(v)
+          }
+        }
+        if (!prev.has(dst)) return null
+        const path = []
+        let cur = dst
+        while (cur !== -1 && cur != null) {
+          path.push(cur)
+          cur = prev.get(cur)
+        }
+        path.reverse()
+        return path
+      }
+      for (let i=0;i<hubRegionIds.length;i++){
+        for (let j=i+1;j<hubRegionIds.length;j++){
+          const a = hubRegionIds[i], b = hubRegionIds[j]
+          const p = bfsPath(a,b)
+          if (!p || p.length < 3) continue
+          // 中间节点加权：越靠近中间越高（鼓励“从内部向外破局”）
+          const mid = Math.floor(p.length/2)
+          for (let k=1;k<p.length-1;k++){
+            const rid = p[k]
+            if (topSet.has(rid)) continue
+            const w = 1 + Math.max(0, (mid - Math.abs(k-mid))) * 0.6
+            count.set(rid, (count.get(rid)||0) + w)
+          }
+        }
+      }
+      const ranked = Array.from(count.entries()).map(([rid,w])=>({ rid, w })).sort((a,b)=>b.w-a.w)
+      for (const it of ranked.slice(0, pathK)) pathPool.push(it.rid)
+    }
+
+    // hubs 之间：同时邻接 >=2 个 top hub 的色块（你说的“前几名之间的色块区域”）
+    const betweenCandidates = []
+    if (betweenK > 0) {
+      for (const r of arr) {
+        if (topSet.has(r.regionId)) continue
+        const adj = Array.isArray(r.adjacentRegions) ? r.adjacentRegions : []
+        let hit = 0
+        for (const rid2 of adj) { if (topSet.has(rid2)) hit++ }
+        if (hit >= 2) {
+          betweenCandidates.push({ regionId: r.regionId, hit, score: Number(r.score||0) })
+        }
+      }
+      betweenCandidates.sort((a,b)=> (b.hit - a.hit) || (b.score - a.score))
+    }
+
+    // hub-connector：两跳桥接结构
+    // 目标：把“接壤高评分 hub 的同色小块”（hub-adjacent）与其共同邻居（connector）显式纳入候选，
+    // 让求解更容易从内部突破，把多个 hub 串起来。
+    const hubConnectorPool = []
+    if (hubConnectorK > 0 && top.length >= 2) {
+      const byRid = new Map(arr.map(r => [r.regionId, r]))
+      // 对每个 region，记录它一跳触达的 hub 集合（只对非-hub 区域有意义）
+      const hubAdj = new Set()
+      const hubAdjToHubs = new Map() // rid -> Set(hubRid)
+      for (const r of arr) {
+        if (topSet.has(r.regionId)) continue
+        const adj = Array.isArray(r.adjacentRegions) ? r.adjacentRegions : []
+        const hubs1 = []
+        for (const rid2 of adj) { if (topSet.has(rid2)) hubs1.push(rid2) }
+        if (hubs1.length > 0) {
+          hubAdj.add(r.regionId)
+          hubAdjToHubs.set(r.regionId, new Set(hubs1))
+        }
+      }
+      // 对每个候选 connector：看它邻居里哪些是 hubAdj；按“邻居颜色”分组
+      // 若某个颜色组里 >=2 个 hubAdj，且它们触达的 hub 联合 >=2，则这是强“内部枢纽”
+      const scored = []
+      for (const c of arr) {
+        const adj = Array.isArray(c.adjacentRegions) ? c.adjacentRegions : []
+        if (adj.length < 2) continue
+        const groups = new Map() // color -> rid[]
+        for (const ridN of adj) {
+          if (!hubAdj.has(ridN)) continue
+          const rn = byRid.get(ridN)
+          const col = rn?.color
+          if (!col) continue
+          const list = groups.get(col) || []
+          list.push(ridN)
+          groups.set(col, list)
+        }
+        if (groups.size === 0) continue
+        let bestGroup = null
+        let bestScore = -Infinity
+        for (const [col, list] of groups.entries()) {
+          if (!list || list.length < 2) continue
+          const hubsUnion = new Set()
+          for (const ridN of list) {
+            const hs = hubAdjToHubs.get(ridN)
+            if (hs) for (const h of hs) hubsUnion.add(h)
+          }
+          if (hubsUnion.size < 2) continue
+          // 评分：越多 hub 被串联，越多同色桥梁围绕同一 connector，越优先
+          // 轻微 tie-break：connector 自身的桥接 score（避免选到无意义边角）
+          const s = (hubsUnion.size * 80) + (list.length * 18) + (Number(c.score||0) * 0.08)
+          if (s > bestScore) {
+            bestScore = s
+            bestGroup = { color: col, members: list.slice(), hubsUnion: Array.from(hubsUnion) }
+          }
+        }
+        if (bestGroup) {
+          scored.push({
+            connectorRid: c.regionId,
+            connectorRep: c.repId,
+            score: bestScore,
+            members: bestGroup.members,
+          })
+        }
+      }
+      scored.sort((a,b)=> (b.score - a.score))
+      for (const it of scored.slice(0, hubConnectorK)) {
+        if (it.connectorRep != null) hubConnectorPool.push(it.connectorRep)
+        // 同色桥梁成员也纳入（这些往往是“内部动手点”，比如 48/49/56/57）
+        for (const ridN of (it.members || [])) {
+          const rep = regionIdToRep.get(ridN)
+          if (rep != null) hubConnectorPool.push(rep)
+        }
+      }
+    }
+
+    const out = []
+    const add = (rid) => {
+      const rep = regionIdToRep.get(rid)
+      if (rep != null) out.push(rep)
+    }
+    for (const r of top) add(r.regionId)
+    for (const rid of pathPool) add(rid)
+    // hub-connector 优先级高：在“between/neighbor”之前注入，让 worker 更倾向内部破局
+    for (const rep of hubConnectorPool) { if (rep != null) out.push(rep) }
+    for (const b of betweenCandidates.slice(0, betweenK)) add(b.regionId)
+    for (const rid of neighborPool.slice(0, neighborK)) add(rid)
+    return Array.from(new Set(out))
+  } catch {
+    return []
+  }
+}
+
+// 仅计算“内部桥梁锚点”：top hubs 两两之间短路径上的中间色块（越居中权重越高）
+function computeInternalBridgeAnchorIds(triangles, opts) {
+  const topK = Number.isFinite(opts?.topK) ? Math.max(2, Math.floor(opts.topK)) : 6
+  const pathK = Number.isFinite(opts?.pathK) ? Math.max(0, Math.floor(opts.pathK)) : 14
+  const pathMaxDepth = Number.isFinite(opts?.pathMaxDepth) ? Math.max(2, Math.min(6, Math.floor(opts.pathMaxDepth))) : 4
+  try {
+    const stats = computeRegionStats(triangles)
+    const arr = Array.isArray(stats?.regions) ? [...stats.regions] : []
+    if (!arr.length) return []
+    arr.sort((a,b)=> (b.score||0) - (a.score||0))
+    const top = arr.slice(0, topK)
+    if (top.length < 2) return []
+    const regionIdToRep = new Map(arr.map(r=>[r.regionId, r.repId]))
+    const adjMap = new Map(arr.map(r=>[r.regionId, Array.isArray(r.adjacentRegions) ? r.adjacentRegions : []]))
+    const hubRegionIds = top.map(r=>r.regionId)
+    const count = new Map()
+    const bfsPath = (src, dst) => {
+      const q = [src]
+      const prev = new Map()
+      prev.set(src, -1)
+      let qi = 0
+      while (qi < q.length) {
+        const u = q[qi++]
+        // depth bound (reconstruct depth cheaply)
+        let du = 0
+        let tmp = u
+        while (tmp !== src && prev.has(tmp)) { du++; tmp = prev.get(tmp) }
+        if (du > pathMaxDepth) continue
+        if (u === dst) break
+        for (const v of (adjMap.get(u) || [])) {
+          if (prev.has(v)) continue
+          prev.set(v, u)
+          q.push(v)
+        }
+      }
+      if (!prev.has(dst)) return null
+      const path = []
+      let cur = dst
+      while (cur !== -1 && cur != null) { path.push(cur); cur = prev.get(cur) }
+      path.reverse()
+      return path
+    }
+    for (let i=0;i<hubRegionIds.length;i++){
+      for (let j=i+1;j<hubRegionIds.length;j++){
+        const a = hubRegionIds[i], b = hubRegionIds[j]
+        const p = bfsPath(a,b)
+        if (!p || p.length < 3) continue
+        const mid = Math.floor(p.length/2)
+        for (let k=1;k<p.length-1;k++){
+          const rid = p[k]
+          const w = 1 + Math.max(0, (mid - Math.abs(k-mid))) * 0.8
+          count.set(rid, (count.get(rid)||0) + w)
+        }
+      }
+    }
+    const ranked = Array.from(count.entries()).map(([rid,w])=>({ rid, w })).sort((a,b)=>b.w-a.w)
+    const out = []
+    for (const it of ranked.slice(0, pathK)) {
+      const rep = regionIdToRep.get(it.rid)
+      if (rep != null) out.push(rep)
+    }
+    return Array.from(new Set(out))
+  } catch {
+    return []
+  }
+}
+
+// 仅计算“真实 top hubs”：只取桥接评分最高的一批色块代表点，作为 worker 的 hub 目标集合（用于奖励/惩罚/内部破局判定）。
+function computeHubAnchorIds(triangles, opts) {
+  const topK = Number.isFinite(opts?.topK) ? Math.max(2, Math.floor(opts.topK)) : 6
+  try {
+    const stats = computeRegionStats(triangles)
+    const arr = Array.isArray(stats?.regions) ? [...stats.regions] : []
+    if (!arr.length) return []
+    // “真实 hubs”只看基础桥接分，防止两跳加成把 connector 误抬为 hub
+    arr.sort((a,b)=> (Number(b.scoreBase ?? b.score ?? 0)) - (Number(a.scoreBase ?? a.score ?? 0)))
+    const out = []
+    for (const r of arr.slice(0, topK)) {
+      if (r?.repId != null) out.push(r.repId)
+    }
+    return Array.from(new Set(out))
+  } catch {
+    return []
+  }
+}
+
+// 两跳候选列表：只看“两跳分”，不看总分/一跳分。
+// 定义：优先选择 connector（两步可串联多个高评分 hub）及其同色桥梁成员；
+// 返回按两跳分排序的 repId 列表（用于并行 A 组线程分工）。
+function computeInternalTwoHopIds(triangles, opts) {
+  const hubsK = Number.isFinite(opts?.hubsK) ? Math.max(2, Math.floor(opts.hubsK)) : 6
+  const topK = Number.isFinite(opts?.topK) ? Math.max(1, Math.floor(opts.topK)) : 6
+  try {
+    const stats = computeRegionStats(triangles)
+    const arr = Array.isArray(stats?.regions) ? [...stats.regions] : []
+    if (!arr.length) return []
+    // hubs 只按基础分定义（避免两跳加成喧宾夺主）
+    const hubs = [...arr].sort((a,b)=> Number(b.scoreBase ?? b.score ?? 0) - Number(a.scoreBase ?? a.score ?? 0)).slice(0, hubsK)
+    const hubSet = new Set(hubs.map(h=>h.regionId))
+    const scored = []
+    for (const r of arr) {
+      if (r?.repId == null) continue
+      if (hubSet.has(r.regionId) || r.isHub) continue // 内部线程不盯 hub 本体
+      // 两跳分：只由 connector 串联强度驱动（hub 权重覆盖 + 同色桥数量）
+      // connector：直接用 connectorHubWeight/Count/MemberCount
+      // member：用 memberConnectorHubWeight/Count/MemberCount（由 computeRegionStats 记录其所属 connector 的两跳强度）
+      let w = 0
+      let c = 0
+      let m = 0
+      if (r.isConnector) {
+        w = Number(r.connectorHubWeight || 0)
+        c = Number(r.connectorHubCount || 0)
+        m = Number(r.connectorMemberCount || 0)
+      } else if (r.isConnectorMember) {
+        w = Number(r.memberConnectorHubWeight || 0)
+        c = Number(r.memberConnectorHubCount || 0)
+        m = Number(r.memberConnectorMemberCount || 0)
+      } else {
+        continue
+      }
+      const twoHop = (w * 120) + (c * 40) + (m * 18)
+      if (twoHop > 0) scored.push({ repId: r.repId, score: twoHop })
+    }
+    scored.sort((a,b)=> b.score - a.score)
+    return Array.from(new Set(scored.slice(0, topK).map(x=>x.repId)))
+  } catch {
+    return []
+  }
+}
 
 // 设置默认的求解器开关与权重，并合并本地持久化配置（localStorage）
 if (typeof window !== 'undefined') {
@@ -31,7 +417,7 @@ if (typeof window !== 'undefined') {
     // 基本搜索策略（更偏向“尽快拿到可行解”）
     enableLB: true,
     enableLookahead: true,
-    enableLookaheadDepth2: false,
+    enableLookaheadDepth2: true,
     enableIncremental: true,
     enableBeam: true,
     beamWidth: 32,
@@ -48,17 +434,28 @@ if (typeof window !== 'undefined') {
     useDFSFirst: true,
     returnFirstFeasible: true,
     // 严格模式（A* 最短路）
-    strictMode: false,
+    // 注意：并行模式下我们会把“严格模式”默认分配给少量线程（1-2个）长期跑，不会让所有线程都进入 strict IDA*
+    strictMode: true,
     logPerf: true,
     // 学习优先级与 SAT 宏规划
     enableLearningPrioritizer: true,
-    enableSATPlanner: false,
+    enableSATPlanner: true,
+    // 分块与宏规划（试验性）：默认开启，便于观察宏顺序日志并提高命中率
+    enableRAGMacro: true,
+    // 严格模式增强：默认启用 IDA* + TT min-f 复用
+    useIDAStar: true,
+    enableTTMinFReuse: true,
+    // 默认启发式：若已加载 pdb_6x6，则严格线程会自动切到 PDB；否则仍可回退到 dynamic_rag_max
+    heuristicName: 'pdb6x6_max',
     // 后端遥测开关与服务地址
     enableTelemetry: true,
     serverBaseUrl: serverBaseDefault,
     // 进度与时间预算
     workerTimeBudgetMs: 300000,
-    parallelWorkers: 3,
+    // 默认并行线程：按用户要求，直接最强 24（会按硬件核心数保护，除非开启“超核”）
+    parallelWorkers: 24,
+    // 默认开启超核（用户要求最强 24 线程并行）；若浏览器卡顿可在性能面板关闭
+    parallelOvercommit: true,
     preprocessTimeBudgetMs: 20000,
     progressComponentsIntervalMs: 0,
     progressDFSIntervalMs: 100,
@@ -94,11 +491,49 @@ if (typeof window !== 'undefined') {
     ...(window.SOLVER_FLAGS || {}),
     ...(persisted || {}),
   }
+  // 用户要求：默认并行线程升到 24。为避免旧 localStorage（如 3）残留，这里强制覆盖并写回。
+  try { window.SOLVER_FLAGS.parallelWorkers = 24 } catch {}
+  try { if (window.SOLVER_FLAGS.parallelOvercommit == null) window.SOLVER_FLAGS.parallelOvercommit = true } catch {}
   // 强制开启遥测：不受持久化配置影响，确保自动上传策略与学习统计
   try {
     window.SOLVER_FLAGS.enableTelemetry = true
+    // 用户要求：把圈选的高收益开关作为默认项（如本地旧配置缺失/过旧，则迁移到新默认）
+    const DEFAULT_PRESET_VER = 1
+    const pv = Number(persisted?.__presetVersion || 0)
+    const needPresetUpgrade = !(pv >= DEFAULT_PRESET_VER)
+    if (needPresetUpgrade) {
+      try {
+        window.SOLVER_FLAGS.enableLookaheadDepth2 = true
+        window.SOLVER_FLAGS.strictMode = true
+        window.SOLVER_FLAGS.useIDAStar = true
+        window.SOLVER_FLAGS.enableTTMinFReuse = true
+        window.SOLVER_FLAGS.enableSATPlanner = true
+        window.SOLVER_FLAGS.enableRAGMacro = true
+        window.SOLVER_FLAGS.enablePDBAutoLoad = true
+        if (!window.SOLVER_FLAGS.pdbBaseUrl) window.SOLVER_FLAGS.pdbBaseUrl = '/pdb/'
+        window.SOLVER_FLAGS.heuristicName = window.SOLVER_FLAGS.heuristicName || 'pdb6x6_max'
+      } catch {}
+    }
+    // 强制写回默认并行线程，避免面板/后续会话仍显示旧值（例如 3）
+    try { window.SOLVER_FLAGS.parallelWorkers = 24 } catch {}
+    try { if (window.SOLVER_FLAGS.parallelOvercommit == null) window.SOLVER_FLAGS.parallelOvercommit = true } catch {}
     // 写回本地，避免旧配置残留导致后续会话关闭遥测
-    const persistedNext = { ...(persisted||{}), enableTelemetry: true }
+    const persistedNext = {
+      ...(persisted||{}),
+      enableTelemetry: true,
+      ...(needPresetUpgrade ? {
+        __presetVersion: DEFAULT_PRESET_VER,
+        enableLookaheadDepth2: true,
+        strictMode: true,
+        useIDAStar: true,
+        enableTTMinFReuse: true,
+        enableSATPlanner: true,
+        enableRAGMacro: true,
+        enablePDBAutoLoad: true,
+        pdbBaseUrl: '/pdb/',
+        heuristicName: (persisted||{}).heuristicName || 'pdb6x6_max',
+      } : {}),
+    }
     localStorage.setItem('solverFlags', JSON.stringify({ ...window.SOLVER_FLAGS, ...persistedNext }))
   } catch {}
   // 启动时根据开关尝试默认加载 PDB（仅一次），优先远程
@@ -139,7 +574,10 @@ attachSolverToWindow()
 const pMod = (a, n) => (a % n + n) % n
 
 function App() {
-  console.log('App component mounting...')
+  // 避免每次渲染都刷屏：只在首次挂载时打印一次（调试用）
+  useEffect(() => {
+    try { console.log('App mounted') } catch {}
+  }, [])
   // 简易哈希路由：用于“说明”子页
   const [route, setRoute] = useState(() => (typeof window!=='undefined' ? window.location.hash : ''))
   useEffect(() => {
@@ -177,6 +615,13 @@ const [triangleSize, setTriangleSize] = useState(30)
   const [bestStartId, setBestStartId] = useState(null)
   const [status, setStatus] = useState('请上传图片')
   const [editMode, setEditMode] = useState(true)
+  // 色块统计（region stats）
+  const [regionStats, setRegionStats] = useState(null)
+  const [regionStatsPng, setRegionStatsPng] = useState(null)
+  const [regionStatsReady, setRegionStatsReady] = useState(false)
+  const [regionStatsComputing, setRegionStatsComputing] = useState(false)
+  const [showRegionStats, setShowRegionStats] = useState(false)
+  const [regionCountLive, setRegionCountLive] = useState(null)
   const [rotation, setRotation] = useState(0)
   // 网格排列方向：horizontal（底边水平）/ vertical（底边竖直）
   const [gridArrangement, setGridArrangement] = useState('vertical')
@@ -283,22 +728,39 @@ const [triangleSize, setTriangleSize] = useState(30)
   // 监听 targetColorCount 变化，实时重新识别
   useEffect(() => {
     if (imgBitmap && targetColorCount !== '') {
-      const run = async () => {
-        setStatus(`正在重新识别为 ${targetColorCount} 种颜色...`)
-        const { palette } = await quantizeImage(imgBitmap, parseInt(targetColorCount))
-        setPalette(palette)
-        setInitialPalette(palette)
-        if (grid) {
-          const mapped = await mapImageToGrid(imgBitmap, grid, palette)
-          setTriangles(mapped)
-          setUndoStack([mapped.map(t => t.color)])
-          setRedoStack([])
-          setStatus(`已重新生成（强制 ${palette.length} 色）`)
-        }
-      }
-      run()
+      let cancelled = false
+      const tc = parseInt(targetColorCount)
+      if (!Number.isFinite(tc) || tc < 2) return
+      const timer = setTimeout(() => {
+        ;(async () => {
+          try {
+            setStatus(`正在重新识别为 ${tc} 种颜色...`)
+            const { palette } = await quantizeImage(imgBitmap, tc)
+            if (cancelled) return
+            setPalette(palette)
+            setInitialPalette(palette)
+            if (grid) {
+              const mapped = await mapImageToGrid(imgBitmap, grid, palette)
+              if (cancelled) return
+              // 若存在检测到的网格参数，额外做一次“同格子多数投票”收尾校准（减少残留错色）
+              try { if (detectedGrid && detectedGrid.success) rectifyColorsByGrid(mapped, detectedGrid) } catch {}
+              setTriangles(mapped)
+              setUndoStack([mapped.map(t => t.color)])
+              setRedoStack([])
+              setStartId(null)
+              setSelectedIds([])
+              setSteps([])
+              setStatus(`已重新生成（强制 ${palette.length} 色）`)
+            }
+          } catch (e) {
+            if (cancelled) return
+            setStatus(`强制颜色数识别失败：${String(e?.message || e).slice(0, 120)}`)
+          }
+        })()
+      }, 220)
+      return () => { cancelled = true; try { clearTimeout(timer) } catch {} }
     }
-  }, [targetColorCount, imgBitmap])
+  }, [targetColorCount, imgBitmap, grid, detectedGrid])
 
   // 点击“添加颜色”始终进入色带选择；选择后由 onAddColorFromPicker 进行泼涂或加入集合
   const onStartAddColorPick = useCallback(() => {
@@ -447,10 +909,22 @@ const [triangleSize, setTriangleSize] = useState(30)
           rectifyMode: true, // 新增标志，指示这是强力纠正
           applyDenoise: false // 禁止同化逻辑，确保涂色不被“平滑”掉
       })
+      // 若我们有网格检测信息（anchors/spacing/angles），则做一次“同格子多数投票”的收尾校准
+      // 这能修复少量残留错色（通常是边界/压缩噪点导致的单点误判）
+      try {
+        if (detectedGrid && detectedGrid.success) {
+          const changed = rectifyColorsByGrid(mapped, detectedGrid)
+          if (changed) {
+            // 不打扰用户，只在状态里轻提示
+            setStatus('几何校准已完成：已根据色块边界优化网格，并修复残留错色。')
+          }
+        }
+      } catch {}
       
       setTriangles(mapped)
       setUndoStack(prev => [...prev, mapped.map(t => t.color)])
-      setStatus('几何校准已完成：已根据色块边界优化网格。')
+      // 若上面的“残留错色修复”已更新 status，这里不要覆盖
+      setStatus(prev => (String(prev||'').includes('残留错色') ? prev : '几何校准已完成：已根据色块边界优化网格。'))
       
     } catch (err) {
       console.error('Rectify Apply Error:', err)
@@ -553,6 +1027,14 @@ const [triangleSize, setTriangleSize] = useState(30)
   const [solveProgress, setSolveProgress] = useState(null)
   // 实时滚动小窗口：进度日志
   const [progressLogs, setProgressLogs] = useState([])
+  // 让“合格解日志落盘”拿到最新的 progressLogs（避免闭包陈旧）
+  const progressLogsRef = useRef([])
+  useEffect(() => { progressLogsRef.current = progressLogs }, [progressLogs])
+
+  // 合格解日志：独立存储，不随“清除解缓存”删除
+  const [showSolveLogModal, setShowSolveLogModal] = useState(false)
+  const [qualifiedLogs, setQualifiedLogs] = useState([])
+  const [selectedQualifiedLog, setSelectedQualifiedLog] = useState(null)
 
   const canvasRef = useRef(null)
   const progressLastRef = useRef(0)
@@ -641,12 +1123,12 @@ const contribRef = useRef({ branch_pruned: 0, enqueued: 0, expanded: 0, critical
     const bitmap = await createImageBitmap(file, { imageOrientation: 'from-image' })
     setImgBitmap(bitmap)
     
-    // 重置状态，确保每次上传新图片都使用自动模式
-    setTargetColorCount('')
+    // 不重置用户的“强制颜色数”：上传新图片也应尊重当前输入
     setLoadedProject(false)
 
-    // 强制使用自动颜色数量进行初次识别
-    const { palette } = await quantizeImage(bitmap)
+    // 初次识别：若用户指定了强制颜色数，则直接按该数量量化
+    const tc0 = parseInt(targetColorCount)
+    const { palette } = await quantizeImage(bitmap, (Number.isFinite(tc0) && tc0 >= 2) ? tc0 : undefined)
     setPalette(palette)
     setInitialPalette(palette)
     setSelectedColor(palette[0] ?? null)
@@ -782,13 +1264,13 @@ const contribRef = useRef({ branch_pruned: 0, enqueued: 0, expanded: 0, critical
            setGridOffsetY(autoOffsetY)
 
            // 保存精确参数，供后续 rebuild 使用（绕过 UI 的整数限制）
+           // 重要：网格必须是等边三角形，因此不保存/不使用 customH（高度只由 side 推导）
            setPreciseGridParams({
              side: detectedSide, // 原始检测值
-             height: gridSpec.spacing, // 新增：精确高度 (H)
              offsetX: autoOffsetX,
              offsetY: autoOffsetY,
              arrangement: finalArrangement,
-             bounds: gridSpec.bounds // 保存检测到的边界
+             bounds: gridSpec.bounds // 仅用于可视化/裁剪参考
            })
 
            setStatus(`已自动对齐网格 (精确边长: ${detectedSide.toFixed(2)})`)
@@ -898,25 +1380,11 @@ const contribRef = useRef({ branch_pruned: 0, enqueued: 0, expanded: 0, critical
              offX = preciseGridParams.offsetX
              offY = preciseGridParams.offsetY
              arr = preciseGridParams.arrangement
-             customH = preciseGridParams.height 
+             // 等边网格：不使用 customH（避免三角形被拉伸成非等边）
+             customH = null
              
-             // 应用检测到的边界 (Bounds)
-             // 如果 detectedGrid 中包含 bounds 信息，我们使用它来进一步校准 offX/offY
-             // 使得网格尽可能贴合边界
-             if (detectedGrid && detectedGrid.bounds) {
-                const b = detectedGrid.bounds
-                // 这里的策略是：让网格的某个原点 (0,0) 对应到 bounds 的左上角 (b.x, b.y)
-                // 但 buildTriangleGrid 的 offsetX 是相对于画布 (0,0) 的
-                // 所以我们将 offsetX 设置为 b.x, offsetY 设置为 b.y
-                // 注意：这可能会覆盖掉 detectGrid 中计算出的 anchor based offset
-                // 但理论上 anchor based offset 应该和 boundary 是自洽的
-                // 我们可以选择信任 boundary 作为“绝对位置”
-                
-                // 为了保险，我们只在自动检测刚完成时应用这个，或者如果用户没有手动拖动过
-                // 这里简单起见，直接应用
-                offX = b.x
-                offY = b.y
-             }
+             // 注意：detectedGrid.bounds 是“可见网格线段的外包矩形”，用于裁剪/可视化更合适，
+             // 不应直接覆盖周期性 offset（offset 是取模意义上的相位），否则会导致网格整体漂移。
              
              // 保持 UI 状态一致
              if (arr !== gridArrangement) setGridArrangement(arr)
@@ -1340,6 +1808,12 @@ const contribRef = useRef({ branch_pruned: 0, enqueued: 0, expanded: 0, critical
 
   // 失败回退：生成接近统一的贪心步骤（5分钟超时或未统一时）
   const pickHeuristicStartId = useCallback((tris) => {
+    // 优先按“桥接联通价值”选起点（与统计面板同款评分一致），避免从角落低价值块起手
+    try {
+      const focus = computeFocusAnchorIds(tris, { topK: 12, betweenK: 6, neighborK: 6 })
+      if (focus && focus.length) return focus[0]
+    } catch {}
+    // 兜底：若统计失败再退回旧逻辑
     const counts = new Map()
     for (const t of tris) {
       if (t.deleted || t.color === 'transparent') continue
@@ -1385,26 +1859,88 @@ const contribRef = useRef({ branch_pruned: 0, enqueued: 0, expanded: 0, critical
     return visited.size
   }, [])
 
-  const computeGreedyPath = useCallback((tris, pal, startIdLocal, limit) => {
+  // 兜底贪心：也按“桥接价值”走，多锚点（每步可换 startId），返回 action steps：[{startId,color}]
+  const computeGreedyPath = useCallback((tris, pal, startCandidates, limit) => {
     const idToIndex = new Map(tris.map((t, i) => [t.id, i]))
     const neighbors = tris.map(t => t.neighbors)
     const colors = tris.map(t => t.color)
-    let region = computeRegion(colors, startIdLocal, idToIndex, neighbors)
+
+    const validStartIds = (Array.isArray(startCandidates) ? startCandidates : [])
+      .filter(sid => sid != null && idToIndex.has(sid) && !tris[idToIndex.get(sid)]?.deleted && tris[idToIndex.get(sid)]?.color !== 'transparent')
+    const fallbackSid = validStartIds[0] ?? pickHeuristicStartId(tris)
+
+    const regionBridgeLocal = (regionSet) => {
+      // 轻量桥接信号：邻接颜色数 + 邻接边界数（不看面积）
+      const adjColors = new Set()
+      let boundaryEdges = 0
+      for (const id of regionSet) {
+        const idx = idToIndex.get(id)
+        const c0 = colors[idx]
+        for (const nb of neighbors[idx] || []) {
+          const nidx = idToIndex.get(nb)
+          if (nidx == null) continue
+          const tn = tris[nidx]
+          if (!tn || tn.deleted) continue
+          const cn = colors[nidx]
+          if (!cn || cn === 'transparent') continue
+          if (cn !== c0) { adjColors.add(cn); boundaryEdges++ }
+        }
+      }
+      return (adjColors.size * 12) + (boundaryEdges * 0.35)
+    }
+
+    const applyOne = (sid, nextColor) => {
+      const region = computeRegion(colors, sid, idToIndex, neighbors)
+      for (const id of region) colors[idToIndex.get(id)] = nextColor
+    }
+
     const path = []
     let guard = 0
-    while (!isUniformColors(colors, tris) && path.length < limit && guard < 5000) {
+    while (!isUniformColors(colors, tris) && path.length < limit && guard < 6000) {
       guard++
-      const curColor = colors[idToIndex.get(startIdLocal)]
-      let best = null, bestSize = -1
+
+      // 选“当前桥接价值最高”的锚点（在 hubs 池里轮）
+      let bestSid = fallbackSid
+      let bestSidScore = -Infinity
+      for (const sid of (validStartIds.length ? validStartIds : [fallbackSid])) {
+        const region = computeRegion(colors, sid, idToIndex, neighbors)
+        const s = regionBridgeLocal(region)
+        if (s > bestSidScore) { bestSidScore = s; bestSid = sid }
+      }
+
+      const curColor = colors[idToIndex.get(bestSid)]
+      const region0 = computeRegion(colors, bestSid, idToIndex, neighbors)
+      const baseBridge = regionBridgeLocal(region0)
+      let bestMove = null
+      let bestScore = -Infinity
       for (const c of pal) {
         if (!c || c === curColor) continue
-        const size = expandedSize(colors, region, neighbors, c, idToIndex)
-        if (size > bestSize) { bestSize = size; best = c }
+        // 禁止短周期振荡：A -> B -> A（同一 startId 下最常见的“来回换色不扩张”）
+        if (path.length >= 2) {
+          const prev2 = path[path.length - 2]
+          const prev1 = path[path.length - 1]
+          if (prev2?.startId === bestSid && prev1?.startId === bestSid && prev2?.color === c) continue
+        }
+        // 评分：优先桥接提升，其次扩张（弱）
+        const size1 = expandedSize(colors, region0, neighbors, c, idToIndex)
+        const delta = size1 - region0.size
+        // 硬约束：不允许“0 扩张”步（会白白浪费步数）
+        if (delta <= 0) continue
+        // 模拟一步（局部复制：只改 region0）
+        const changed = []
+        for (const id of region0) { const idx = idToIndex.get(id); changed.push([idx, colors[idx]]); colors[idx] = c }
+        const region1 = computeRegion(colors, bestSid, idToIndex, neighbors)
+        const bridge1 = regionBridgeLocal(region1)
+        // 回滚
+        for (const [idx, old] of changed) colors[idx] = old
+
+        const score = (bridge1 - baseBridge) * 2.5 + (size1 - region0.size) * 0.6
+        if (score > bestScore) { bestScore = score; bestMove = c }
       }
-      if (!best) break
-      for (const id of region) { colors[idToIndex.get(id)] = best }
-      region = computeRegion(colors, startIdLocal, idToIndex, neighbors)
-      path.push(best)
+      // 没有任何能扩张的 move，直接停（否则会出现“内部来回换色”）
+      if (!bestMove) break
+      applyOne(bestSid, bestMove)
+      path.push({ startId: bestSid, color: bestMove })
     }
     return path
   }, [computeRegion, expandedSize, isUniformColors])
@@ -1416,10 +1952,19 @@ const contribRef = useRef({ branch_pruned: 0, enqueued: 0, expanded: 0, critical
       if (editMode) { setStatus('请先保存编辑，再进行自动求解'); return }
       if (triangles.length === 0) { setStatus('当前画布为空，无法求解'); return }
       if (!palette || palette.length < 2) { setStatus('调色板颜色不足，无法求解'); return }
+      // 关键：若用 file:// 直接打开页面，Worker（尤其 module worker）会被浏览器拦截，必然“启动失败”
+      try {
+        if (typeof window !== 'undefined' && window.location && window.location.protocol === 'file:') {
+          setStatus('检测到当前为 file:// 直接打开页面。浏览器会拦截 Worker，无法开始计算。请用本地服务器运行：npm run dev 或 npm run preview。')
+          return
+        }
+      } catch {}
       setSolving(true)
-      setStatus('正在计算最少步骤（自动选择起点）…')
+      setStatus('计算中…')
       setSolveProgress({ phase: 'init' })
       setProgressLogs([])
+      // 避免“上一次的不合格方案”残留造成误解：本次点击即清空旧步骤
+      try { setSteps([]); setBestStartId(null) } catch {}
       solveStartRef.current = Date.now()
       contribRef.current = { branch_pruned: 0, enqueued: 0, expanded: 0, critical_hits: 0, path_len_reduction: 0, lb_improve_total: 0 }
       // 启动遥测 Run（不阻塞求解）
@@ -1428,58 +1973,40 @@ const contribRef = useRef({ branch_pruned: 0, enqueued: 0, expanded: 0, critical
       const telemetrySafeLog = async (payload)=>{ try{ if(__runId) await telemetryLogEvent(__runId, payload) }catch{} }
       // 让出一次事件循环，确保“计算中…”与状态文案先渲染
       await new Promise(r => setTimeout(r, 0))
-      // 优先尝试缓存命中
+      // 1) 先查缓存（本地 IndexedDB → 后端 MongoDB），验证通过则直接返回（无需再计算）
       try {
-        const cache = await getCachePath(graphSignature)
-        const cachedPath = cache?.path
-        const cachedStart = cache?.start_id
-        const cachedMin = cache?.min_steps
-        if (cachedPath && cachedPath.length>0 && cachedStart!=null) {
-          // 前端统一性二次验证，避免错误缓存直接使用
-          const idToIndex = new Map(triangles.map((t,i)=>[t.id,i]))
-          const neighbors = triangles.map(t=>t.neighbors)
-          const checkUniformPathCached = (startIdLocal, pathLocal)=>{
-            if (startIdLocal==null || !Array.isArray(pathLocal) || pathLocal.length===0) return false
-            const idxStart = idToIndex.get(startIdLocal)
-            if (idxStart==null) return false
-            let colorsLocal = triangles.map(t=>t.color)
-            for(let i=0;i<pathLocal.length;i++){
-              const stepColor = pathLocal[i]
-              const startColorCur = colorsLocal[idxStart]
-              if (stepColor===startColorCur) { return false }
-              const regionSet = new Set(); const q=[startIdLocal]; const visited=new Set([startIdLocal])
-              while(q.length){
-                const id=q.shift(); const idx=idToIndex.get(id)
-                if (idx==null) return false
-                if (colorsLocal[idx]!==startColorCur) continue
-                regionSet.add(id)
-                const nbs = neighbors[idx] || []
-                for(const nb of nbs){ if(!visited.has(nb)){ visited.add(nb); q.push(nb) } }
-              }
-              if (regionSet.size===0) return false
-              for(const id of regionSet){ colorsLocal[idToIndex.get(id)] = stepColor }
-            }
-            const finalTris = triangles.map((t,i)=>({ ...t, color: colorsLocal[i] }))
-            return isUniform(finalTris)
-          }
-          const okUniform = checkUniformPathCached(cachedStart, cachedPath)
-          const okFlags = (cache?.is_unified===true && cache?.quality==='final')
-          if (okUniform && okFlags) {
-            const snapshots = await captureCanvasPNG(triangles, canvasRef.current.width, canvasRef.current.height, cachedStart, cachedPath.slice(0, Math.max(1, Math.min(40, cachedPath.length))))
-             setSteps([{ path: cachedPath, images: [snapshots] }])
+        const cached = await getCachedSolution(graphSignature)
+        if (cached?.paths?.[0] && cached?.startId != null) {
+          const cachedPath = cached.paths[0]
+          const cachedStart = cached.startId
+          const cacheSource = cached?.__cacheSource || '?'
+          // 统一性验证 + 步数上限验证（严格）
+          const okUniform = verifyUnifiedPath({ triangles, startId: cachedStart, path: cachedPath })
+          const okStep = (!Number.isFinite(maxStepsLimit) || (Array.isArray(cachedPath) && cachedPath.length <= maxStepsLimit))
+          if (okUniform && okStep) {
+            const snapshots = await buildStepSnapshots({ triangles, width: canvasRef.current.width, height: canvasRef.current.height, startId: cachedStart, path: cachedPath, maxSnap: 240, includeInitial: true })
+            setSteps([{ path: cachedPath, images: snapshots }])
             setBestStartId(cachedStart)
-            setStatus(`缓存预览：起点 #${cachedStart}，步骤 ${cachedMin??cachedPath.length}（继续计算中）`)
+            setStatus(`缓存命中(${cacheSource})：起点 #${cachedStart}，步骤 ${cachedPath.length}，上限 ${Number.isFinite(maxStepsLimit) ? maxStepsLimit : '∞'}`)
             setSolveProgress(null)
-            try { await telemetrySafeLog({ status:'cache_preview', min_steps: cachedMin??cachedPath.length, best_start_id: cachedStart, graph_signature: graphSignature }) } catch {}
-            try { await uploadStrategyAuto(triangles, palette, 'auto_solve', cachedStart, cachedPath) } catch {}
+            try { await telemetrySafeLog({ status:'cache_hit', min_steps: cachedPath.length, best_start_id: cachedStart, graph_signature: graphSignature }) } catch {}
+            try { await uploadStrategyAuto(triangles, palette, 'auto_solve_cache', cachedStart, cachedPath) } catch {}
+            try { if(__runId) await telemetryFinishRun(__runId, { status:'cache_hit', min_steps: cachedPath.length, best_start_id: cachedStart, time_ms: Date.now() - solveStartRef.current, graph_signature: graphSignature }) } catch {}
+            setSolving(false)
+            return
           } else {
-            setStatus('缓存存在但未通过统一性校验，继续计算…')
-            await telemetrySafeLog({ status:'cache_validation_failed', reason: okUniform? 'flag_not_final' : 'not_uniform', cached_len: cachedPath.length })
+            await telemetrySafeLog({ status:'cache_rejected', reason: okUniform ? (okStep?'unknown':'over_step_limit') : 'not_uniform', cached_len: cachedPath.length })
+            // 不合格缓存：直接删除（本地 + 后端），避免继续命中脏数据
+            try { await deleteCachedSolutionEverywhere(graphSignature) } catch {}
           }
         }
       } catch {}
       // 获取推荐参数与优先起点
       let preferredStartId = null
+      // 本次求解复用：高价值锚点池（避免重复 computeRegionStats）
+      let solveFocusAnchors = null
+      // 本次求解复用：真实 top hubs（供 worker 的 hubAnchorIds）
+      let solveHubAnchors = null
       try {
         const rec = await getRecommendation(graphSignature)
         if (rec?.flags_overrides) { window.SOLVER_FLAGS = { ...(window.SOLVER_FLAGS||{}), ...(rec.flags_overrides||{}) } }
@@ -1492,76 +2019,55 @@ const contribRef = useRef({ branch_pruned: 0, enqueued: 0, expanded: 0, critical
       // 强制使用 Web Worker，不再回退到主线程
       if (!result) {
         try {
-          // -------------------- 8 Worker 并行调度 --------------------
+          // -------------------- 并行 Worker 调度（最多 24，4 个一组策略） --------------------
           const HARD_BUDGET_MS = 180000
-          const PAR_N = 8
           const PAR_GROUP = 4
+          const uiFlags0 = (window.SOLVER_FLAGS || {})
+          const wantRaw = Number(uiFlags0.parallelWorkers)
+          const want = Number.isFinite(wantRaw) ? Math.max(1, Math.min(24, Math.floor(wantRaw))) : 8
+          const hw = (typeof navigator !== 'undefined' && navigator.hardwareConcurrency) ? Number(navigator.hardwareConcurrency) : null
+          const allowOver = !!uiFlags0.parallelOvercommit
+          // 默认保护：不超出硬件核心数（除非开启“超核”）
+          const safeCap = (Number.isFinite(hw) && hw > 0 && !allowOver) ? Math.max(1, Math.min(24, hw)) : 24
+          const capped = Math.min(want, safeCap)
+          // 按 4 个一组向上取整（至少 8 以覆盖 2 组策略），但不超过 capped
+          const groups = Math.max(2, Math.ceil(capped / PAR_GROUP))
+          const PAR_N = Math.min(24, groups * PAR_GROUP)
 
-          // 选 8 个不同的 preferredStartId（边界得分高），尽量减少重复工作
-          const computePreferredStartIds = (tris, k=8) => {
+          // 一次求解只算一次 anchors（避免重复 computeRegionStats）
+          const topK = Math.max(8, Math.min(18, PAR_N))
+          const hubs = (function(){
             try {
-              const idToIndex = new Map(tris.map((t,i)=>[t.id,i]))
-              const neighbors = tris.map(t=>t.neighbors)
-              const active = []
-              for (let i=0;i<tris.length;i++){
-                const t = tris[i]
-                if (!t || t.deleted || !t.color || t.color==='transparent') continue
-                active.push(t.id)
+              const focus = computeFocusAnchorIds(triangles, { topK, betweenK: Math.max(6, Math.floor(topK/2)), neighborK: Math.max(6, Math.floor(topK/2)), pathK: Math.max(8, Math.floor(topK/2)), pathMaxDepth: 6 })
+              if (preferredStartId!=null) {
+                const idx = focus.indexOf(preferredStartId)
+                if (idx > 0) { focus.splice(idx,1); focus.unshift(preferredStartId) }
+                if (idx < 0) focus.unshift(preferredStartId)
               }
-              const score = (id)=>{
-                const idx = idToIndex.get(id)
-                if (idx==null) return -Infinity
-                const t0 = tris[idx]
-                const c0 = t0?.color
-                if (!c0 || c0==='transparent' || t0.deleted) return -Infinity
-                let s = 0
-                const nbs = neighbors[idx] || []
-                for (const nb of nbs){
-                  const nidx = idToIndex.get(nb)
-                  if (nidx==null) continue
-                  const tn = tris[nidx]
-                  if (!tn || tn.deleted || !tn.color || tn.color==='transparent') continue
-                  if (tn.color !== c0) s++
-                }
-                return s
-              }
-              // 采样，避免全量评分过重
-              const SAMPLE_MAX = 1200
-              const sample = []
-              if (active.length <= SAMPLE_MAX) {
-                for (const id of active) sample.push(id)
-              } else {
-                const step = Math.max(1, Math.floor(active.length / 900))
-                for (let i=0;i<active.length && sample.length<900;i+=step) sample.push(active[i])
-                for (let i=0;i<300;i++) sample.push(active[Math.floor(Math.random()*active.length)])
-              }
-              const arr = []
-              const seen = new Set()
-              for (const id of sample){
-                if (id==null || seen.has(id)) continue
-                seen.add(id)
-                const s = score(id)
-                if (Number.isFinite(s)) arr.push({ id, s })
-              }
-              arr.sort((a,b)=> b.s - a.s)
-              const out = []
-              const used = new Set()
-              // 推荐起点优先塞进去
-              if (preferredStartId!=null) { out.push(preferredStartId); used.add(preferredStartId) }
-              for (const it of arr){
-                if (out.length >= k) break
-                if (!used.has(it.id)) { out.push(it.id); used.add(it.id) }
-              }
-              return out
+              return Array.from(new Set(focus))
             } catch { return preferredStartId!=null ? [preferredStartId] : [] }
+          })()
+          // 缓存供后续兜底使用（避免重复计算）
+          solveFocusAnchors = hubs
+          const hubAnchors = (function(){
+            try { return computeHubAnchorIds(triangles, { topK: 6 }) } catch { return [] }
+          })()
+          solveHubAnchors = hubAnchors
+          // A 组（半数线程）专用：两跳分候选起点池（按两跳分降序）。用于“内部优先串联 hubs”的分工。
+          const twoHopIds = (function(){
+            try { return computeInternalTwoHopIds(triangles, { hubsK: 6, topK: Math.max(6, Math.min(18, Math.ceil(PAR_N / 2))) }) } catch { return [] }
+          })()
+          const preferredList = []
+          for (let i=0;i<PAR_N;i++){
+            preferredList.push(hubs.length ? hubs[i % hubs.length] : null)
           }
-
-          const preferredList = computePreferredStartIds(triangles, PAR_N)
           // 保底：如果取不到，退化为 null（让 worker 自选）
           while (preferredList.length < PAR_N) preferredList.push(null)
 
-          // 两组策略：A 更保守（强剪枝/桥接优先），B 更激进（更早 fullExpand/放松剪枝）
-          const mkFlags = (base, groupIdx, wIdx) => {
+          // 多组策略：每 4 个一组。
+          // 用户要求：始终优先“桥接联通价值”，避免从角落低价值区域开局。
+          // 因此默认所有组都启用 multiAnchor（参数不同以覆盖更多局面），不再混入固定起点激进组作为默认。
+          const mkFlags = (base, groupTag, groupLocalIdx, wIdx, totalWorkers, focusPack) => {
             const common = {
               ...base,
               workerTimeBudgetMs: HARD_BUDGET_MS,
@@ -1569,11 +2075,41 @@ const contribRef = useRef({ branch_pruned: 0, enqueued: 0, expanded: 0, critical
               maxNodes: Infinity,
               // 严格遵守用户步数上限：默认不允许自动放宽
               allowStepLimitRelax: false,
+              // 让每个 worker 的随机/打散行为可区分（避免重复工作量）
+              workerVariant: wIdx,
+              // 共享焦点：来自“色块统计同款评分”的 top hubs（所有线程劲往一处使）
+              focusAnchorIds: Array.isArray(focusPack?.focusAnchorIds) ? focusPack.focusAnchorIds : undefined,
+              // 真实 hubs：仅用于“是否打通高评分hub”的奖励/惩罚/剪枝，避免把过渡/内部锚点误当 hub
+              hubAnchorIds: Array.isArray(focusPack?.hubAnchorIds) ? focusPack.hubAnchorIds : undefined,
+              focusPrimaryAnchorId: focusPack?.focusPrimaryAnchorId ?? undefined,
+              internalBridgeIds: Array.isArray(focusPack?.internalBridgeIds) ? focusPack.internalBridgeIds : undefined,
               // 提示：worker 内部会根据 retry_degrade 自动降级；这里做“起始多样性”
             }
-            if (groupIdx === 0) {
+            // 线程分组：A=两跳组（半数线程），B=基础组（半数线程）
+            const isGroupA = (groupTag === 'A')
+            // 1/4 线程作为“近似组”：允许 stepLimit+1/+2 探索并尝试压回 stepLimit
+            const tw = Number.isFinite(totalWorkers) ? totalWorkers : 0
+            const nearCount = tw > 0 ? Math.max(1, Math.floor(tw / 4)) : 0
+            const isNear = (nearCount > 0) ? (wIdx >= (tw - nearCount)) : false
+            // 其中一半 near 线程允许 +2（更像“取消步骤限制”的折中：搜索更深，但输出仍严格 stepLimit）
+            const near2Start = tw - Math.max(1, Math.floor(nearCount / 2))
+            const extra = isNear ? ((wIdx >= near2Start) ? 2 : 1) : 0
+            const nearPatch = isNear ? { allowNearMissStep: true, nearMissExtraSteps: extra } : { allowNearMissStep: false, nearMissExtraSteps: 0 }
+            // mode 循环：全部 multiAnchor，只是强度不同
+            // 0=标准多锚点；1=强桥接（更强 focus）；2=强多锚点（更大束/更多锚点）；3=强解锁（更重顺序解锁）
+            // 组内策略轮转（避免重复工作量）：每组独立按 groupLocalIdx%4 分配 4 套参数
+            const mode = groupLocalIdx % 4
+            if (mode === 0) {
               return {
                 ...common,
+                ...nearPatch,
+                internalBridgeOnly: !!isGroupA,
+                // A 组：多锚点桥接策略（每步可换 startId）
+                multiAnchor: true,
+                // 更偏桥接与主色合并
+                multiAnchorConnectW: Math.max(6, Number(common.multiAnchorConnectW||0) || 6),
+                multiAnchorDomW: Math.max(3, Number(common.multiAnchorDomW||0) || 3),
+                multiAnchorBdVarW: Math.max(1.2, Number(common.multiAnchorBdVarW||0) || 1.2),
                 enableBridgeFirst: true,
                 enableLB: true,
                 enableBeam: true,
@@ -1582,21 +2118,70 @@ const contribRef = useRef({ branch_pruned: 0, enqueued: 0, expanded: 0, critical
                 lbImproveMin: Math.max(2, common.lbImproveMin ?? 1),
                 useDFSFirst: false,
                 returnFirstFeasible: false,
-                enableSATPlanner: true,
+                // SAT 会触发后端请求，避免 24 线程同时打后端：只让 B 组的第 1 个线程尝试 SAT
+                enableSATPlanner: (groupTag === 'B' && groupLocalIdx === 0),
               }
             }
+            if (mode === 1) {
+              // 强桥接：focus 更强，成本更低，更愿意先少步打通高桥接区域
+              return {
+                ...common,
+                ...nearPatch,
+                internalBridgeOnly: !!isGroupA,
+                multiAnchor: true,
+                multiAnchorFocusDepth: Math.max(3, Number(common.multiAnchorFocusDepth||0) || 3),
+                multiAnchorFocusK: Math.max(3, Number(common.multiAnchorFocusK||0) || 3),
+                multiAnchorConnectW: Math.max(14, Number(common.multiAnchorConnectW||12) || 12),
+                multiAnchorCutW: Math.max(7, Number(common.multiAnchorCutW||6) || 6),
+                multiAnchorCostW: Math.min(2.0, Number(common.multiAnchorCostW||2.2) || 2.2),
+                enableBridgeFirst: true,
+                enableLB: true,
+                enableBeam: true,
+                beamWidth: Math.max(56, common.beamWidth ?? 32),
+                beamMin: Math.max(12, common.beamMin ?? 8),
+                lbImproveMin: Math.max(1, common.lbImproveMin ?? 1),
+                useDFSFirst: false,
+                returnFirstFeasible: false,
+                enableSATPlanner: false,
+              }
+            }
+            if (mode === 2) {
+              // 更强多锚点：更大束宽/更多锚点，适合极端散乱
+              return {
+                ...common,
+                ...nearPatch,
+                internalBridgeOnly: !!isGroupA,
+                multiAnchor: true,
+                multiAnchorBeamWidth: Math.min(96, Math.max(32, Number(common.multiAnchorBeamWidth||24) || 24)),
+                multiAnchorAnchors: Math.min(24, Math.max(12, Number(common.multiAnchorAnchors||10) || 10)),
+                multiAnchorColorsPerAnchor: Math.min(10, Math.max(5, Number(common.multiAnchorColorsPerAnchor||5) || 5)),
+                enableBridgeFirst: true,
+                enableLB: true,
+                enableBeam: true,
+                beamWidth: Math.max(64, common.beamWidth ?? 32),
+                beamMin: Math.max(12, common.beamMin ?? 8),
+                lbImproveMin: Math.max(1, common.lbImproveMin ?? 1),
+                useDFSFirst: false,
+                returnFirstFeasible: false,
+                enableSATPlanner: false,
+              }
+            }
+            // mode === 3：强解锁（顺序关键题型）
             return {
               ...common,
-              // 激进组：更早放开剪枝（减少“过剪导致无解”的概率）
-              enableZeroExpandFilter: false,
-              rareFreqRatio: 0,
-              rareFreqAbs: 0,
-              minDeltaRatio: 0,
-              lbImproveMin: 0,
-              fullExpand: true,
-              disableStartPrune: true,
-              enableLB: false,
-              enableBeam: false,
+              ...nearPatch,
+              internalBridgeOnly: !!isGroupA,
+              multiAnchor: true,
+              multiAnchorUnlockW: Math.max(2.2, Number(common.multiAnchorUnlockW||1.4) || 1.4),
+              multiAnchorUnlockDepth: Math.max(1, Number(common.multiAnchorUnlockDepth||1) || 1),
+              multiAnchorUnlockAnchors: Math.max(5, Number(common.multiAnchorUnlockAnchors||4) || 4),
+              multiAnchorUnlockColors: Math.max(4, Number(common.multiAnchorUnlockColors||3) || 3),
+              enableBridgeFirst: true,
+              enableLB: true,
+              enableBeam: true,
+              beamWidth: Math.max(48, common.beamWidth ?? 32),
+              beamMin: Math.max(12, common.beamMin ?? 8),
+              lbImproveMin: Math.max(1, common.lbImproveMin ?? 1),
               useDFSFirst: false,
               returnFirstFeasible: false,
               enableSATPlanner: false,
@@ -1610,8 +2195,11 @@ const contribRef = useRef({ branch_pruned: 0, enqueued: 0, expanded: 0, critical
           const lightTris = triangles.map(t=>({ id: t.id, neighbors: t.neighbors, color: t.color, deleted: !!t.deleted }))
 
           const workers = []
-          const states = Array.from({ length: PAR_N }, (_, i)=>({ i, last: null, best: null, nodes: 0, group: i < PAR_GROUP ? 0 : 1 }))
+          const states = Array.from({ length: PAR_N }, (_, i)=>({ i, last: null, best: null, nodes: 0, group: Math.floor(i / PAR_GROUP) }))
           let solved = false
+          // 每个 worker 独立节流日志：避免 24 线程把主线程打爆
+          const workerLogLastTs = Array.from({ length: PAR_N }, ()=>0)
+          const workerLogCounts = Array.from({ length: PAR_N }, ()=>0)
 
           const cleanup = ()=>{
             for (const w of workers) { try { w.terminate() } catch {} }
@@ -1643,23 +2231,245 @@ const contribRef = useRef({ branch_pruned: 0, enqueued: 0, expanded: 0, critical
           }
 
           const resPromise = new Promise((resolve, reject)=>{
+            // 只在“合格解”出现时才允许提前结束；near-miss 只能记录，不能终止其它线程。
+            let bestQualified = null // { bestStartId, path, len, payload, winner }
+            let bestNearMiss = null  // { bestStartId, path, len }
+            const finished = new Set()
+            const startErrors = []
             const timeout = setTimeout(()=>{
               if (solved) return
               solved = true
               cleanup()
-              reject(new Error('worker-timeout'))
-            }, HARD_BUDGET_MS + 8000)
+              // 不把算满时间当作异常：到点才允许返回 near-miss/近似（仍不算合格解）
+              if (bestQualified) {
+                resolve({ ...bestQualified.payload, bestStartId: bestQualified.bestStartId, paths: [bestQualified.path], minSteps: bestQualified.len, timedOut: false, __winner: bestQualified.winner })
+              } else if (bestNearMiss) {
+                resolve({ bestStartId: null, paths: [], minSteps: 0, timedOut: true, __timeout: true, nearMiss: bestNearMiss })
+              } else {
+                resolve({ bestStartId: null, paths: [], minSteps: 0, timedOut: true, __timeout: true })
+              }
+            }, HARD_BUDGET_MS + 25000)
+
+            const half = Math.max(1, Math.floor(PAR_N / 2))
+            // 严格组：按用户要求在 B 组中分出一半线程长期跑 strict（IDA*/A*）证明型搜索，其余线程继续 multiAnchor 覆盖搜索空间。
+            const strictN = (function(){
+              const ui = (window.SOLVER_FLAGS||{})
+              if (!ui.strictMode) return 0
+              const bCount = Math.max(0, PAR_N - half)
+              const raw = Number(ui.strictParallelWorkers)
+              if (Number.isFinite(raw)) return Math.max(0, Math.min(bCount, Math.floor(raw)))
+              // 默认：B 组的一半（24线程 -> B=12 -> strict=6）
+              return Math.max(0, Math.floor(bCount / 2))
+            })()
+            const strictWorkerSet = (function(){
+              const set = new Set()
+              // 仅从 B 组选取，且优先选 B 组“前半”：
+              // 1) 避免与 near-miss（通常在末尾 1/4 线程）重叠
+              // 2) 让严格组更稳定地长期跑
+              for (let ii = half; ii < PAR_N && set.size < strictN; ii++){
+                set.add(ii)
+              }
+              return set
+            })()
+
+            // PDB 下发（仅严格线程）：避免把巨大对象广播给所有 worker
+            const pdbPayload = (function(){
+              try {
+                const key = 'pdb_6x6'
+                const sourceObj = (typeof window !== 'undefined' && window.__PDB_AUTOLOAD__ && window.__PDB_AUTOLOAD__[key]) ? window.__PDB_AUTOLOAD__[key] : null
+                if (sourceObj && typeof sourceObj === 'object') return { key, obj: sourceObj }
+                const lsJson = localStorage?.getItem('PDB:' + key)
+                if (lsJson) {
+                  const obj = JSON.parse(lsJson)
+                  if (obj && typeof obj === 'object') return { key, obj }
+                }
+              } catch {}
+              return null
+            })()
+
+            const pushWorkerLog = (i, groupTag, msg, force=false)=>{
+              const now = Date.now()
+              const flagsUi = (window.SOLVER_FLAGS||{})
+              const perWorkerInterval = Number.isFinite(flagsUi.progressAllWorkersIntervalMs)
+                ? Math.max(0, flagsUi.progressAllWorkersIntervalMs)
+                : 600
+              if (!force && perWorkerInterval>0 && (now - (workerLogLastTs[i]||0)) < perWorkerInterval) return
+              workerLogLastTs[i] = now
+              workerLogCounts[i] = (workerLogCounts[i]||0) + 1
+              const line = `[${((now - solveStartRef.current)/1000).toFixed(1)}s] W${i+1}${groupTag} ${msg}`
+              setProgressLogs(prev=>{
+                const next = [...prev, line]
+                return next.length>800 ? next.slice(next.length-800) : next
+              })
+            }
+
+            // 记录每个 worker 的“策略/模块参与情况”，用于最终显示“合格解来自哪条线程、用了哪些模块”
+            const workerMeta = Array.from({ length: PAR_N }, ()=>({
+              modules: new Set(),
+              strategy: [],
+              preferredStartId: null,
+              isStrict: false,
+            }))
+            const addMod = (i, m)=>{ try { if (m) workerMeta[i]?.modules?.add(String(m)) } catch {} }
+            const addStrat = (i, s)=>{ try { if (s) workerMeta[i]?.strategy?.push(String(s)) } catch {} }
+            const formatMeta = (i)=>{
+              const m = workerMeta[i]
+              const mods = Array.from(m?.modules||[])
+              const st = Array.from(new Set(m?.strategy||[]))
+              return {
+                modules: mods.join('+') || '-',
+                strategy: st.join('+') || '-',
+                preferredStartId: m?.preferredStartId ?? null,
+              }
+            }
+            const updateMetaByPhase = (i, groupTag, phase)=>{
+              const ph = String(phase||'')
+              if (!ph) return
+              if (ph.includes('strict')) addMod(i, 'strict')
+              if (ph.includes('ida')) addMod(i, 'IDA*')
+              if (ph.includes('astar')) addMod(i, 'A*')
+              if (ph.includes('mcts')) addMod(i, 'MCTS')
+              if (ph.includes('sat')) addMod(i, 'SAT')
+              if (ph.includes('rag')) addMod(i, 'RAG')
+              if (ph.includes('optimize') || ph.includes('repair')) addMod(i, 'LocalRepair')
+              if (ph.includes('dfs')) addMod(i, 'DFS')
+              if (groupTag === 'A') addStrat(i, 'A组(两跳/DFS)')
+              if (groupTag === 'B') addStrat(i, 'B组(基础/多策略)')
+            }
+
+            // 开始前先写一行：期望启动的 worker 数、严格线程编号
+            try {
+              const strictList = Array.from(strictWorkerSet).sort((a,b)=>a-b).map(x=>x+1)
+              setProgressLogs(prev=>{
+                const now = Date.now()
+                const line = `[${((now - solveStartRef.current)/1000).toFixed(1)}s] PAR start PAR_N=${PAR_N} strictWorkers=${strictList.join(',')||'-'}`
+                const next = [...prev, line]
+                return next.length>800 ? next.slice(next.length-800) : next
+              })
+            } catch {}
 
             for (let i=0;i<PAR_N;i++){
-              const groupIdx = i < PAR_GROUP ? 0 : 1
-              const w = new Worker(new URL('./utils/solver-worker.js', import.meta.url), { type: 'module' })
-              workers.push(w)
-              const flags = mkFlags(flagsInitialBase, groupIdx, i)
+              const groupTag = (i < half) ? 'A' : 'B'
+              const groupLocalIdx = (i < half) ? i : (i - half)
+              let w = null
+              try {
+                w = new Worker(new URL('./utils/solver-worker.js', import.meta.url), { type: 'module' })
+                workers.push(w)
+                pushWorkerLog(i, groupTag, `worker_created`, true)
+              } catch (e) {
+                // worker 启动失败：在超核/内存紧张场景可能发生，直接跳过该 worker
+                const errStr = String(e?.message||e)
+                states[i].last = { phase:'worker_start_failed', error: errStr }
+                startErrors.push(errStr)
+                pushWorkerLog(i, groupTag, `worker_start_failed error=${errStr}`, true)
+                continue
+              }
+              // A组：细分为3个子组，分别对应“两跳Top1/2/3”作为起点（focusPrimaryAnchorId），并启用 DFS 深度优先分工
+              // B组：按基础 hubs 正常跑
+              const aPoolFull = (Array.isArray(twoHopIds) && twoHopIds.length) ? twoHopIds : hubs
+              const aTop3 = aPoolFull.slice(0, 3)
+              const bPool = hubs
+              const aLocal = (i < half) ? i : 0
+              const aSub = (aLocal % 3) // 0/1/2 -> top1/top2/top3
+              const aLane = Math.floor(aLocal / 3)
+              const aLaneCount = Math.max(1, Math.ceil(half / 3))
+              const aPrimary = (aTop3.length ? (aTop3[aSub % aTop3.length]) : (aPoolFull[0] ?? null))
+              const primary = (groupTag === 'A')
+                ? aPrimary
+                : (bPool.length ? bPool[i % bPool.length] : (preferredList[i] ?? null))
+              const isStrictWorker = strictWorkerSet.has(i)
+              workerMeta[i].isStrict = !!isStrictWorker
+              const flags0 = mkFlags(flagsInitialBase, groupTag, groupLocalIdx, i, PAR_N, {
+                focusAnchorIds: hubs,
+                hubAnchorIds: hubAnchors,
+                // A组把 primary 作为 focusPrimaryAnchorId（组内错位），B组仍以 hub 为 primary
+                focusPrimaryAnchorId: primary,
+                // A组：每个子组只下发自己的 TopX 起点（避免三组互相干扰）；DFS分工通过 lane 参数避免重复路径
+                internalBridgeIds: (groupTag === 'A') ? [aPrimary].filter(x=>x!=null) : [],
+                internalSearchMode: (groupTag === 'A') ? 'dfs' : undefined,
+                internalDfsSplitDepth: (groupTag === 'A') ? 2 : undefined,
+                internalDfsLane: (groupTag === 'A') ? aLane : undefined,
+                internalDfsLaneCount: (groupTag === 'A') ? aLaneCount : undefined,
+                internalDfsLockAnchorDepth: (groupTag === 'A') ? 3 : undefined,
+              })
+              // 严格组分工：在 B 组前半的 strictN 个线程上，使用不同的 preferredStartId / IDA* vs A* / 轻微排序权重差异，减少重复工作量
+              const strictLocal = (i >= half) ? (i - half) : -1
+              const strictIdx = (strictLocal >= 0) ? strictLocal : -1
+              const strictPreferred = (bPool && bPool.length && strictIdx >= 0) ? bPool[Math.min(bPool.length-1, strictIdx % bPool.length)] : primary
+              const strictHeuristicName = (pdbPayload?.key === 'pdb_6x6') ? 'layered_pdb_6x6_max' : 'dynamic_rag_max'
+              const strictUseIDA = (strictIdx % 6 === 0) ? false : true // 1 条线程用 A*（补位），其余默认 IDA*
+              const strictDispW = [0.45, 0.55, 0.65, 0.75, 0.85, 0.95][Math.max(0, strictIdx % 6)]
+              const flags = isStrictWorker
+                ? {
+                    ...(flags0||{}),
+                    // 严格线程：把预算留给 strict IDA*，禁用种子/多锚点阶段
+                    strictMode: true,
+                    useIDAStar: strictUseIDA,
+                    heuristicName: strictHeuristicName,
+                    skipSeedPhase: true,
+                    multiAnchor: false,
+                    internalBridgeOnly: false,
+                    allowNearMissStep: false,
+                    nearMissExtraSteps: 0,
+                    useDFSFirst: false,
+                    returnFirstFeasible: false,
+                    dispersionWeight: strictDispW,
+                  }
+                : {
+                    ...(flags0||{}),
+                    // 非严格线程：即便全局默认开启 strictMode，也不进入 strict IDA*，保证 24 线程覆盖搜索空间
+                    strictMode: false,
+                    useIDAStar: false,
+                    // 非严格线程的 strict-probe 使用轻量启发式，避免因未注入 PDB 导致 h≈0
+                    heuristicName: 'dynamic_rag_max',
+                    skipSeedPhase: false,
+                  }
+
+              // 严格线程尝试注入 PDB（如果主线程有本地 PDB 数据）
+              if (isStrictWorker && pdbPayload?.key && pdbPayload?.obj) {
+                try { w.postMessage({ type:'load_pdb', key: pdbPayload.key, obj: pdbPayload.obj }) } catch {}
+                addMod(i, 'PDB')
+              }
+
               try { w.postMessage({ type:'set_flags', flags }) } catch {}
+              if (isStrictWorker) {
+                addStrat(i, `Strict(${strictUseIDA ? 'IDA*' : 'A*'})`)
+                addStrat(i, `h=${strictHeuristicName}`)
+                addStrat(i, `dispW=${strictDispW}`)
+              } else {
+                if (groupTag === 'A') addStrat(i, 'multiAnchor+内部DFS分工')
+                if (groupTag === 'B') addStrat(i, 'multiAnchor(基础轮转)')
+              }
+              // 降低卡顿：并行时显著放慢 progress 上报（每个 worker 独立节流）
+              // A 组更需要反馈（但 DFS 深度优先也会更“啃”），B 组更慢；leader UI 仍会二次节流。
+              try {
+                const progressPostIntervalMs = isStrictWorker ? 420 : ((groupTag === 'A') ? 120 : 260)
+                w.postMessage({ type:'set_flags', flags: { progressPostIntervalMs } })
+              } catch {}
+
+              // 捕获 worker 级别异常：确保日志里能看到哪个线程挂了
+              try {
+                w.onerror = (ev)=>{
+                  const msg = String(ev?.message || ev?.type || 'worker_error')
+                  pushWorkerLog(i, groupTag, `onerror ${msg}`, true)
+                }
+                w.onmessageerror = (ev)=>{
+                  pushWorkerLog(i, groupTag, `onmessageerror`, true)
+                }
+              } catch {}
 
               w.onmessage = (ev)=>{
                 const { type, payload } = ev.data || {}
                 if (solved) return
+                // 所有 worker 的关键事件都要写日志（便于核对 24 线程是否都在正常跑）
+                if (type === 'init_done') {
+                  pushWorkerLog(i, groupTag, `init_done triangles=${payload?.triangles??'-'} palette=${payload?.palette??'-'}`, true)
+                } else if (type === 'flags_set') {
+                  pushWorkerLog(i, groupTag, `flags_set ok=${payload?.ok??'-'}`, true)
+                } else if (type === 'pdb_loaded') {
+                  pushWorkerLog(i, groupTag, `pdb_loaded ok=${payload?.ok??false} key=${payload?.key??'-'}${payload?.error?` err=${String(payload.error).slice(0,120)}`:''}`, true)
+                  if (payload?.ok) addMod(i, 'PDB')
+                }
                 if (type === 'progress') {
                   const p = payload
                   const now = Date.now()
@@ -1668,7 +2478,25 @@ const contribRef = useRef({ branch_pruned: 0, enqueued: 0, expanded: 0, critical
                   if (p?.phase === 'best_update' && Number.isFinite(p?.minSteps)) {
                     states[i].best = { minSteps: p.minSteps, bestStartId: p.bestStartId }
                   }
+                  updateMetaByPhase(i, groupTag, p?.phase)
                   const leader = pickLeader()
+                  // 所有 worker 都写“轻量日志”（独立节流），leader 继续驱动 UI 更新
+                  {
+                    const perf = p?.perf || {}
+                    const phaseRaw = p?.phase || 'search'
+                    const extra = (function(){
+                      if (phaseRaw==='branch_pruned') {
+                        return ` reason=${p?.reason??'-'} step=${p?.step??'-'} color=${p?.color??'-'}`
+                      } else if (phaseRaw==='branch_quality') {
+                        const dr = (typeof p?.deltaRatio==='number') ? (p.deltaRatio.toFixed(3)) : (p?.deltaRatio??'-')
+                        return ` step=${p?.step??'-'} color=${p?.color??'-'} delta=${p?.delta??'-'} dr=${dr} lb=${p?.lb??'-'} prio=${p?.priority??'-'}`
+                      } else if (phaseRaw==='retry_degrade') {
+                        return ` retry=${p?.retry??'-'}`
+                      }
+                      return ''
+                    })()
+                    pushWorkerLog(i, groupTag, `phase=${phaseRaw}${extra} nodes=${p?.nodes??0} queue=${p?.queue??0} sols=${p?.solutions??0} enq=${perf?.enqueued??'-'} exp=${perf?.expanded??'-'} zf=${perf?.filteredZero??'-'}`, false)
+                  }
                   if (i !== leader) return
 
                   const flagsUi = (window.SOLVER_FLAGS||{})
@@ -1686,11 +2514,11 @@ const contribRef = useRef({ branch_pruned: 0, enqueued: 0, expanded: 0, critical
                   const phase = p?.phase === 'components' ? `已识别连通分量：${p?.count}`
                     : p?.phase === 'components_build' ? `正在构建分量：${p?.count}（当前大小 ${p?.compSize??'-'}）`
                     : p?.phase === 'best_update' ? `已更新最优：起点 #${p?.bestStartId}，最少步骤 ${p?.minSteps}`
+                    : p?.phase === 'near_miss' ? `发现近似解：${p?.len}步（超1步），正在尝试压回 ${p?.stepLimit} 步…`
                     : p?.phase === 'retry_degrade' ? `降级重试：${p?.retry ?? '-'}`
                     : `已探索节点：${nodes}，候选分支：${sols}`
 
-                  const grpLabel = groupIdx === 0 ? 'A' : 'B'
-                  setStatus(`8线程并行计算中（当前领先：W${i+1}/${PAR_N} 组${grpLabel}）… ${phase}`)
+                  setStatus(`计算中… ${phase}`)
                   setSolveProgress({
                     phase: p?.phase,
                     nodes: p?.nodes,
@@ -1724,23 +2552,70 @@ const contribRef = useRef({ branch_pruned: 0, enqueued: 0, expanded: 0, critical
                   if (typeof perf?.filteredZero === 'number') { contribRef.current.branch_pruned += perf.filteredZero }
                   if (typeof perf?.enqueued === 'number') { contribRef.current.enqueued += perf.enqueued }
                   if (typeof perf?.expanded === 'number') { contribRef.current.expanded += perf.expanded }
-                  const line = `[${((now - solveStartRef.current)/1000).toFixed(1)}s] W${i+1}${groupIdx===0?'A':'B'} phase=${phaseRaw}${compInfo}${extra} nodes=${p?.nodes??0} queue=${p?.queue??0} sols=${p?.solutions??0} enq=${perf?.enqueued??'-'} exp=${perf?.expanded??'-'} zf=${perf?.filteredZero??'-'}`
+                  const line = `[${((now - solveStartRef.current)/1000).toFixed(1)}s] W${i+1}${groupTag} phase=${phaseRaw}${compInfo}${extra} nodes=${p?.nodes??0} queue=${p?.queue??0} sols=${p?.solutions??0} enq=${perf?.enqueued??'-'} exp=${perf?.expanded??'-'} zf=${perf?.filteredZero??'-'}`
                   setProgressLogs(prev=>{
                     const next = [...prev, line]
                     return next.length>200 ? next.slice(next.length-200) : next
                   })
                   progressLastRef.current = now
                 } else if (type === 'result') {
-                  solved = true
-                  clearTimeout(timeout)
-                  const winner = { workerIndex: i, group: groupIdx, preferredStartId: preferredList[i] }
-                  cleanup()
-                  resolve({ ...payload, __winner: winner })
+                  finished.add(i)
+                  pushWorkerLog(i, groupTag, `result minSteps=${payload?.minSteps??'-'} timedOut=${payload?.timedOut??'-'} bestStartId=${payload?.bestStartId??'-'}`, true)
+                  const winner = { workerIndex: i, group: groupTag, preferredStartId: primary ?? preferredList[i] }
+                  // 只要返回的 paths 里存在“合格解”，就立刻结束；否则只记录 near-miss，继续跑满时间。
+                  try {
+                    const sid = payload?.bestStartId
+                    const paths = Array.isArray(payload?.paths) ? payload.paths : []
+                    const qualified = []
+                    for (const p of paths) {
+                      if (!Array.isArray(p) || p.length === 0) continue
+                      if (sid == null) continue
+                      const okStep = (!Number.isFinite(maxStepsLimit) || p.length <= maxStepsLimit)
+                      if (!okStep) continue
+                      const okUniform = verifyUnifiedPath({ triangles, startId: sid, path: p })
+                      if (okUniform) qualified.push(p)
+                    }
+                    if (qualified.length) {
+                      qualified.sort((a,b)=>a.length-b.length)
+                      const bestP = qualified[0]
+                      // 把“模块参与/策略摘要”打包进 winnerDetail，供最终进度窗口展示
+                      const meta = formatMeta(i)
+                      const winnerDetail = { ...winner, preferredStartId: meta.preferredStartId ?? winner.preferredStartId, strategy: meta.strategy, modules: meta.modules }
+                      bestQualified = { bestStartId: sid, path: bestP, len: bestP.length, payload, winner: winnerDetail }
+                      solved = true
+                      clearTimeout(timeout)
+                      cleanup()
+                      pushWorkerLog(i, groupTag, `QUALIFIED len=${bestP.length} strategy=${winnerDetail.strategy} modules=${winnerDetail.modules}`, true)
+                      resolve({ ...payload, bestStartId: sid, paths: [bestP], minSteps: bestP.length, timedOut: false, __winner: winnerDetail })
+                      return
+                    }
+                    // 记录 near-miss（只取更短的），但不能结束计算
+                    const nm = payload?.nearMiss
+                    if (nm?.path && Array.isArray(nm.path) && nm.path.length > 0 && Number.isFinite(nm.len)) {
+                      if (!bestNearMiss || nm.len < bestNearMiss.len) {
+                        bestNearMiss = { bestStartId: nm.bestStartId, path: nm.path, len: nm.len }
+                      }
+                    }
+                  } catch {}
                 }
               }
 
-              const pref = preferredList[i]
-              w.postMessage({ type:'auto', triangles: lightTris, palette, maxBranches, stepLimit: maxStepsLimit, preferredStartId: pref })
+              // 分批启动 worker，降低瞬时卡顿（尤其 24 线程）
+              const pref = (isStrictWorker ? strictPreferred : (primary ?? preferredList[i]))
+              workerMeta[i].preferredStartId = pref
+              if (isStrictWorker) addStrat(i, `prefStart=#${pref}`)
+              try { w.postMessage({ type:'init', triangles: lightTris, palette }) } catch {}
+              setTimeout(() => {
+                try { w.postMessage({ type:'auto', maxBranches, stepLimit: maxStepsLimit, preferredStartId: pref }) } catch {}
+              }, Math.min(400, i * 18))
+            }
+
+            // 若没有任何 worker 成功启动，直接返回 timedOut（非异常）
+            if (workers.length === 0) {
+              clearTimeout(timeout)
+              solved = true
+              cleanup()
+              resolve({ bestStartId: null, paths: [], minSteps: 0, timedOut: true, __timeout: true, __noWorkers: true, __startError: startErrors[0] || null })
             }
           })
 
@@ -1752,55 +2627,95 @@ const contribRef = useRef({ branch_pruned: 0, enqueued: 0, expanded: 0, critical
           // result = await window.Solver_minStepsAuto?.(lightTris2, palette, maxBranches, (p)=>{
           // ... (整个回退逻辑注释掉) ...
           // }, Number.isFinite(maxStepsLimit) ? maxStepsLimit : 80)
-          console.error('Worker failed, but skipping main thread fallback to enforce worker logic', wErr);
-          throw wErr; 
-        }
-      }
-      // 严格审核：仅允许输出最终颜色统一的方案
-      const idToIndex = new Map(triangles.map((t,i)=>[t.id,i]))
-      const neighbors = triangles.map(t=>t.neighbors)
-      const checkUnified = (path)=>{
-        let colors = triangles.map(t=>t.color)
-        const startIdLocal = result.bestStartId
-        for(const color of path){
-          const startColorCur = colors[idToIndex.get(startIdLocal)]
-          if(color===startColorCur) continue
-          const regionSet = new Set(); const q=[startIdLocal]; const visited=new Set([startIdLocal])
-          while(q.length){
-            const id=q.shift(); const idx=idToIndex.get(id)
-            if(colors[idx]!==startColorCur) continue
-            regionSet.add(id)
-            for(const nb of neighbors[idx]){ if(!visited.has(nb)){ visited.add(nb); q.push(nb) } }
+          // 不再把 worker-timeout 作为“求解错误”
+          const msg = String(wErr?.message || wErr || '')
+          if (/worker-timeout/i.test(msg)) {
+            // 只有真正跑到超时才算 __timeout
+            result = { bestStartId: null, paths: [], minSteps: 0, timedOut: true, __timeout: true }
+          } else {
+            console.error('Worker failed, but skipping main thread fallback to enforce worker logic', wErr)
+            // 其它异常：不能当作“时间到”，否则会立刻返回近似解（看起来像没算）。
+            result = { bestStartId: null, paths: [], minSteps: 0, timedOut: true, __timeout: false, __error: msg, __failed: true }
           }
-          for(const id of regionSet){ colors[idToIndex.get(id)] = color }
         }
-        const finalTris = triangles.map((t,i)=>({ ...t, color: colors[i] }))
-        return isUniform(finalTris)
       }
-      let unifiedPaths = (result?.paths||[]).filter(p=>checkUnified(p) && (!Number.isFinite(maxStepsLimit) || (Array.isArray(p) && p.length <= maxStepsLimit)))
+      // 严格审核：只认“全局统一 + 满足 stepLimit”的合格解
+      const sidFinal = result?.bestStartId
+      let unifiedPaths = (result?.paths||[]).filter(p=>{
+        if (!Array.isArray(p) || p.length===0) return false
+        if (sidFinal == null) return false
+        const okStep = (!Number.isFinite(maxStepsLimit) || p.length <= maxStepsLimit)
+        if (!okStep) return false
+        return verifyUnifiedPath({ triangles, startId: sidFinal, path: p })
+      })
+      // 若没有合格解：允许返回 near-miss（+1/+2）或兜底近似方案用于参考，但这些都“不算合格解”，不得缓存/不得写入后端解库。
       if (!result || unifiedPaths.length === 0 || !result.bestStartId) {
-        if (!result || unifiedPaths.length === 0 || !result.bestStartId) {
-          const startIdLocal = (result?.bestStartId!=null) ? result.bestStartId : (startId!=null ? startId : pickHeuristicStartId(triangles))
-          const heurLimit = Number.isFinite(maxStepsLimit) ? Math.max(1, Math.min(40, maxStepsLimit)) : 40
-          const heurPath = computeGreedyPath(triangles, palette, startIdLocal, heurLimit)
-          if (heurPath && heurPath.length) {
-            const snapshots = await captureCanvasPNG(triangles, canvasRef.current.width, canvasRef.current.height, startIdLocal, heurPath)
-             setSteps([{ path: heurPath, images: [snapshots] }])
-            setStatus(`3分钟内未找到合格解（8线程并行已耗尽预算），已给出接近方案：起点 #${startIdLocal}，步骤 ${heurPath.length}`)
+        // worker 全部启动失败：这不是“算满 3 分钟”，不允许返回任何近似解（否则看起来像“立刻返回不合格解”）
+        if (result?.__noWorkers) {
+          setSteps([])
+          setBestStartId(null)
+          const err = result?.__startError ? ` 启动错误：${String(result.__startError).slice(0, 160)}` : ''
+          setStatus(`计算线程启动失败（Worker 未能启动），无法开始计算。${err}（请使用 npm run dev / npm run preview 运行，或换浏览器重试）`)
+          setSolveProgress(null)
+          try { if(__runId) await telemetryFinishRun(__runId, { status:'no_workers', min_steps: 0, best_start_id: null, time_ms: Date.now() - solveStartRef.current, graph_signature: graphSignature }) } catch {}
+          return
+        }
+        // 1) 优先 near-miss（来自 worker 的 +1/+2 探索）
+        if ((result?.__timeout === true) && result?.nearMiss?.path && Array.isArray(result.nearMiss.path) && result.nearMiss.path.length > 0) {
+          try {
+            const nm = result.nearMiss
+            const startIdLocal = nm.bestStartId ?? (startId!=null ? startId : pickHeuristicStartId(triangles))
+            const snaps = await buildStepSnapshots({ triangles, width: canvasRef.current.width, height: canvasRef.current.height, startId: startIdLocal, path: nm.path, maxSnap: 240, includeInitial: true })
+            setSteps([{ path: nm.path, images: snaps }])
+            setBestStartId(startIdLocal)
+            const baseLim = Number.isFinite(maxStepsLimit) ? maxStepsLimit : (nm.len - 1)
+            const extra = Math.max(1, nm.len - baseLim)
+            setStatus(`3分钟内未找到合格解（≤${baseLim}步）。已返回 +${extra}步近似解（${nm.len}步，仅供参考，不缓存/不入库）。`)
             setSolveProgress(null)
-            // 近似方案也上传策略摘要，并结束遥测 Run，确保总站可见
-            try { await uploadStrategyAuto(triangles, palette, 'auto_solve_fallback', startIdLocal, heurPath) } catch {}
-            
+            // 不缓存、不入库（包括不调用 saveCachedSolutionWithPuzzle / uploadStrategyAuto）
+            try { if(__runId) await telemetryFinishRun(__runId, { status:'near_miss', min_steps: nm.len, best_start_id: startIdLocal, time_ms: Date.now() - solveStartRef.current, graph_signature: graphSignature }) } catch {}
+            return
+          } catch {}
+        }
+
+        // 2) 再兜底给一个“参考解”（可能不统一/可能超步数），但仍不入库
+        try {
+          // 只有时间到（算满预算）才允许给近似兜底
+          if (!(result?.__timeout === true)) throw new Error('not_timed_out')
+          const hubs = (function(){
+            try { return (Array.isArray(solveFocusAnchors) && solveFocusAnchors.length) ? solveFocusAnchors : computeFocusAnchorIds(triangles, { topK: 18, betweenK: 10, neighborK: 10, pathK: 14, pathMaxDepth: 6 }) } catch { return [] }
+          })()
+          const startIdLocal = (result?.bestStartId!=null) ? result.bestStartId : (startId!=null ? startId : (hubs[0] ?? pickHeuristicStartId(triangles)))
+          const heurLimit = Number.isFinite(maxStepsLimit) ? Math.max(1, Math.min(40, maxStepsLimit + 2)) : 40
+          const heurPath = computeGreedyPath(triangles, palette, hubs.length ? hubs : [startIdLocal], heurLimit)
+          if (heurPath && heurPath.length) {
+            const snapshots = await buildStepSnapshots({ triangles, width: canvasRef.current.width, height: canvasRef.current.height, startId: startIdLocal, path: heurPath, maxSnap: 240, includeInitial: true })
+            setSteps([{ path: heurPath, images: snapshots }])
+            setBestStartId(startIdLocal)
+            setStatus(`3分钟内未找到合格解（并行已耗尽预算）。已给出近似方案（仅供参考，不缓存/不入库）：起点 #${startIdLocal}，步骤 ${heurPath.length}`)
+            setSolveProgress(null)
             try { if(__runId) await telemetryFinishRun(__runId, { status:'fallback', min_steps: heurPath.length, best_start_id: startIdLocal, time_ms: Date.now() - solveStartRef.current, graph_signature: graphSignature }) } catch {}
             return
           }
-          setStatus('未能在上限内统一，也无法生成接近方案。请提高步数上限或重试。')
+        } catch {}
+
+        // 若并行流程失败（非超时），不要返回任何近似解/旧解
+        if (result?.__failed) {
+          setSteps([])
+          setBestStartId(null)
+          const em = String(result?.__error || '').trim()
+          const tail = em ? `（错误：${em.slice(0, 180)}）` : ''
+          setStatus(`计算线程启动/运行异常，未能进入计算流程（已阻止返回不合格解）。请刷新后重试。${tail}`)
           setSolveProgress(null)
-          // 无解时亦上传空摘要并结束遥测，便于数据库与总站同步
-          try { await uploadStrategyAuto(triangles, palette, 'auto_solve_failed', startIdLocal, []) } catch {}
-          try { if(__runId) await telemetryFinishRun(__runId, { status:'no_solution', best_start_id: startIdLocal, time_ms: Date.now() - solveStartRef.current, graph_signature: graphSignature }) } catch {}
+          try { if(__runId) await telemetryFinishRun(__runId, { status:'worker_failed', error: String(result?.__error||''), min_steps: 0, best_start_id: null, time_ms: Date.now() - solveStartRef.current, graph_signature: graphSignature }) } catch {}
           return
         }
+        setSteps([])
+        setBestStartId(null)
+        setStatus(`3分钟内未找到合格解（≤${Number.isFinite(maxStepsLimit) ? maxStepsLimit : '∞'}步）。`)
+        setSolveProgress(null)
+        try { if(__runId) await telemetryFinishRun(__runId, { status:'no_solution', min_steps: 0, best_start_id: null, time_ms: Date.now() - solveStartRef.current, graph_signature: graphSignature }) } catch {}
+        return
       }
       if (!result || result.paths.length === 0 || !result.bestStartId) {
         if (result?.timedOut) {
@@ -1865,11 +2780,55 @@ const contribRef = useRef({ branch_pruned: 0, enqueued: 0, expanded: 0, critical
       }
       setSteps(stepImgs)
       setBestStartId(result.bestStartId ?? null)
-      setStatus(`计算完成（自动起点 #${result.bestStartId}），最少步骤：${result.minSteps}，合格分支：${unifiedPaths.length}`)
+      const win = result?.__winner
+      const winStr = (win && Number.isFinite(win.workerIndex))
+        ? `；合格解来自 W${(win.workerIndex+1)}${win.group||''}${win.preferredStartId!=null?`（pref #${win.preferredStartId}）`:''}${win.strategy?`；策略=${win.strategy}`:''}${win.modules?`；模块=${win.modules}`:''}`
+        : ''
+      setStatus(`计算完成（自动起点 #${result.bestStartId}），最少步骤：${result.minSteps}，合格分支：${unifiedPaths.length}${winStr}`)
       setSolveProgress(null)
-      try { await putCachePath(graphSignature, { path: unifiedPaths[0]||[], min_steps: result.minSteps, start_id: result.bestStartId, flags: window.SOLVER_FLAGS, is_unified: true, quality: 'final' }) } catch {}
-      try { await uploadStrategyAuto(triangles, palette, 'auto_solve', result.bestStartId, unifiedPaths[0]||[]) } catch {}
-      try { await recordRunScore(graphSignature, { run_id: __runId, algo_name: (window.SOLVER_FLAGS?.heuristicName||'default'), min_steps: result.minSteps, best_start_id: result.bestStartId, time_ms: Date.now() - solveStartRef.current, is_unified: true, quality: 'final', source: 'auto_solve', flags: window.SOLVER_FLAGS }) } catch {}
+      // 只缓存/上传“合格解”：必须统一颜色，且满足用户 stepLimit（严格）
+      try {
+        const bestPath = unifiedPaths?.[0]
+        const okUniform = (bestPath && result.bestStartId!=null) ? verifyUnifiedPath({ triangles, startId: result.bestStartId, path: bestPath }) : false
+        const okStep = (bestPath && Array.isArray(bestPath)) ? (!Number.isFinite(maxStepsLimit) || bestPath.length <= maxStepsLimit) : false
+        if (okUniform && okStep) {
+          // 合格解日志：单独存入浏览器“求解日志库”，用于后续调试复盘；不会被“清除解缓存”删除
+          try {
+            const win = result?.__winner || null
+            const lines = Array.isArray(progressLogsRef.current) ? progressLogsRef.current.slice(-800) : []
+            await saveQualifiedSolveLog({
+              graph_signature: graphSignature,
+              timestamp: Date.now(),
+              min_steps: bestPath.length,
+              best_start_id: result.bestStartId,
+              winner: win,
+              summary: `QUALIFIED len=${bestPath.length} start=${result.bestStartId} winner=${win?.workerIndex!=null?('W'+(win.workerIndex+1)+(win.group||'')):'-'}`,
+              // 仅保留关键字段，避免过大
+              flags: (function(){
+                try {
+                  const f = window.SOLVER_FLAGS || {}
+                  return {
+                    strictMode: !!f.strictMode,
+                    strictParallelWorkers: f.strictParallelWorkers ?? null,
+                    enableSATPlanner: !!f.enableSATPlanner,
+                    enableRAGMacro: !!f.enableRAGMacro,
+                    enableLearningPrioritizer: !!f.enableLearningPrioritizer,
+                    heuristicName: f.heuristicName || null,
+                    parallelWorkers: f.parallelWorkers ?? null,
+                  }
+                } catch { return null }
+              })(),
+              lines,
+            })
+          } catch {}
+          await saveCachedSolutionWithPuzzle(graphSignature, { startId: result.bestStartId, paths: [bestPath], minSteps: bestPath.length }, makePuzzlePayload(triangles, palette), window.SOLVER_FLAGS)
+          await uploadStrategyAuto(triangles, palette, 'auto_solve', result.bestStartId, bestPath)
+          await recordRunScore(graphSignature, { run_id: __runId, algo_name: (window.SOLVER_FLAGS?.heuristicName||'default'), min_steps: bestPath.length, best_start_id: result.bestStartId, time_ms: Date.now() - solveStartRef.current, is_unified: true, quality: 'final', source: 'auto_solve', flags: window.SOLVER_FLAGS })
+        } else {
+          // 不合格解：不入库/不缓存，避免下次直接命中
+          try { await telemetrySafeLog({ status:'not_cached', reason: okUniform ? (okStep?'unknown':'over_step_limit') : 'not_uniform', min_steps: result.minSteps }) } catch {}
+        }
+      } catch {}
       try { await postLearnScore(graphSignature, { run_id: __runId, graph_signature: graphSignature, is_unified: true, path_len: result.minSteps, algo_scores: (()=>{ const m = { lb_improve_total: contribRef.current.lb_improve_total||0, branch_pruned_count: contribRef.current.branch_pruned||0, expansion_saved_est: Math.max(0, (contribRef.current.enqueued||0)-(contribRef.current.expanded||0)), critical_hits: contribRef.current.critical_hits||0, path_len_reduction: contribRef.current.path_len_reduction||0 }; const w = { lb:0.35, prune:0.25, expand:0.25, critical:0.10, path:0.05 }; const denom = Math.max(1, m.lb_improve_total + m.branch_pruned_count + m.expansion_saved_est + m.critical_hits + m.path_len_reduction); const norm = { lb: m.lb_improve_total/denom, prune: m.branch_pruned_count/denom, expand: m.expansion_saved_est/denom, critical: m.critical_hits/denom, path: m.path_len_reduction/denom }; const f = window.SOLVER_FLAGS||{}; const mods = []; const add=(key, engaged)=>{ if(!engaged) return; const score=100*(w.lb*norm.lb + w.prune*norm.prune + w.expand*norm.expand + w.critical*norm.critical + w.path*norm.path); mods.push({ key, score, metrics: m })}; add('ucb_prioritizer', !!f.enableLearningPrioritizer); add('bridge_first', !!f.enableBridgeFirst); add('best_first', !!f.enableBestFirst); add('a_star_lb', !!f.useAStarInBestFirst || !!f.useStrongLBInBestFirst); add('beam_search', !!f.enableBeam); add('lookahead', !!f.enableLookahead || !!f.enableLookaheadDepth2); add('zero_expand_filter', !!f.enableZeroExpandFilter); add('pdb', !!f.enablePDBAutoLoad); add('local_repair', !!f.optimizeEnableWindow || !!f.optimizeEnableRemoval || (Number(f.optimizeSwapPasses)||0)>0 ); add('sat_planner', !!f.enableSATPlanner); return mods; })() }) } catch {}
       // 结束遥测 Run
       try { if(__runId) await telemetryFinishRun(__runId, { status:'finished', min_steps: result.minSteps, best_start_id: result.bestStartId, time_ms: Date.now() - solveStartRef.current, graph_signature: graphSignature }) } catch {}
@@ -1891,7 +2850,7 @@ const contribRef = useRef({ branch_pruned: 0, enqueued: 0, expanded: 0, critical
       if (editMode) { setStatus('请先保存编辑，再继续计算最短步骤'); return }
       if (!steps || steps.length === 0) { setStatus('暂无可行方案，先执行自动求解'); return }
       setSolving(true)
-      setStatus('正在继续计算最短步骤…')
+      setStatus('计算中…')
       setSolveProgress({ phase: 'init' })
       setProgressLogs([])
       solveStartRef.current = Date.now()
@@ -1899,59 +2858,29 @@ const contribRef = useRef({ branch_pruned: 0, enqueued: 0, expanded: 0, critical
       graphSignature2 = makeGraphSignature(triangles, palette)
       try { const __r2 = await telemetryStartRun(triangles, palette, { ...(window.SOLVER_FLAGS||{}), mode: 'continue_shortest' }); __runId2 = __r2?.runId || null } catch {}
       const telemetrySafeLog2 = async (payload)=>{ try{ if(__runId2) await telemetryLogEvent(__runId2, payload) }catch{} }
-      // 尝试命中缓存，直接返回
+      // 尝试命中缓存（本地→后端）：命中且通过统一性/步数校验则直接返回，避免重复计算
       try {
-        const cache = await getCachePath(graphSignature2)
-        const cachedPath = cache?.path
-        const cachedStart = cache?.start_id
-        const cachedMin = cache?.min_steps
-        if (cachedPath && cachedPath.length>0 && cachedStart!=null) {
-          // 前端统一性二次验证
-          const idToIndex = new Map(triangles.map((t,i)=>[t.id,i]))
-          const neighbors = triangles.map(t=>t.neighbors)
-          const checkUniformPathCached = (startIdLocal, pathLocal)=>{
-            if (startIdLocal==null || !Array.isArray(pathLocal) || pathLocal.length===0) return false
-            const idxStart = idToIndex.get(startIdLocal)
-            if (idxStart==null) return false
-            let colorsLocal = triangles.map(t=>t.color)
-            for(let i=0;i<pathLocal.length;i++){
-              const stepColor = pathLocal[i]
-              const startColorCur = colorsLocal[idxStart]
-              if (stepColor===startColorCur) { return false }
-              const regionSet = new Set(); const q=[startIdLocal]; const visited=new Set([startIdLocal])
-              while(q.length){ const id=q.shift(); const idx=idToIndex.get(id); if (idx==null) return false; if (colorsLocal[idx]!==startColorCur) continue; regionSet.add(id); const nbs = neighbors[idx] || []; for(const nb of nbs){ if(!visited.has(nb)){ visited.add(nb); q.push(nb) } } }
-              if (regionSet.size===0) return false
-              for(const id of regionSet){ colorsLocal[idToIndex.get(id)] = stepColor }
-            }
-            const finalTris = triangles.map((t,i)=>({ ...t, color: colorsLocal[i] }))
-            return isUniform(finalTris)
-          }
-          const okUniform = checkUniformPathCached(cachedStart, cachedPath)
-          const okFlags = (cache?.is_unified===true && cache?.quality==='final')
-          if (okUniform && okFlags) {
-            const SNAPSHOT_LIMIT = 40
-            const snapshots = []
-            // Generate snapshot for each step
-            const fullPath = cachedPath.slice(0, SNAPSHOT_LIMIT)
-            snapshots.push(await captureCanvasPNG(triangles, canvasRef.current.width, canvasRef.current.height, cachedStart, []))
-            
-            let currentP = []
-            for(let k=0; k<fullPath.length; k++){
-               currentP.push(fullPath[k])
-               snapshots.push(await captureCanvasPNG(triangles, canvasRef.current.width, canvasRef.current.height, cachedStart, currentP))
-               if(k % 5 === 0) await new Promise(r=>setTimeout(r,0))
-            }
-            
-             setSteps([{ path: cachedPath, images: snapshots }])
+        const cached = await getCachedSolution(graphSignature2)
+        const cachedPath = cached?.paths?.[0]
+        const cachedStart = cached?.startId
+        const cacheSource = cached?.__cacheSource || '?'
+        if (cachedPath && cachedPath.length > 0 && cachedStart != null) {
+          const okUniform = verifyUnifiedPath({ triangles, startId: cachedStart, path: cachedPath })
+          const okStep = (!Number.isFinite(maxStepsLimit) || cachedPath.length <= maxStepsLimit)
+          if (okUniform && okStep) {
+            const snapshots = await buildStepSnapshots({ triangles, width: canvasRef.current.width, height: canvasRef.current.height, startId: cachedStart, path: cachedPath, maxSnap: 240, includeInitial: true })
+            setSteps([{ path: cachedPath, images: snapshots }])
             setBestStartId(cachedStart)
-            setStatus(`缓存预览：步骤 ${cachedMin??cachedPath.length}（起点 #${cachedStart}，继续计算中）`)
+            setStatus(`缓存命中(${cacheSource})：步骤 ${cachedPath.length}（起点 #${cachedStart}），上限 ${Number.isFinite(maxStepsLimit) ? maxStepsLimit : '∞'}`)
             setSolveProgress(null)
-            try { await telemetrySafeLog2({ status:'cache_preview', min_steps: cachedMin??cachedPath.length, best_start_id: cachedStart, graph_signature: graphSignature2 }) } catch {}
-            try { await uploadStrategyAuto(triangles, palette, 'continue_shortest', cachedStart, cachedPath) } catch {}
-          } else {
-            setStatus('缓存存在但未通过统一性校验，继续计算…')
-            await telemetrySafeLog2({ status:'cache_validation_failed', reason: okUniform? 'flag_not_final' : 'not_uniform', cached_len: cachedPath.length })
+            try { await telemetrySafeLog2({ status:'cache_hit', min_steps: cachedPath.length, best_start_id: cachedStart, graph_signature: graphSignature2 }) } catch {}
+            try { await uploadStrategyAuto(triangles, palette, 'continue_shortest_cache', cachedStart, cachedPath) } catch {}
+            try { if(__runId2) await telemetryFinishRun(__runId2, { status:'cache_hit', min_steps: cachedPath.length, best_start_id: cachedStart, time_ms: Date.now() - solveStartRef.current, graph_signature: graphSignature2 }) } catch {}
+            setSolving(false)
+            return
           }
+          // 不合格缓存：直接删除（本地 + 后端）
+          try { await deleteCachedSolutionEverywhere(graphSignature2) } catch {}
         }
       } catch {}
       await new Promise(r=>setTimeout(r,0))
@@ -1974,7 +2903,7 @@ const contribRef = useRef({ branch_pruned: 0, enqueued: 0, expanded: 0, critical
                   : p?.phase === 'components_build' ? `正在构建分量：${p?.count}（当前大小 ${p?.compSize??'-'}）`
                   : p?.phase === 'best_update' ? `已更新最优：起点 #${p?.bestStartId}，最少步骤 ${p?.minSteps}`
                   : `已探索节点：${nodes}，候选分支：${sols}`
-                setStatus(`正在继续计算最短步骤… ${phase}`)
+                setStatus(`计算中… ${phase}`)
             setSolveProgress({
               phase: p?.phase,
               nodes: p?.nodes,
@@ -2036,7 +2965,9 @@ const contribRef = useRef({ branch_pruned: 0, enqueued: 0, expanded: 0, critical
           : { ...(window.SOLVER_FLAGS||{}), useDFSFirst: false, returnFirstFeasible: false }
         try { worker.postMessage({ type:'set_flags', flags }) } catch {}
         const lightTris3 = triangles.map(t=>({ id: t.id, neighbors: t.neighbors, color: t.color, deleted: !!t.deleted }))
-        worker.postMessage({ type:'auto', triangles: lightTris3, palette, maxBranches, stepLimit: maxStepsLimit })
+        // 先 init 缓存 puzzle，再发 auto（后续若只调 flags/stepLimit，可只发 auto 不带 triangles/palette）
+        try { worker.postMessage({ type:'init', triangles: lightTris3, palette }) } catch {}
+        worker.postMessage({ type:'auto', maxBranches, stepLimit: maxStepsLimit })
         result = await resPromise
       } catch (err) {
         try{ window.__solverWorker = null }catch{}
@@ -2078,13 +3009,23 @@ const contribRef = useRef({ branch_pruned: 0, enqueued: 0, expanded: 0, critical
       const neighbors = triangles.map(t=>t.neighbors)
       const checkUnified = (path)=>{
         let colors = triangles.map(t=>t.color)
-        const startIdLocal = result.bestStartId
-        for(const color of path){
-          const startColorCur = colors[idToIndex.get(startIdLocal)]
-          if(color===startColorCur) continue
-          const regionSet = new Set(); const q=[startIdLocal]; const visited=new Set([startIdLocal])
+        const applyOne = (sid, color)=>{
+          const idxS = idToIndex.get(sid)
+          if (idxS==null) return false
+          const startColorCur = colors[idxS]
+          if(color===startColorCur) return true
+          const regionSet = new Set(); const q=[sid]; const visited=new Set([sid])
           while(q.length){ const id=q.shift(); const idx=idToIndex.get(id); if(colors[idx]!==startColorCur) continue; regionSet.add(id); for(const nb of neighbors[idx]){ if(!visited.has(nb)){ visited.add(nb); q.push(nb) } } }
           for(const id of regionSet){ colors[idToIndex.get(id)] = color }
+          return true
+        }
+        const fallbackStart = result.bestStartId
+        for(const step of path){
+          const isObj = step && typeof step === 'object'
+          const sid = isObj ? step.startId : fallbackStart
+          const color = isObj ? step.color : step
+          if (sid==null || !color) return false
+          if (!applyOne(sid, color)) return false
         }
         const finalTris = triangles.map((t,i)=>({ ...t, color: colors[i] }))
         return isUniform(finalTris)
@@ -2099,17 +3040,52 @@ const contribRef = useRef({ branch_pruned: 0, enqueued: 0, expanded: 0, critical
       const SNAPSHOT_LIMIT = 40
       for (const path of unifiedPaths) {
         setStatus(`正在生成步骤快照… (${stepImgs.length+1}/${result.paths.length})`)
-        const snapshots = await captureCanvasPNG(triangles, canvasRef.current.width, canvasRef.current.height, result.bestStartId, path.slice(0, SNAPSHOT_LIMIT))
-         stepImgs.push({ path, images: [snapshots] })
+        const snapshots = await buildStepSnapshots({ triangles, width: canvasRef.current.width, height: canvasRef.current.height, startId: result.bestStartId, path, maxSnap: SNAPSHOT_LIMIT, includeInitial: true })
+         stepImgs.push({ path, images: snapshots })
         await new Promise(r=>setTimeout(r,0))
       }
       setSteps(stepImgs)
       setBestStartId(result.bestStartId ?? null)
       setStatus(`已更新为最短步骤（自动起点 #${result.bestStartId}），最少步骤：${result.minSteps}`)
       setSolveProgress(null)
-      try { await putCachePath(graphSignature2, { path: unifiedPaths[0]||[], min_steps: result.minSteps, start_id: result.bestStartId, flags: window.SOLVER_FLAGS, is_unified: true, quality: 'final' }) } catch {}
-      try { await uploadStrategyAuto(triangles, palette, 'continue_shortest', result.bestStartId, unifiedPaths[0]||[]) } catch {}
-      try { await recordRunScore(graphSignature2, { run_id: __runId2, algo_name: (window.SOLVER_FLAGS?.heuristicName||'default'), min_steps: result.minSteps, best_start_id: result.bestStartId, time_ms: Date.now() - solveStartRef.current, is_unified: true, quality: 'final', source: 'continue_shortest', flags: window.SOLVER_FLAGS }) } catch {}
+      try {
+        const bestPath = unifiedPaths?.[0]
+        const okUniform = (bestPath && result.bestStartId!=null) ? verifyUnifiedPath({ triangles, startId: result.bestStartId, path: bestPath }) : false
+        const okStep = (bestPath && Array.isArray(bestPath)) ? (!Number.isFinite(maxStepsLimit) || bestPath.length <= maxStepsLimit) : false
+        if (okUniform && okStep) {
+          try {
+            const win = result?.__winner || null
+            const lines = Array.isArray(progressLogsRef.current) ? progressLogsRef.current.slice(-800) : []
+            await saveQualifiedSolveLog({
+              graph_signature: graphSignature2,
+              timestamp: Date.now(),
+              min_steps: bestPath.length,
+              best_start_id: result.bestStartId,
+              winner: win,
+              summary: `QUALIFIED(continue_shortest) len=${bestPath.length} start=${result.bestStartId} winner=${win?.workerIndex!=null?('W'+(win.workerIndex+1)+(win.group||'')):'-'}`,
+              flags: (function(){
+                try {
+                  const f = window.SOLVER_FLAGS || {}
+                  return {
+                    strictMode: !!f.strictMode,
+                    strictParallelWorkers: f.strictParallelWorkers ?? null,
+                    enableSATPlanner: !!f.enableSATPlanner,
+                    enableRAGMacro: !!f.enableRAGMacro,
+                    enableLearningPrioritizer: !!f.enableLearningPrioritizer,
+                    heuristicName: f.heuristicName || null,
+                    parallelWorkers: f.parallelWorkers ?? null,
+                    mode: 'continue_shortest',
+                  }
+                } catch { return null }
+              })(),
+              lines,
+            })
+          } catch {}
+          await saveCachedSolutionWithPuzzle(graphSignature2, { startId: result.bestStartId, paths: [bestPath], minSteps: bestPath.length }, makePuzzlePayload(triangles, palette), window.SOLVER_FLAGS)
+          await uploadStrategyAuto(triangles, palette, 'continue_shortest', result.bestStartId, bestPath)
+          await recordRunScore(graphSignature2, { run_id: __runId2, algo_name: (window.SOLVER_FLAGS?.heuristicName||'default'), min_steps: bestPath.length, best_start_id: result.bestStartId, time_ms: Date.now() - solveStartRef.current, is_unified: true, quality: 'final', source: 'continue_shortest', flags: window.SOLVER_FLAGS })
+        }
+      } catch {}
             try { await postLearnScore(graphSignature2, { run_id: __runId2, graph_signature: graphSignature2, is_unified: true, path_len: result.minSteps, algo_scores: (()=>{ const m = { lb_improve_total: contribRef.current.lb_improve_total||0, branch_pruned_count: contribRef.current.branch_pruned||0, expansion_saved_est: Math.max(0, (contribRef.current.enqueued||0)-(contribRef.current.expanded||0)), critical_hits: contribRef.current.critical_hits||0, path_len_reduction: contribRef.current.path_len_reduction||0 }; const w = { lb:0.35, prune:0.25, expand:0.25, critical:0.10, path:0.05 }; const denom = Math.max(1, m.lb_improve_total + m.branch_pruned_count + m.expansion_saved_est + m.critical_hits + m.path_len_reduction); const norm = { lb: m.lb_improve_total/denom, prune: m.branch_pruned_count/denom, expand: m.expansion_saved_est/denom, critical: m.critical_hits/denom, path: m.path_len_reduction/denom }; const f = window.SOLVER_FLAGS||{}; const mods = []; const add=(key, engaged)=>{ if(!engaged) return; const score=100*(w.lb*norm.lb + w.prune*norm.prune + w.expand*norm.expand + w.critical*norm.critical + w.path*norm.path); mods.push({ key, score, metrics: m })}; add('ucb_prioritizer', !!f.enableLearningPrioritizer); add('bridge_first', !!f.enableBridgeFirst); add('best_first', !!f.enableBestFirst); add('a_star_lb', !!f.useAStarInBestFirst || !!f.useStrongLBInBestFirst); add('beam_search', !!f.enableBeam); add('lookahead', !!f.enableLookahead || !!f.enableLookaheadDepth2); add('zero_expand_filter', !!f.enableZeroExpandFilter); add('pdb', !!f.enablePDBAutoLoad); add('local_repair', !!f.optimizeEnableWindow || !!f.optimizeEnableRemoval || (Number(f.optimizeSwapPasses)||0)>0 ); add('sat_planner', !!f.enableSATPlanner); return mods; })() }) } catch {}
       try { if(__runId2) await telemetryFinishRun(__runId2, { status:'finished', min_steps: result.minSteps, best_start_id: result.bestStartId, time_ms: Date.now() - solveStartRef.current, graph_signature: graphSignature2 }) } catch {}
     } catch (err) {
@@ -2131,7 +3107,7 @@ const contribRef = useRef({ branch_pruned: 0, enqueued: 0, expanded: 0, critical
       const originalPath = steps[0]?.path
       const sid = bestStartId ?? pickHeuristicStartId(triangles)
       setSolving(true)
-      setStatus('正在进行路径优化（反思 / 拆解 / 压缩）…')
+      setStatus('计算中…')
       setSolveProgress({ phase: 'optimize_init' })
       setProgressLogs([])
       solveStartRef.current = Date.now()
@@ -2141,107 +3117,174 @@ const contribRef = useRef({ branch_pruned: 0, enqueued: 0, expanded: 0, critical
       const telemetrySafeLog3 = async (payload)=>{ try{ if(__runId3) await telemetryLogEvent(__runId3, payload) }catch{} }
       await new Promise(r=>setTimeout(r,0))
       let result = null
-      // 优化方案
-      // ... (existing code) ...
-      // try {
-      //   const worker = new Worker(new URL('./utils/solver-worker.js', import.meta.url), { type: 'module' })
-      //   try { window.__solverWorker = worker } catch {}
-      //   const resPromise = new Promise((resolve, reject)=>{
-      //     // const timeout = setTimeout(()=>{ try{ worker.terminate() }catch{}; try{ window.__solverWorker = null }catch{}; reject(new Error('worker-timeout')) }, 180000)
-      //     worker.onmessage = (ev)=>{
-      //       // ...
-      //     }
-      //   })
-      //   // ...
-      //   result = await resPromise
-      // } catch (err) {
-      //   // ...
-      // }
-      // 临时禁用 worker 优化，直接使用主线程回退逻辑，或者确保 worker 不会被超时杀死
-      // 但为了简单起见，我们还是用 worker，只是去掉了超时。
-      // 上面的 SearchReplace 已经尝试去掉超时，但是可能没生效或者文件版本问题。
-      // 让我们再试一次，精确定位。
+      // 并行优化：复用并行线程配置，启动 N 个 worker 同时优化当前方案；参数分组避免重复。
+      // 不影响正常调度：不触碰 window.__solverWorker/__solverWorkers（只在本函数内部管理并终止）。
       try {
-        const worker = new Worker(new URL('./utils/solver-worker.js', import.meta.url), { type: 'module' })
-        try { window.__solverWorker = worker } catch {}
-        const resPromise = new Promise((resolve, reject)=>{
-          // const timeout = setTimeout(()=>{ try{ worker.terminate() }catch{}; try{ window.__solverWorker = null }catch{}; reject(new Error('worker-timeout')) }, 180000)
-          worker.onmessage = (ev)=>{
-            const { type, payload } = ev.data || {}
-            if(type==='progress'){
-              const p = payload
+        const uiFlags0 = (window.SOLVER_FLAGS || {})
+        const wantRaw = Number(uiFlags0.parallelWorkers)
+        const want = Number.isFinite(wantRaw) ? Math.max(1, Math.min(24, Math.floor(wantRaw))) : 8
+        const hw = (typeof navigator !== 'undefined' && navigator.hardwareConcurrency) ? Number(navigator.hardwareConcurrency) : null
+        const allowOver = !!uiFlags0.parallelOvercommit
+        const safeCap = (Number.isFinite(hw) && hw > 0 && !allowOver) ? Math.max(1, Math.min(24, hw)) : 24
+        const PAR_N = Math.min(want, safeCap)
+
+        const workers = []
+        const results = []
+        const startTs = Date.now()
+        const hardTimeout = Math.max(20000, Math.min(120000, (uiFlags0.optimizeTimeBudgetMs ?? 60000)))
+
+        const lightTris = triangles.map(t=>({ id: t.id, neighbors: t.neighbors, color: t.color, deleted: !!t.deleted }))
+        // 优化也继承“高评分hub/内部桥梁”策略：否则容易只在慢扩张路线里微调，错过两步破局
+        const focusIds = (function(){
+          try { return computeFocusAnchorIds(triangles, { topK: 18, betweenK: 10, neighborK: 10, pathK: 14, pathMaxDepth: 6 }) } catch { return [] }
+        })()
+        const hubIds = (function(){
+          try { return computeHubAnchorIds(triangles, { topK: 6 }) } catch { return [] }
+        })()
+        const internalIds = (function(){
+          // 优化阶段不需要 top3 限死：取较多候选，提高“多线程不同点试探”的覆盖面
+          try { return computeInternalTwoHopIds(triangles, { hubsK: 6, topK: 12 }) } catch { return [] }
+        })()
+
+        const mkOptFlags = (wIdx)=>{
+          const mode = wIdx % 6
+          // 大多数 worker 只做局部优化（更轻），少量 worker 做全局重算（更重）
+          const enableGlobal = (mode === 0 || mode === 3)
+          const internalOnly = (mode === 0 || mode === 3) && internalIds.length
+          const base = { ...(window.SOLVER_FLAGS||{}), mode: 'optimize_path', workerVariant: wIdx }
+          return {
+            ...base,
+            focusAnchorIds: focusIds,
+            hubAnchorIds: hubIds,
+            internalBridgeIds: internalIds,
+            internalBridgeOnly: !!internalOnly,
+            optimizeTimeBudgetMs: Math.max(8000, Math.floor(hardTimeout * (enableGlobal ? 1.0 : 0.55))),
+            optimizeEnableGlobalSearch: enableGlobal,
+            // 参数扰动：避免重复
+            optimizeWindowSize: (mode===1?6: mode===2?4: 5),
+            optimizeEnableBeamWindow: (mode===2 || mode===3),
+            optimizeBeamWidth: (mode===3?6: mode===2?4: 3),
+            optimizeBeamWindows: (mode===3?3: 2),
+            optimizeEnableRemoval: true,
+            optimizeEnableBoundTrim: (mode!==4),
+            optimizeEnableSwap: true,
+            optimizeSwapPasses: (mode===5?2:1),
+            // 进一步强化“省两步桥接”的价值
+            multiAnchorHubW: Math.max(32, Number(base.multiAnchorHubW||24) || 24),
+            multiAnchorHub2W: Math.max(22, Number(base.multiAnchorHub2W||14) || 14),
+            multiAnchorHubDepth: 2,
+          }
+        }
+
+        const runOne = (wIdx)=> new Promise((resolve)=>{
+          let w = null
+          try { w = new Worker(new URL('./utils/solver-worker.js', import.meta.url), { type: 'module' }) } catch { return resolve(null) }
+          workers.push(w)
+          let done = false
+          const finish = (payload)=>{
+            if (done) return
+            done = true
+            try { w.terminate() } catch {}
+            resolve(payload || null)
+          }
+          const logLine = (msg)=>{
+            try {
               const now = Date.now()
-              if (now - progressLastRef.current > 200) {
-                const phase = p?.phase || 'optimize'
-                setStatus(`正在路径优化… 阶段：${phase}`)
-                setSolveProgress({ phase, criticalCount: p?.criticalCount, minSteps: p?.minSteps, components: p?.count })
-                const perf = p?.perf || {}
-                if (typeof p?.criticalCount === 'number') { contribRef.current.critical_hits += p.criticalCount }
-                if (typeof perf?.enqueued === 'number') { contribRef.current.enqueued += perf.enqueued }
-                if (typeof perf?.expanded === 'number') { contribRef.current.expanded += perf.expanded }
-                const line = `[${((now - solveStartRef.current)/1000).toFixed(1)}s] phase=${phase} crit=${p?.criticalCount??'-'} min=${p?.minSteps??'-'} enq=${perf?.enqueued??'-'} exp=${perf?.expanded??'-'}`
-                setProgressLogs(prev=>{ const next=[...prev,line]; return next.length>200 ? next.slice(next.length-200) : next })
+              const line = `[${((now - startTs)/1000).toFixed(1)}s][opt-W${wIdx+1}] ${msg}`
+              setProgressLogs(prev=>{
+                const next = [...prev, line]
+                return next.length > 400 ? next.slice(next.length - 400) : next
+              })
+            } catch {}
+          }
+          w.onmessage = (ev)=>{
+            const { type, payload } = ev.data || {}
+            if (type === 'progress') {
+              const now = Date.now()
+              if (now - progressLastRef.current > 250) {
+                const phase = payload?.phase || 'optimize'
+                setStatus(`计算中… ${phase}`)
+                setSolveProgress({ phase, elapsedMs: now - startTs })
                 progressLastRef.current = now
-                telemetrySafeLog3({ phase, perf, extra: { criticalCount: p?.criticalCount, minSteps: p?.minSteps, components: p?.count } })
               }
-            } else if(type==='result'){
-              // clearTimeout(timeout)
-              try{ worker.terminate() }catch{}
-              try{ window.__solverWorker = null }catch{}
-              resolve(payload)
+              // 记录更细的日志（不做强节流，方便排查卡住在哪）
+              try { logLine(`phase=${payload?.phase||'optimize'} len=${payload?.len??payload?.optimizedLen??'-'} crit=${payload?.criticalCount??'-'} reason=${payload?.reason??'-'}`) } catch {}
+            } else if (type === 'result') {
+              finish(payload)
             }
           }
-        })
-        // 确保使用 DFS-first 与早停寻找更短路径
-        const flags = { ...(window.SOLVER_FLAGS||{}), useDFSFirst: true, returnFirstFeasible: true }
-        try { worker.postMessage({ type:'set_flags', flags }) } catch {}
-        const lightTris5 = triangles.map(t=>({ id: t.id, neighbors: t.neighbors, color: t.color, deleted: !!t.deleted }))
-        worker.postMessage({ type:'optimize', triangles: lightTris5, palette, startId: sid, path: originalPath })
-        result = await resPromise
-      } catch (err) {
-        try{ window.__solverWorker = null }catch{}
-        // 回退：主线程路径优化
-        const lightTris6 = triangles.map(t=>({ id: t.id, neighbors: t.neighbors, color: t.color, deleted: !!t.deleted }))
-        result = await window.OptimizeSolution?.(lightTris6, palette, sid, originalPath, (p)=>{
-          const now = Date.now()
-          const phase = p?.phase || 'optimize'
-          if (now - progressLastRef.current > 200) {
-            setStatus(`正在路径优化… 阶段：${phase}`)
-            setSolveProgress({ phase, criticalCount: p?.criticalCount, minSteps: p?.minSteps })
-            if (typeof p?.criticalCount === 'number') { contribRef.current.critical_hits += p.criticalCount }
-            const line = `[${((now - solveStartRef.current)/1000).toFixed(1)}s] phase=${phase} crit=${p?.criticalCount??'-'} min=${p?.minSteps??'-'}`
-            setProgressLogs(prev=>{ const next=[...prev,line]; return next.length>200 ? next.slice(next.length-200) : next })
-            progressLastRef.current = now
-            telemetrySafeLog3({ phase, extra: { criticalCount: p?.criticalCount, minSteps: p?.minSteps } })
+          w.onerror = (e)=>{
+            try { logLine(`error=${String(e?.message||e)}`) } catch {}
+            finish(null)
           }
+          w.onmessageerror = (e)=>{
+            try { logLine(`messageerror=${String(e?.message||e)}`) } catch {}
+            finish(null)
+          }
+          try { w.postMessage({ type:'set_flags', flags: mkOptFlags(wIdx) }) } catch {}
+          try { w.postMessage({ type:'optimize', triangles: lightTris, palette, startId: sid, path: originalPath }) } catch { finish(null) }
+          // 兜底超时
+          setTimeout(()=>{ try { logLine('timeout') } catch {}; finish(null) }, hardTimeout + 5000)
         })
+
+        const payloads = await Promise.all(Array.from({ length: PAR_N }, (_,i)=>runOne(i)))
+        for (const p of payloads) { if (p) results.push(p) }
+        // 选最短且统一的结果
+        const candidates = results
+          .filter(r=>Array.isArray(r.optimizedPath) && Number.isFinite(r.optimizedLen))
+          .map(r=>{
+            const ok = verifyUnifiedPath({ triangles, startId: (r.bestStartId ?? sid), path: r.optimizedPath })
+            return { ...r, ok }
+          })
+          .filter(x=>x.ok)
+        candidates.sort((a,b)=> (a.optimizedLen - b.optimizedLen) || ((b.shortened?1:0)-(a.shortened?1:0)))
+        result = candidates[0] || results[0] || null
+        try { for (const w of workers) { try { w.terminate() } catch {} } } catch {}
+      } catch (err) {
+        console.warn('parallel optimize failed', err)
+        result = null
       }
+
       if (!result) { setStatus('路径优化失败'); setSolveProgress(null); return }
-      // 本地统一性校验：仅在“更短且统一”时替换展示
-      const checkUniformPath = (tris, startIdLocal, pathLocal)=>{
-        const idToIndex = new Map(tris.map((t,i)=>[t.id,i]))
-        const neighbors = tris.map(t=>t.neighbors)
-        const isUniformFast = (colorsArr)=>{
-          let first=null
-          for(let i=0;i<tris.length;i++){ const t=tris[i]; const c=colorsArr[i]; if(t.deleted || !c || c==='transparent') continue; if(first===null){ first=c } else if(c!==first){ return false } }
-          return first!==null
-        }
-        let colorsLocal = tris.map(t=>t.color)
-        const buildRegion = (colorsArr)=>{ const rc = colorsArr[idToIndex.get(startIdLocal)]; const rs=new Set(); const q=[startIdLocal]; const v=new Set([startIdLocal]); while(q.length){ const id=q.shift(); const idx=idToIndex.get(id); if(colorsArr[idx]!==rc) continue; rs.add(id); for(const nb of neighbors[idx]){ if(!v.has(nb)){ v.add(nb); q.push(nb) } } } return rs }
-        for(const stepColor of pathLocal){ const reg = buildRegion(colorsLocal); for(const id of reg){ colorsLocal[idToIndex.get(id)] = stepColor } }
-        return isUniformFast(colorsLocal)
-      }
       const isUniformOut = Array.isArray(result.optimizedPath)
-        ? checkUniformPath(triangles, result.bestStartId ?? sid, result.optimizedPath)
+        ? verifyUnifiedPath({ triangles, startId: (result.bestStartId ?? sid), path: result.optimizedPath })
         : false
       if (result.shortened && result.optimizedPath && result.optimizedLen < (originalPath?.length||Infinity) && isUniformOut){
         // 生成新的快照
         const SNAPSHOT_LIMIT = 40
-        const snapshots = await captureCanvasPNG(triangles, canvasRef.current.width, canvasRef.current.height, result.bestStartId ?? sid, result.optimizedPath.slice(0, SNAPSHOT_LIMIT))
-         setSteps([{ path: result.optimizedPath, images: [snapshots] }])
+        const snapshots = await buildStepSnapshots({ triangles, width: canvasRef.current.width, height: canvasRef.current.height, startId: (result.bestStartId ?? sid), path: result.optimizedPath, maxSnap: SNAPSHOT_LIMIT, includeInitial: true })
+         setSteps([{ path: result.optimizedPath, images: snapshots }])
         setBestStartId(result.bestStartId ?? sid)
         setStatus(`路径优化成功：由 ${originalPath.length} 步缩短为 ${result.optimizedLen} 步（起点 #${result.bestStartId ?? sid}）`)
-        try { await putCachePath(graphSignature3, { path: result.optimizedPath, min_steps: result.optimizedLen, start_id: result.bestStartId ?? sid, flags: window.SOLVER_FLAGS, is_unified: true, quality: 'final' }) } catch {}
+        // 合格解日志（优化后）：单独存入浏览器“求解日志库”，不随清除解缓存删除
+        try {
+          const lines = Array.isArray(progressLogsRef.current) ? progressLogsRef.current.slice(-800) : []
+          await saveQualifiedSolveLog({
+            graph_signature: graphSignature3,
+            timestamp: Date.now(),
+            min_steps: result.optimizedLen,
+            best_start_id: (result.bestStartId ?? sid),
+            winner: result?.__winner || null,
+            summary: `QUALIFIED(optimize_path) len=${result.optimizedLen} start=${result.bestStartId ?? sid}`,
+            flags: (function(){
+              try {
+                const f = window.SOLVER_FLAGS || {}
+                return {
+                  strictMode: !!f.strictMode,
+                  strictParallelWorkers: f.strictParallelWorkers ?? null,
+                  enableSATPlanner: !!f.enableSATPlanner,
+                  enableRAGMacro: !!f.enableRAGMacro,
+                  enableLearningPrioritizer: !!f.enableLearningPrioritizer,
+                  heuristicName: f.heuristicName || null,
+                  parallelWorkers: f.parallelWorkers ?? null,
+                  mode: 'optimize_path',
+                }
+              } catch { return null }
+            })(),
+            lines,
+          })
+        } catch {}
+        try { await saveCachedSolutionWithPuzzle(graphSignature3, { startId: (result.bestStartId ?? sid), paths: [result.optimizedPath], minSteps: result.optimizedLen }, makePuzzlePayload(triangles, palette), window.SOLVER_FLAGS) } catch {}
         try { await recordRunScore(graphSignature3, { run_id: __runId3, algo_name: (window.SOLVER_FLAGS?.heuristicName||'default'), min_steps: result.optimizedLen, best_start_id: result.bestStartId ?? sid, time_ms: Date.now() - solveStartRef.current, is_unified: true, quality: 'final', source: 'optimize_path', flags: window.SOLVER_FLAGS }) } catch {}
         try { contribRef.current.path_len_reduction += Math.max(0, (originalPath?.length||0) - result.optimizedLen) } catch {}
         try { await postLearnScore(graphSignature3, { run_id: __runId3, graph_signature: graphSignature3, is_unified: true, path_len: result.optimizedLen, algo_scores: (()=>{ const m = { lb_improve_total: contribRef.current.lb_improve_total||0, branch_pruned_count: contribRef.current.branch_pruned||0, expansion_saved_est: Math.max(0, (contribRef.current.enqueued||0)-(contribRef.current.expanded||0)), critical_hits: contribRef.current.critical_hits||0, path_len_reduction: contribRef.current.path_len_reduction||0 }; const w = { lb:0.35, prune:0.25, expand:0.25, critical:0.10, path:0.05 }; const denom = Math.max(1, m.lb_improve_total + m.branch_pruned_count + m.expansion_saved_est + m.critical_hits + m.path_len_reduction); const norm = { lb: m.lb_improve_total/denom, prune: m.branch_pruned_count/denom, expand: m.expansion_saved_est/denom, critical: m.critical_hits/denom, path: m.path_len_reduction/denom }; const f = window.SOLVER_FLAGS||{}; const mods = []; const add=(key, engaged)=>{ if(!engaged) return; const score=100*(w.lb*norm.lb + w.prune*norm.prune + w.expand*norm.expand + w.critical*norm.critical + w.path*norm.path); mods.push({ key, score, metrics: m })}; add('ucb_prioritizer', !!f.enableLearningPrioritizer); add('bridge_first', !!f.enableBridgeFirst); add('best_first', !!f.enableBestFirst); add('a_star_lb', !!f.useAStarInBestFirst || !!f.useStrongLBInBestFirst); add('beam_search', !!f.enableBeam); add('lookahead', !!f.enableLookahead || !!f.enableLookaheadDepth2); add('zero_expand_filter', !!f.enableZeroExpandFilter); add('pdb', !!f.enablePDBAutoLoad); add('local_repair', !!f.optimizeEnableWindow || !!f.optimizeEnableRemoval || (Number(f.optimizeSwapPasses)||0)>0 ); add('sat_planner', !!f.enableSATPlanner); return mods; })() }) } catch {}
@@ -2249,7 +3292,8 @@ const contribRef = useRef({ branch_pruned: 0, enqueued: 0, expanded: 0, critical
         try { await uploadStrategyAuto(triangles, palette, 'optimize_path', (result.bestStartId ?? sid), result.optimizedPath, (result?.analysis?.critical||null)) } catch {}
       } else {
         setStatus('未发现更短且统一的路径（已完成关键节点分析，可查看日志）')
-        const isUniformOrig = checkUniformPath(triangles, sid, originalPath)
+        // 仅用于调试展示（避免引用已删除函数）
+        try { verifyUnifiedPath({ triangles, startId: sid, path: originalPath }) } catch {}
         
         try { if(__runId3) await telemetryFinishRun(__runId3, { status:'finished', min_steps: originalPath?.length, best_start_id: sid, time_ms: Date.now() - solveStartRef.current, graph_signature: graphSignature3 }) } catch {}
         try { await uploadStrategyAuto(triangles, palette, 'optimize_path', sid, originalPath, (result?.analysis?.critical||null)) } catch {}
@@ -2281,6 +3325,29 @@ const contribRef = useRef({ branch_pruned: 0, enqueued: 0, expanded: 0, critical
     catch { setStatus('复制失败，可手动选择文本复制') }
   }, [progressLogs, maxStepsLimit, triangles, palette])
   const onClearLogs = useCallback(()=>{ setProgressLogs([]); setStatus('已清空进度日志') }, [])
+
+  const onOpenSolveLogs = useCallback(async ()=>{
+    try {
+      const list = await listQualifiedSolveLogs(80)
+      setQualifiedLogs(Array.isArray(list) ? list : [])
+      setSelectedQualifiedLog(null)
+      setShowSolveLogModal(true)
+      setStatus(`已加载求解日志：${Array.isArray(list) ? list.length : 0} 条`)
+    } catch (e) {
+      setStatus(`读取求解日志失败：${String(e?.message||e).slice(0,120)}`)
+    }
+  }, [])
+
+  const onClearSolutionCacheOnly = useCallback(async ()=>{
+    try {
+      const ok = window.confirm('确认清除“题目+合格解”的浏览器缓存（IndexedDB）？\n说明：这不会删除后端数据库缓存；也不会清除“合格解策略记录/求解日志”。')
+      if (!ok) return
+      const res = await clearAllCachedSolutionsLocal()
+      setStatus(`已清除解缓存：ok=${res?.ok??false} deleted=${res?.deleted ?? 'unknown'}（求解日志未清除）`)
+    } catch (e) {
+      setStatus(`清除解缓存失败：${String(e?.message||e).slice(0,120)}`)
+    }
+  }, [])
   // 日志窗口自动滚动到最新（可关闭）
   useEffect(()=>{
     if (!autoScroll) return
@@ -2539,7 +3606,75 @@ const contribRef = useRef({ branch_pruned: 0, enqueued: 0, expanded: 0, critical
     setInitialDeletedIds(deletedIds)
     setEditMode(false)
     setStatus('已保存编辑为存档点：撤销/重做将回到此状态')
+
+    // 保存后异步生成色块统计与编号快照（避免阻塞 UI）
+    try {
+      setRegionStatsReady(false)
+      setRegionStatsComputing(true)
+      const trisSnap = triangles.map(t=>({ ...t }))
+      const gridSnap = { ...grid }
+      const rotSnap = rotation
+      setTimeout(() => {
+        try {
+          const stats = computeRegionStats(trisSnap)
+          const png = renderRegionStatsSnapshotPNG({ grid: gridSnap, triangles: trisSnap, rotation: rotSnap, regionStats: stats })
+          setRegionStats(stats)
+          setRegionStatsPng(png)
+          setRegionStatsReady(true)
+        } catch (e) {
+          console.warn('region stats failed', e)
+          setRegionStats(null)
+          setRegionStatsPng(null)
+          setRegionStatsReady(false)
+        } finally {
+          setRegionStatsComputing(false)
+        }
+      }, 30)
+    } catch {}
   }, [grid, triangles, palette, selectedColor])
+
+  // 随时重算色块统计（用于代码更新/调参后验证评分变化）
+  const recomputeRegionStats = useCallback(() => {
+    if (!grid || !Array.isArray(triangles) || triangles.length === 0) return
+    try {
+      setRegionStatsReady(false)
+      setRegionStatsComputing(true)
+      const trisSnap = triangles.map(t=>({ ...t }))
+      const gridSnap = { ...grid }
+      const rotSnap = rotation
+      setTimeout(() => {
+        try {
+          const stats = computeRegionStats(trisSnap)
+          const png = renderRegionStatsSnapshotPNG({ grid: gridSnap, triangles: trisSnap, rotation: rotSnap, regionStats: stats })
+          setRegionStats(stats)
+          setRegionStatsPng(png)
+          setRegionStatsReady(true)
+        } catch (e) {
+          console.warn('region stats failed', e)
+          setRegionStats(null)
+          setRegionStatsPng(null)
+          setRegionStatsReady(false)
+        } finally {
+          setRegionStatsComputing(false)
+        }
+      }, 30)
+    } catch {}
+  }, [grid, triangles, rotation])
+
+  // 编辑期间实时统计色块数量（节流）
+  useEffect(() => {
+    if (!grid || !Array.isArray(triangles) || triangles.length === 0) { setRegionCountLive(null); return }
+    let timer = null
+    timer = setTimeout(() => {
+      try {
+        const stats = computeRegionStats(triangles)
+        setRegionCountLive(stats?.count ?? null)
+      } catch {
+        setRegionCountLive(null)
+      }
+    }, 220)
+    return () => { try { if (timer) clearTimeout(timer) } catch {} }
+  }, [grid, triangles, editMode, rotation])
 
   const onEnterEdit = useCallback(() => {
     setEditMode(true)
@@ -2689,6 +3824,9 @@ const contribRef = useRef({ branch_pruned: 0, enqueued: 0, expanded: 0, critical
           <button onClick={onSelectSameColor} disabled={triangles.length===0}>选择同色</button>
           <button onClick={onBulkReplaceToSelected} disabled={!selectedColor || selectedIds.length===0}>批量替换为选色</button>
           <button onClick={onSolve} disabled={solving || triangles.length===0}>{solving ? '计算中…' : '自动求解'}</button>
+          <span style={{ marginLeft: '.25rem', fontSize:'12px', color:'#7f8aa8' }}>
+            色块：{regionCountLive==null ? '-' : regionCountLive}
+          </span>
           <span style={{ marginLeft: '.5rem', display:'inline-flex', alignItems:'center', gap:'.25rem', color:'#a9b3c9' }}>
             <label htmlFor="stepLimit">步数上限</label>
             <input
@@ -2713,7 +3851,16 @@ const contribRef = useRef({ branch_pruned: 0, enqueued: 0, expanded: 0, critical
               <button onClick={onSaveEdit}>保存编辑</button>
             </>
           ) : (
-            <button onClick={onEnterEdit}>进入编辑</button>
+            <>
+              <button onClick={onEnterEdit}>进入编辑</button>
+              {regionStatsComputing ? (
+                <button disabled title="正在统计色块与评分…">统计中…</button>
+              ) : regionStatsReady ? (
+                <button onClick={()=>setShowRegionStats(true)}>查看统计信息（{regionStats?.count ?? 0}）</button>
+              ) : (
+                <button disabled title="请先点击“保存编辑”，统计完成后即可查看">查看统计信息</button>
+              )}
+            </>
           )}
         </div>
         <div style={{ marginTop: '.5rem', padding: '.5rem', border: '1px solid var(--border)', borderRadius: '8px', background: '#121826' }}>
@@ -2835,6 +3982,11 @@ const contribRef = useRef({ branch_pruned: 0, enqueued: 0, expanded: 0, critical
             }} />
           </div>
           <div className="row" style={{ marginTop: '.25rem' }}>
+            <label>调试</label>
+            <button onClick={onOpenSolveLogs} title="查看“合格解”产生时的策略/模块参与与关键日志（独立存储，不随清除解缓存删除）">查看求解日志</button>
+            <button onClick={onClearSolutionCacheOnly} style={{ marginLeft: '.5rem' }} title="只清除题目+合格解缓存（IndexedDB solutions），不会删除求解日志/策略记录">清除解缓存</button>
+          </div>
+          <div className="row" style={{ marginTop: '.25rem' }}>
             <label>导入选项</label>
             <label style={{ display:'inline-flex', alignItems:'center', gap:'.35rem' }} title="开启后：导入时忽略快照中的调色板，只保留导入画布中出现的颜色">
               <input type="checkbox" checked={importPaletteOnlyFromTriangles} onChange={e=>setImportPaletteOnlyFromTriangles(e.target.checked)} />
@@ -2853,6 +4005,254 @@ const contribRef = useRef({ branch_pruned: 0, enqueued: 0, expanded: 0, critical
         </div>
         <StepsPanel steps={steps} />
       </div>
+
+      {/* 合格解求解日志弹窗：独立存储（不随“清除解缓存”删除） */}
+      {showSolveLogModal && (
+        <div style={{ position:'fixed', inset:0, background:'rgba(0,0,0,0.42)', zIndex:9999, display:'flex', alignItems:'center', justifyContent:'center' }}>
+          <div className="panel" style={{ width:'min(1100px, 92vw)', height:'min(86vh, 860px)', overflow:'hidden', background:'var(--panel)', display:'flex', flexDirection:'column' }}>
+            <div style={{ display:'flex', alignItems:'center', justifyContent:'space-between', gap:'10px', padding:'12px 12px 8px 12px', borderBottom:'1px solid var(--border)' }}>
+              <div style={{ display:'flex', flexDirection:'column' }}>
+                <div style={{ fontSize:'14px', color:'var(--muted)' }}>求解日志（仅合格解）</div>
+                <div style={{ fontSize:'12px', color:'#7f8aa8' }}>该日志库独立存储：清除“解缓存”不会影响这里的策略/模块记录。</div>
+              </div>
+              <div style={{ display:'inline-flex', gap:'8px', alignItems:'center' }}>
+                <button
+                  className="small-btn"
+                  style={{ fontSize:'12px' }}
+                  onClick={async ()=>{
+                    try {
+                      const list = await listQualifiedSolveLogs(80)
+                      setQualifiedLogs(Array.isArray(list) ? list : [])
+                      setSelectedQualifiedLog(null)
+                      setStatus(`已刷新求解日志：${Array.isArray(list) ? list.length : 0} 条`)
+                    } catch {}
+                  }}
+                  title="重新从浏览器日志库读取"
+                >
+                  刷新
+                </button>
+                <button onClick={()=>setShowSolveLogModal(false)} className="small-btn" style={{ fontSize:'12px' }}>关闭</button>
+              </div>
+            </div>
+
+            <div style={{ display:'grid', gridTemplateColumns:'minmax(320px, 0.9fr) 1.1fr', gap:'12px', padding:'12px', overflow:'auto' }}>
+              <div style={{ border:'1px solid var(--border)', borderRadius:'8px', background:'#0f1420', overflow:'auto' }}>
+                <div style={{ padding:'10px 10px 6px 10px', fontSize:'12px', color:'#93a0b7', borderBottom:'1px solid rgba(255,255,255,0.06)' }}>
+                  共 {Array.isArray(qualifiedLogs) ? qualifiedLogs.length : 0} 条（最新在上）
+                </div>
+                <div>
+                  {(Array.isArray(qualifiedLogs) ? qualifiedLogs : []).map((r)=> {
+                    const t = r?.timestamp ? new Date(r.timestamp) : null
+                    const timeStr = t ? `${t.toLocaleDateString()} ${t.toLocaleTimeString()}` : '-'
+                    const win = r?.winner || {}
+                    const winStr = (win && Number.isFinite(win.workerIndex)) ? `W${win.workerIndex+1}${win.group||''}` : '-'
+                    const title = `${timeStr} | len=${r?.min_steps ?? '-'} | ${winStr} | ${String(r?.graph_signature||'').slice(0, 10)}…`
+                    const active = (selectedQualifiedLog?.id && selectedQualifiedLog.id === r.id)
+                    return (
+                      <div
+                        key={r.id}
+                        onClick={async ()=>{
+                          try {
+                            const full = await getQualifiedSolveLog(r.id)
+                            setSelectedQualifiedLog(full || r)
+                          } catch {
+                            setSelectedQualifiedLog(r)
+                          }
+                        }}
+                        title={title}
+                        style={{
+                          padding:'10px',
+                          borderBottom:'1px solid rgba(255,255,255,0.06)',
+                          cursor:'pointer',
+                          background: active ? 'rgba(120,160,255,0.10)' : 'transparent',
+                        }}
+                      >
+                        <div style={{ display:'flex', justifyContent:'space-between', gap:'8px' }}>
+                          <div style={{ fontSize:'12px', color:'#cbd3e1' }}>{timeStr}</div>
+                          <div style={{ fontSize:'12px', color:'#93a0b7' }}>len={r?.min_steps ?? '-'}</div>
+                        </div>
+                        <div style={{ marginTop:'4px', fontSize:'12px', color:'#93a0b7', display:'flex', justifyContent:'space-between', gap:'8px' }}>
+                          <span>{String(r?.graph_signature||'')}</span>
+                          <span>{winStr}</span>
+                        </div>
+                        {r?.summary && <div style={{ marginTop:'4px', fontSize:'12px', color:'#7f8aa8' }}>{String(r.summary).slice(0, 120)}</div>}
+                      </div>
+                    )
+                  })}
+                  {(!Array.isArray(qualifiedLogs) || qualifiedLogs.length===0) && (
+                    <div style={{ padding:'12px', color:'#93a0b7' }}>暂无记录（只有跑出合格解时才会写入）。</div>
+                  )}
+                </div>
+              </div>
+
+              <div style={{ border:'1px solid var(--border)', borderRadius:'8px', background:'#0f1420', overflow:'hidden', display:'flex', flexDirection:'column' }}>
+                <div style={{ padding:'10px', borderBottom:'1px solid rgba(255,255,255,0.06)', display:'flex', justifyContent:'space-between', gap:'10px', alignItems:'center' }}>
+                  <div style={{ fontSize:'12px', color:'#93a0b7' }}>
+                    {selectedQualifiedLog ? `详情：${selectedQualifiedLog.id}` : '请选择一条日志查看详情'}
+                  </div>
+                  {selectedQualifiedLog && (
+                    <div style={{ display:'inline-flex', gap:'8px', alignItems:'center' }}>
+                      <button
+                        className="small-btn"
+                        style={{ fontSize:'12px' }}
+                        onClick={async ()=>{
+                          try {
+                            const txt = (Array.isArray(selectedQualifiedLog?.lines) ? selectedQualifiedLog.lines : []).join('\n')
+                            await navigator.clipboard.writeText(txt)
+                            setStatus('已复制日志文本到剪贴板')
+                          } catch {
+                            setStatus('复制失败：浏览器可能禁止 clipboard')
+                          }
+                        }}
+                      >
+                        复制日志
+                      </button>
+                      <button
+                        className="small-btn"
+                        style={{ fontSize:'12px' }}
+                        onClick={async ()=>{
+                          try {
+                            const ok = window.confirm('确认删除这条求解日志？\n注意：这只删除日志，不影响后端或解缓存。')
+                            if (!ok) return
+                            await deleteQualifiedSolveLog(selectedQualifiedLog.id)
+                            const list = await listQualifiedSolveLogs(80)
+                            setQualifiedLogs(Array.isArray(list) ? list : [])
+                            setSelectedQualifiedLog(null)
+                            setStatus('已删除该条求解日志')
+                          } catch {}
+                        }}
+                        title="仅删除该条求解日志（用于调试整理）"
+                      >
+                        删除
+                      </button>
+                    </div>
+                  )}
+                </div>
+
+                <div style={{ padding:'10px', overflow:'auto', fontSize:'12px', color:'#cbd3e1', whiteSpace:'pre-wrap' }}>
+                  {selectedQualifiedLog ? (
+                    <>
+                      <div style={{ color:'#93a0b7', marginBottom:'8px' }}>
+                        signature={selectedQualifiedLog.graph_signature || '-'}；min_steps={selectedQualifiedLog.min_steps ?? '-'}；best_start_id={selectedQualifiedLog.best_start_id ?? '-'}
+                      </div>
+                      <div style={{ color:'#93a0b7', marginBottom:'8px' }}>
+                        winner={(() => {
+                          const w = selectedQualifiedLog.winner || {}
+                          const wStr = (w && Number.isFinite(w.workerIndex)) ? `W${w.workerIndex+1}${w.group||''}` : '-'
+                          const pref = (w?.preferredStartId!=null) ? ` pref #${w.preferredStartId}` : ''
+                          const strat = w?.strategy ? `；策略=${w.strategy}` : ''
+                          const mods = w?.modules ? `；模块=${w.modules}` : ''
+                          return `${wStr}${pref}${strat}${mods}`
+                        })()}
+                      </div>
+                      <div style={{ color:'#93a0b7', marginBottom:'8px' }}>
+                        flags={selectedQualifiedLog.flags ? JSON.stringify(selectedQualifiedLog.flags) : '-'}
+                      </div>
+                      <hr style={{ border:'none', borderTop:'1px solid rgba(255,255,255,0.06)', margin:'10px 0' }} />
+                      {(Array.isArray(selectedQualifiedLog.lines) ? selectedQualifiedLog.lines : []).join('\n') || '（无日志行）'}
+                    </>
+                  ) : (
+                    '（右侧显示选中日志的策略摘要与原始日志行）'
+                  )}
+                </div>
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* 色块统计弹窗：编号快照 + 评分列表 */}
+      {showRegionStats && (
+        <div style={{ position:'fixed', inset:0, background:'rgba(0,0,0,0.42)', zIndex:9999, display:'flex', alignItems:'center', justifyContent:'center' }}>
+          <div className="panel" style={{ width:'min(1100px, 92vw)', height:'min(86vh, 860px)', overflow:'hidden', background:'var(--panel)', display:'flex', flexDirection:'column' }}>
+            <div style={{ display:'flex', alignItems:'center', justifyContent:'space-between', gap:'10px', padding:'12px 12px 8px 12px', borderBottom:'1px solid var(--border)' }}>
+              <div style={{ display:'flex', flexDirection:'column' }}>
+                <div style={{ fontSize:'14px', color:'var(--muted)' }}>色块统计信息</div>
+                <div style={{ fontSize:'12px', color:'#7f8aa8' }}>共 {regionStats?.count ?? 0} 个色块（编号=regionId+1）。评分=基础桥接分（边界/相邻/碎片度）+ hub-connector 两跳加成（同色桥梁+共同枢纽）。</div>
+              </div>
+              <div style={{ display:'inline-flex', gap:'8px', alignItems:'center' }}>
+                <button onClick={recomputeRegionStats} disabled={regionStatsComputing} className="small-btn" style={{ fontSize:'12px' }} title="使用当前画布与最新评分逻辑重新计算">重新计算</button>
+                <button onClick={()=>setShowRegionStats(false)} className="small-btn" style={{ fontSize:'12px' }}>关闭</button>
+              </div>
+            </div>
+
+            <div style={{ display:'grid', gridTemplateColumns:'minmax(320px, 0.9fr) 1.1fr', gap:'12px', padding:'12px', overflow:'auto' }}>
+              <div>
+                <div style={{ fontSize:'12px', color:'#93a0b7', marginBottom:'6px' }}>编号快照（点击可另存）</div>
+                {regionStatsPng ? (
+                  <a href={regionStatsPng} download="region-stats.png" title="点击另存为 PNG">
+                    <img src={regionStatsPng} alt="region stats" style={{ width:'100%', borderRadius:'8px', border:'1px solid var(--border)', background:'#0f1420' }} />
+                  </a>
+                ) : (
+                  <div style={{ padding:'10px', border:'1px solid var(--border)', borderRadius:'8px', background:'#0f1420', color:'#93a0b7' }}>暂无快照</div>
+                )}
+              </div>
+
+              <div>
+                <div style={{ display:'flex', alignItems:'center', justifyContent:'space-between', marginBottom:'6px' }}>
+                  <div style={{ fontSize:'12px', color:'#93a0b7' }}>评分列表（默认按桥接评分降序）</div>
+                </div>
+                <div style={{ overflow:'auto', border:'1px solid var(--border)', borderRadius:'8px', background:'#0f1420' }}>
+                  <table style={{ width:'100%', borderCollapse:'collapse', fontSize:'12px', color:'#cbd3e1' }}>
+                    <thead>
+                      <tr style={{ position:'sticky', top:0, background:'#0b1020', borderBottom:'1px solid var(--border)' }}>
+                        <th style={{ textAlign:'left', padding:'8px' }}>编号</th>
+                        <th style={{ textAlign:'left', padding:'8px' }}>颜色</th>
+                        <th style={{ textAlign:'right', padding:'8px' }}>大小</th>
+                        <th style={{ textAlign:'right', padding:'8px' }}>评分</th>
+                        <th style={{ textAlign:'right', padding:'8px' }}>基础分</th>
+                        <th style={{ textAlign:'right', padding:'8px' }}>两跳加成</th>
+                        <th style={{ textAlign:'right', padding:'8px' }}>加成(原始)</th>
+                        <th style={{ textAlign:'right', padding:'8px' }}>加成(缩放)</th>
+                        <th style={{ textAlign:'right', padding:'8px' }}>hub覆盖</th>
+                        <th style={{ textAlign:'right', padding:'8px' }}>hub权重</th>
+                        <th style={{ textAlign:'right', padding:'8px' }}>相邻色块</th>
+                        <th style={{ textAlign:'right', padding:'8px' }}>边界边</th>
+                        <th style={{ textAlign:'right', padding:'8px' }}>碎片度</th>
+                        <th style={{ textAlign:'right', padding:'8px' }}>死角</th>
+                        <th style={{ textAlign:'right', padding:'8px' }}>距边</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {(() => {
+                        const arr = Array.isArray(regionStats?.regions) ? [...regionStats.regions] : []
+                        arr.sort((a,b)=> (b.score||0) - (a.score||0))
+                        return arr.map(r => (
+                          <tr key={r.regionId} style={{ borderBottom:'1px solid rgba(255,255,255,0.06)' }}>
+                            <td style={{ padding:'8px' }}>{r.regionId + 1}</td>
+                            <td style={{ padding:'8px' }}>
+                              <span style={{ display:'inline-flex', alignItems:'center', gap:'6px' }}>
+                                <span style={{ width:'12px', height:'12px', borderRadius:'3px', background:r.color, border:'1px solid rgba(255,255,255,0.25)' }} />
+                                <span style={{ color:'#93a0b7' }}>{r.color}</span>
+                              </span>
+                            </td>
+                            <td style={{ padding:'8px', textAlign:'right' }}>{r.size}</td>
+                            <td style={{ padding:'8px', textAlign:'right' }}>{Number.isFinite(r.score) ? r.score.toFixed(2) : '-'}</td>
+                            <td style={{ padding:'8px', textAlign:'right', color:'#93a0b7' }}>{Number.isFinite(r.scoreBase) ? r.scoreBase.toFixed(2) : '-'}</td>
+                            <td style={{ padding:'8px', textAlign:'right', color:'#93a0b7' }}>{Number.isFinite((r.score||0) - (r.scoreBase||0)) ? ((r.score||0) - (r.scoreBase||0)).toFixed(2) : '-'}</td>
+                            <td style={{ padding:'8px', textAlign:'right', color:'#93a0b7' }}>{Number.isFinite(r.hubBonusRaw) ? r.hubBonusRaw.toFixed(1) : '-'}</td>
+                            <td style={{ padding:'8px', textAlign:'right', color:'#93a0b7' }}>{Number.isFinite(r.hubBonusScaled) ? r.hubBonusScaled.toFixed(1) : '-'}</td>
+                            <td style={{ padding:'8px', textAlign:'right', color:'#93a0b7' }}>{Number.isFinite(r.hubTouchCount) ? r.hubTouchCount : '-'}</td>
+                            <td style={{ padding:'8px', textAlign:'right', color:'#93a0b7' }}>{Number.isFinite(r.hubTouchWeight) ? r.hubTouchWeight.toFixed(2) : '-'}</td>
+                            <td style={{ padding:'8px', textAlign:'right' }}>{r.adjRegionCount}</td>
+                            <td style={{ padding:'8px', textAlign:'right' }}>{r.boundaryEdges}</td>
+                            <td style={{ padding:'8px', textAlign:'right' }}>{r.fragSum}</td>
+                            <td style={{ padding:'8px', textAlign:'right' }}>{r.borderish}</td>
+                            <td style={{ padding:'8px', textAlign:'right' }}>{Number.isFinite(r.avgDist) ? r.avgDist.toFixed(2) : '-'}</td>
+                          </tr>
+                        ))
+                      })()}
+                    </tbody>
+                  </table>
+                </div>
+                <div style={{ marginTop:'8px', fontSize:'12px', color:'#93a0b7' }}>
+                  说明：相邻色块=与该色块边界直接接触的其他连通色块数量；两跳加成=“同色桥梁 + 共同枢纽 connector”把多个高评分 hub 串联的潜力；死角=该色块内邻居数&lt;3 的三角形数量（越大越贴边/越不适合作为起点）。
+                </div>
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   )
 }

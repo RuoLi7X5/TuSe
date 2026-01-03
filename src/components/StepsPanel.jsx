@@ -8,13 +8,19 @@ export default function StepsPanel({ steps }) {
         <div key={i}>
           <div style={{ marginBottom: '.25rem', color: '#a9b3c9' }}>分支 {i+1}（步数：{branch.path.length}）</div>
           <div style={{ margin: '.25rem 0', fontSize: '.9rem' }}>
-            步骤：{branch.path.map((c, idx) => (
+            步骤：{branch.path.map((step, idx) => {
+              const isObj = step && typeof step === 'object'
+              const color = isObj ? step.color : step
+              const sid = isObj ? step.startId : null
+              return (
               <span key={idx} style={{ display:'inline-flex', alignItems:'center', gap:'.25rem', marginRight: '.5rem' }}>
-                <span style={{ width:'14px', height:'14px', background:c, border:'1px solid #000', display:'inline-block' }} />
-                <span style={{ color: '#a9b3c9' }}>{c}</span>
+                {sid!=null ? <span style={{ color:'#93a0b7', fontSize:'12px' }}>#{sid}</span> : null}
+                <span style={{ width:'14px', height:'14px', background: color, border:'1px solid #000', display:'inline-block' }} />
+                <span style={{ color: '#a9b3c9' }}>{color}</span>
                 {idx < branch.path.length-1 ? <span style={{ margin:'0 .25rem' }}>→</span> : null}
               </span>
-            ))}
+              )
+            })}
           </div>
           <div style={{ display:'grid', gap:'.5rem', gridTemplateColumns:'repeat(4, minmax(0, 1fr))' }}>
             {branch.images.map((src, j) => (

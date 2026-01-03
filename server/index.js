@@ -167,11 +167,12 @@ function isPathSuspicious(path){
   try {
     if (!Array.isArray(path) || path.length===0) return true
     const invalid = new Set(['', 'transparent', null, undefined])
-    let prev = null
-    for (const c of path) {
+    let prevColor = null
+    for (const step of path) {
+      const c = (step && typeof step === 'object') ? step.color : step
       if (invalid.has(c)) return true
-      if (prev!==null && c===prev) return true
-      prev = c
+      if (prevColor!==null && c===prevColor) return true
+      prevColor = c
     }
     return false
   } catch { return true }
@@ -192,21 +193,42 @@ app.get('/api/cache/path', async (req, res)=>{
   } catch (e) { res.status(500).json({ error: e.message }) }
 })
 
+// Cache delete (invalidate bad cached solutions)
+app.delete('/api/cache/path', async (req, res)=>{
+  try {
+    const signature = String(req.query?.signature || '')
+    if (!signature) return res.status(400).json({ error: 'signature required' })
+    const r = await Cache.deleteOne({ graph_signature: signature })
+    res.json({ ok: true, deletedCount: r?.deletedCount || 0 })
+  } catch (e) { res.status(500).json({ error: e.message }) }
+})
+
 // Cache write
 app.post('/api/cache/path', async (req, res)=>{
   try {
-    const { graph_signature, path, min_steps, start_id, flags, is_unified, quality } = req.body || {}
+    const { graph_signature, path, min_steps, start_id, flags, is_unified, quality, puzzle } = req.body || {}
     if (!graph_signature) return res.status(400).json({ error: 'graph_signature required' })
     // 默认质量：根据 is_unified 推断，并对可疑路径降级为 approx
     const suspicious = isPathSuspicious(path)
     const q = quality || ((is_unified===false || suspicious) ? 'approx' : 'final')
     const unified = (is_unified!==false) && !suspicious
-    await Cache.updateOne(
-      { graph_signature },
-      { $set: { graph_signature, path: path||[], min_steps, start_id, flags_json: flags||{}, is_unified: unified, quality: q } },
-      { upsert: true }
-    )
-    res.json({ ok: true, downgraded: suspicious })
+    // 只允许“更短解”覆盖旧解：同题一旦有更短步骤解必须覆盖；更长解不得覆盖。
+    // 但若旧记录非 final/unified，则允许覆盖为 final/unified。
+    const newSteps = Number(min_steps)
+    if (!Number.isFinite(newSteps)) return res.status(400).json({ error: 'min_steps required' })
+    const filter = {
+      graph_signature,
+      $or: [
+        { min_steps: { $exists: false } },
+        { min_steps: { $gt: newSteps } },
+        { quality: { $ne: 'final' } },
+        { is_unified: { $ne: true } },
+      ],
+    }
+    const update = { $set: { graph_signature, path: path||[], min_steps: newSteps, start_id, flags_json: flags||{}, puzzle_json: puzzle || undefined, is_unified: unified, quality: q } }
+    const r = await Cache.updateOne(filter, update, { upsert: true })
+    const skipped = (r.matchedCount === 0 && r.upsertedCount === 0)
+    res.json({ ok: true, downgraded: suspicious, skipped })
   } catch (e) { res.status(500).json({ error: e.message }) }
 })
 
